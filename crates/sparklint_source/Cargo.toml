@@ -1,0 +1,17 @@
+[package]
+name = "sparklint_source"
+description = "Source loading for sparklint: .py, Databricks source notebooks, .ipynb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ruff_notebook = { workspace = true }
+ruff_python_ast = { workspace = true }
+ruff_text_size = { workspace = true }
+ruff_source_file = { workspace = true }
+thiserror = { workspace = true }

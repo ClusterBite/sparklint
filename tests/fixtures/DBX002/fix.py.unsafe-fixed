@@ -1,0 +1,8 @@
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+
+spark = SparkSession.builder.getOrCreate()
+
+df = spark.table("t")
+e = df.isEmpty()  # expect: DBX002
+ids = [r[0] for r in df.collect()]  # expect: DBX002

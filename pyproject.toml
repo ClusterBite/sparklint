@@ -1,0 +1,56 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "sparklint"
+description = "A fast, Spark-aware linter for PySpark code and Databricks notebooks, written in Rust."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Marthinus Bosman", email = "hello@clusterbite.com" }]
+maintainers = [{ name = "ClusterBite", email = "hello@clusterbite.com" }]
+keywords = [
+    "pyspark",
+    "spark",
+    "databricks",
+    "linter",
+    "static-analysis",
+    "performance",
+    "cost",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/clusterbite/sparklint"
+Repository = "https://github.com/clusterbite/sparklint"
+Documentation = "https://github.com/clusterbite/sparklint#readme"
+Rules = "https://github.com/clusterbite/sparklint/blob/main/docs/RULES_CATALOG.md"
+Changelog = "https://github.com/clusterbite/sparklint/blob/main/CHANGELOG.md"
+Issues = "https://github.com/clusterbite/sparklint/issues"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "crates/sparklint/Cargo.toml"
+module-name = "sparklint"
+python-source = "python"
+strip = true
+# The crates embed spec/*.json (include_str!), so the sdist must carry them.
+include = [
+    { path = "LICENSE", format = "sdist" },
+    { path = "NOTICE", format = "sdist" },
+    { path = "spec/*.json", format = "sdist" },
+]

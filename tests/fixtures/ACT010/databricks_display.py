@@ -1,0 +1,51 @@
+# Databricks notebook source
+import dbldatagen as dg
+import pandas as pd
+import plotly.express as px
+
+df = spark.table("events")
+pdf = pd.DataFrame({"a": [1]})
+
+# COMMAND ----------
+
+# Not Spark actions: nothing to report, nothing to delete.
+displayHTML("<h1>Report</h1>")
+displayHTML(f"<a href='/jobs/{job_id}'>job</a>")
+display(dbutils.fs.ls("/mnt/data"))
+display(pdf)
+display(pdf.describe())
+display(px.bar(pdf, x="a"))
+display([1, 2, 3])
+display(df.head(5))
+display(df.take(10))
+display(df.limit(10))
+display(df.toPandas())
+display()
+
+# COMMAND ----------
+
+# dbldatagen's DataGenerator has its own explain(): not a DataFrame.
+testDataSpec = (
+    dg.DataGenerator(sparkSession=spark, name="t", rows=100000, partitions=4)
+    .withIdOutput()
+    .withColumn("order_num", minValue=1, maxValue=100000000, step=-1)
+)
+testDataSpec.explain()
+figure = px.bar(pdf, x="a")
+figure.show()
+pdf.plot().show()
+
+# COMMAND ----------
+
+# Spark DataFrames: reported.
+display(df)  # expect: ACT010
+display(df.filter("a > 1").select("a"))  # expect: ACT010
+df.show()  # expect: ACT010
+df.printSchema()  # expect: ACT010
+built = testDataSpec.build()
+built.withColumn("x", built.id).explain()  # expect: ACT010
+
+
+def preview(events_df):
+    display(events_df)  # expect: ACT010
+    events_df.show()  # expect: ACT010

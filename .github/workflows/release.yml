@@ -1,0 +1,184 @@
+name: Release
+
+# Builds wheels + sdist on a version tag (v*) and publishes them to PyPI with Trusted
+# Publishing (OIDC). No API token is stored anywhere: PyPI must have a trusted publisher for
+# this repository, workflow file `release.yml` and environment `pypi`.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:   # builds only; the publish job runs for tags
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    name: tag matches Cargo version
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compare tag and workspace version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          tag="${GITHUB_REF_NAME#v}"
+          echo "Cargo.toml: $version, tag: $tag"
+          test "$version" = "$tag"
+
+  linux:
+    name: linux ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: auto
+          args: --release --locked --out dist
+      - name: Smoke test
+        if: matrix.target == 'x86_64'
+        run: |
+          python -m pip install --no-index --find-links dist sparklint
+          sparklint --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+  macos:
+    name: macos ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist
+      - name: Smoke test
+        if: matrix.target == 'aarch64'
+        run: |
+          python -m pip install --no-index --find-links dist sparklint
+          sparklint --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  windows:
+    name: windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --locked --out dist
+      - name: Smoke test
+        shell: bash
+        run: |
+          python -m pip install --no-index --find-links dist sparklint
+          sparklint --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-windows-x64
+          path: dist
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - name: Build and smoke test from the sdist
+        run: |
+          python -m pip install dist/*.tar.gz
+          sparklint --version
+          python -m sparklint --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: dist
+
+  collect:
+    name: check distributions
+    runs-on: ubuntu-latest
+    needs: [linux, macos, windows, sdist]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist
+      - name: Expect five wheels and the sdist
+        shell: bash
+        run: |
+          test "$(ls dist/*.whl | wc -l)" -eq 5
+          test "$(ls dist/*.tar.gz | wc -l)" -eq 1
+      - run: pipx run twine check --strict dist/*
+
+  publish:
+    name: publish to PyPI
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check-version, collect]
+    environment:
+      name: pypi
+      url: https://pypi.org/project/sparklint/
+    permissions:
+      id-token: write   # Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  github-release:
+    name: GitHub release
+    runs-on: ubuntu-latest
+    needs: [publish]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --title "$GITHUB_REF_NAME"
+          --notes "See CHANGELOG.md for details. Install: pip install sparklint==${GITHUB_REF_NAME#v}"

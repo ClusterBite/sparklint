@@ -1,0 +1,8 @@
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+
+spark = SparkSession.builder.getOrCreate()
+
+df = spark.table("t")
+a = df.groupBy("k").agg(F.array_distinct(F.collect_list("v")).alias("vs"))  # expect: PRF015
+w = df.select(F.array_join(F.array_distinct(F.collect_list("v")), ","))  # expect: PRF015

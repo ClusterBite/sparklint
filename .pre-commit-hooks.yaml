@@ -1,0 +1,8 @@
+- id: sparklint
+  name: sparklint
+  description: Spark-aware linter for PySpark code and Databricks notebooks.
+  entry: sparklint check
+  language: python
+  types_or: [python, jupyter]
+  require_serial: true
+  minimum_pre_commit_version: "2.9.2"

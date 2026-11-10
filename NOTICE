@@ -1,0 +1,14 @@
+sparklint
+Copyright 2026 Marthinus Bosman / ClusterBite
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party material
+--------------------
+
+Compiled dependencies:
+
+The sparklint binary statically links Rust crates published on crates.io, including the
+Python parser crates of Ruff (https://github.com/astral-sh/ruff, Copyright (c) 2022
+Charles Marsh, MIT License). The licenses of all linked crates are listed in their
+crates.io packages; Cargo.lock lists the exact versions.

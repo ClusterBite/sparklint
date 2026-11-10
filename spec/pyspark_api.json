@@ -1,0 +1,3288 @@
+{
+ "classes": {
+  "Builder": {
+   "appName": {
+    "returns": "Builder"
+   },
+   "config": {
+    "returns": "Builder"
+   },
+   "create": {
+    "returns": "SparkSession"
+   },
+   "enableHiveSupport": {
+    "returns": "Builder"
+   },
+   "getOrCreate": {
+    "returns": "SparkSession"
+   },
+   "master": {
+    "returns": "Builder"
+   },
+   "remote": {
+    "returns": "Builder"
+   }
+  },
+  "Catalog": {
+   "analyzeTable": {
+    "returns": "None"
+   },
+   "cacheTable": {
+    "returns": "None"
+   },
+   "clearCache": {
+    "returns": "None"
+   },
+   "createDatabase": {
+    "returns": "None"
+   },
+   "createExternalTable": {
+    "returns": "DataFrame"
+   },
+   "createTable": {
+    "returns": "DataFrame"
+   },
+   "currentCatalog": {
+    "returns": "str"
+   },
+   "currentDatabase": {
+    "returns": "str"
+   },
+   "databaseExists": {
+    "returns": "bool"
+   },
+   "dropDatabase": {
+    "returns": "None"
+   },
+   "dropGlobalTempView": {
+    "returns": "bool"
+   },
+   "dropTable": {
+    "returns": "None"
+   },
+   "dropTempView": {
+    "returns": "bool"
+   },
+   "dropView": {
+    "returns": "None"
+   },
+   "functionExists": {
+    "returns": "bool"
+   },
+   "getCreateTableString": {
+    "returns": "str"
+   },
+   "getDatabase": {
+    "returns": "other"
+   },
+   "getFunction": {
+    "returns": "other"
+   },
+   "getTable": {
+    "returns": "other"
+   },
+   "getTableProperties": {
+    "returns": "other"
+   },
+   "isCached": {
+    "returns": "bool"
+   },
+   "listCatalogs": {
+    "returns": "list"
+   },
+   "listColumns": {
+    "returns": "list"
+   },
+   "listDatabases": {
+    "returns": "list"
+   },
+   "listFunctions": {
+    "returns": "list"
+   },
+   "listPartitions": {
+    "returns": "list"
+   },
+   "listTables": {
+    "returns": "list"
+   },
+   "listViews": {
+    "returns": "list"
+   },
+   "recoverPartitions": {
+    "returns": "None"
+   },
+   "refreshByPath": {
+    "returns": "None"
+   },
+   "refreshTable": {
+    "returns": "None"
+   },
+   "registerFunction": {
+    "deprecated": "2.3.0",
+    "returns": "other"
+   },
+   "setCurrentCatalog": {
+    "returns": "None"
+   },
+   "setCurrentDatabase": {
+    "returns": "None"
+   },
+   "tableExists": {
+    "returns": "bool"
+   },
+   "truncateTable": {
+    "returns": "None"
+   },
+   "uncacheTable": {
+    "returns": "None"
+   }
+  },
+  "Column": {
+   "alias": {
+    "returns": "Column"
+   },
+   "asc": {
+    "returns": "Column"
+   },
+   "asc_nulls_first": {
+    "returns": "Column"
+   },
+   "asc_nulls_last": {
+    "returns": "Column"
+   },
+   "astype": {
+    "returns": "Column"
+   },
+   "between": {
+    "returns": "Column"
+   },
+   "bitwiseAND": {
+    "returns": "Column"
+   },
+   "bitwiseOR": {
+    "returns": "Column"
+   },
+   "bitwiseXOR": {
+    "returns": "Column"
+   },
+   "cast": {
+    "returns": "Column"
+   },
+   "contains": {
+    "returns": "Column"
+   },
+   "desc": {
+    "returns": "Column"
+   },
+   "desc_nulls_first": {
+    "returns": "Column"
+   },
+   "desc_nulls_last": {
+    "returns": "Column"
+   },
+   "dropFields": {
+    "returns": "Column"
+   },
+   "endswith": {
+    "returns": "Column"
+   },
+   "eqNullSafe": {
+    "returns": "Column"
+   },
+   "getField": {
+    "deprecated": "3.0.0",
+    "returns": "Column"
+   },
+   "getItem": {
+    "deprecated": "3.0.0",
+    "returns": "Column"
+   },
+   "ilike": {
+    "returns": "Column"
+   },
+   "isNaN": {
+    "returns": "Column"
+   },
+   "isNotNull": {
+    "returns": "Column"
+   },
+   "isNull": {
+    "returns": "Column"
+   },
+   "isin": {
+    "returns": "Column"
+   },
+   "like": {
+    "returns": "Column"
+   },
+   "name": {
+    "returns": "Column"
+   },
+   "otherwise": {
+    "returns": "Column"
+   },
+   "outer": {
+    "returns": "Column"
+   },
+   "over": {
+    "returns": "Column"
+   },
+   "rlike": {
+    "returns": "Column"
+   },
+   "startswith": {
+    "returns": "Column"
+   },
+   "substr": {
+    "returns": "Column"
+   },
+   "transform": {
+    "returns": "Column"
+   },
+   "try_cast": {
+    "returns": "Column"
+   },
+   "when": {
+    "returns": "Column"
+   },
+   "withField": {
+    "returns": "Column"
+   }
+  },
+  "DataFrame": {
+   "agg": {
+    "returns": "DataFrame"
+   },
+   "alias": {
+    "returns": "DataFrame"
+   },
+   "approxQuantile": {
+    "returns": "other"
+   },
+   "asTable": {
+    "returns": "other"
+   },
+   "cache": {
+    "returns": "DataFrame"
+   },
+   "checkpoint": {
+    "returns": "DataFrame"
+   },
+   "coalesce": {
+    "returns": "DataFrame"
+   },
+   "colRegex": {
+    "returns": "Column"
+   },
+   "collect": {
+    "returns": "list[Row]"
+   },
+   "columns": {
+    "property": true,
+    "returns": "list"
+   },
+   "corr": {
+    "returns": "float"
+   },
+   "count": {
+    "returns": "int"
+   },
+   "cov": {
+    "returns": "float"
+   },
+   "createGlobalTempView": {
+    "returns": "None"
+   },
+   "createOrReplaceGlobalTempView": {
+    "returns": "None"
+   },
+   "createOrReplaceTempView": {
+    "returns": "None"
+   },
+   "createTempView": {
+    "returns": "None"
+   },
+   "crossJoin": {
+    "returns": "DataFrame"
+   },
+   "crosstab": {
+    "returns": "DataFrame"
+   },
+   "cube": {
+    "returns": "GroupedData"
+   },
+   "describe": {
+    "returns": "DataFrame"
+   },
+   "distinct": {
+    "returns": "DataFrame"
+   },
+   "drop": {
+    "returns": "DataFrame"
+   },
+   "dropDuplicates": {
+    "returns": "DataFrame"
+   },
+   "dropDuplicatesWithinWatermark": {
+    "returns": "DataFrame"
+   },
+   "drop_duplicates": {
+    "returns": "DataFrame"
+   },
+   "dropna": {
+    "returns": "DataFrame"
+   },
+   "dtypes": {
+    "property": true,
+    "returns": "list"
+   },
+   "exceptAll": {
+    "returns": "DataFrame"
+   },
+   "executionInfo": {
+    "property": true,
+    "returns": "other"
+   },
+   "exists": {
+    "returns": "Column"
+   },
+   "explain": {
+    "returns": "None"
+   },
+   "fillna": {
+    "returns": "DataFrame"
+   },
+   "filter": {
+    "returns": "DataFrame"
+   },
+   "first": {
+    "returns": "Row"
+   },
+   "foreach": {
+    "returns": "None"
+   },
+   "foreachPartition": {
+    "returns": "None"
+   },
+   "freqItems": {
+    "returns": "DataFrame"
+   },
+   "groupBy": {
+    "returns": "GroupedData"
+   },
+   "groupby": {
+    "returns": "GroupedData"
+   },
+   "groupingSets": {
+    "returns": "GroupedData"
+   },
+   "head": {
+    "returns": "other"
+   },
+   "hint": {
+    "returns": "DataFrame"
+   },
+   "inputFiles": {
+    "returns": "list"
+   },
+   "intersect": {
+    "returns": "DataFrame"
+   },
+   "intersectAll": {
+    "returns": "DataFrame"
+   },
+   "isEmpty": {
+    "returns": "bool"
+   },
+   "isLocal": {
+    "returns": "bool"
+   },
+   "isStreaming": {
+    "property": true,
+    "returns": "bool"
+   },
+   "join": {
+    "returns": "DataFrame"
+   },
+   "lateralJoin": {
+    "returns": "DataFrame"
+   },
+   "limit": {
+    "returns": "DataFrame"
+   },
+   "localCheckpoint": {
+    "returns": "DataFrame"
+   },
+   "mapInArrow": {
+    "returns": "DataFrame"
+   },
+   "mapInPandas": {
+    "returns": "DataFrame"
+   },
+   "melt": {
+    "returns": "DataFrame"
+   },
+   "mergeInto": {
+    "returns": "MergeIntoWriter"
+   },
+   "metadataColumn": {
+    "returns": "Column"
+   },
+   "na": {
+    "property": true,
+    "returns": "DataFrameNaFunctions"
+   },
+   "nearestByJoin": {
+    "returns": "DataFrame"
+   },
+   "observe": {
+    "returns": "DataFrame"
+   },
+   "offset": {
+    "returns": "DataFrame"
+   },
+   "orderBy": {
+    "returns": "DataFrame"
+   },
+   "pandas_api": {
+    "returns": "PandasOnSparkDataFrame"
+   },
+   "persist": {
+    "returns": "DataFrame"
+   },
+   "plot": {
+    "property": true,
+    "returns": "other"
+   },
+   "printSchema": {
+    "returns": "None"
+   },
+   "randomSplit": {
+    "returns": "list"
+   },
+   "rdd": {
+    "property": true,
+    "returns": "RDD"
+   },
+   "registerTempTable": {
+    "deprecated": "2.0.0",
+    "returns": "None"
+   },
+   "repartition": {
+    "returns": "DataFrame"
+   },
+   "repartitionById": {
+    "returns": "DataFrame"
+   },
+   "repartitionByRange": {
+    "returns": "DataFrame"
+   },
+   "replace": {
+    "returns": "DataFrame"
+   },
+   "rollup": {
+    "returns": "GroupedData"
+   },
+   "sameSemantics": {
+    "returns": "bool"
+   },
+   "sample": {
+    "returns": "DataFrame"
+   },
+   "sampleBy": {
+    "returns": "DataFrame"
+   },
+   "scalar": {
+    "returns": "Column"
+   },
+   "schema": {
+    "property": true,
+    "returns": "other"
+   },
+   "select": {
+    "returns": "DataFrame"
+   },
+   "selectExpr": {
+    "returns": "DataFrame"
+   },
+   "semanticHash": {
+    "returns": "int"
+   },
+   "show": {
+    "returns": "None"
+   },
+   "sort": {
+    "returns": "DataFrame"
+   },
+   "sortWithinPartitions": {
+    "returns": "DataFrame"
+   },
+   "sparkSession": {
+    "property": true,
+    "returns": "SparkSession"
+   },
+   "stat": {
+    "property": true,
+    "returns": "DataFrameStatFunctions"
+   },
+   "storageLevel": {
+    "property": true,
+    "returns": "other"
+   },
+   "subtract": {
+    "returns": "DataFrame"
+   },
+   "summary": {
+    "returns": "DataFrame"
+   },
+   "tail": {
+    "returns": "list[Row]"
+   },
+   "take": {
+    "returns": "list[Row]"
+   },
+   "to": {
+    "returns": "DataFrame"
+   },
+   "toArrow": {
+    "returns": "other"
+   },
+   "toDF": {
+    "returns": "DataFrame"
+   },
+   "toJSON": {
+    "returns": "other"
+   },
+   "toLocalIterator": {
+    "returns": "other"
+   },
+   "toPandas": {
+    "returns": "PandasDataFrame"
+   },
+   "transform": {
+    "returns": "DataFrame"
+   },
+   "transpose": {
+    "returns": "DataFrame"
+   },
+   "union": {
+    "returns": "DataFrame"
+   },
+   "unionAll": {
+    "returns": "DataFrame"
+   },
+   "unionByName": {
+    "returns": "DataFrame"
+   },
+   "unpersist": {
+    "returns": "DataFrame"
+   },
+   "unpivot": {
+    "returns": "DataFrame"
+   },
+   "where": {
+    "returns": "DataFrame"
+   },
+   "withColumn": {
+    "returns": "DataFrame"
+   },
+   "withColumnRenamed": {
+    "returns": "DataFrame"
+   },
+   "withColumns": {
+    "returns": "DataFrame"
+   },
+   "withColumnsRenamed": {
+    "returns": "DataFrame"
+   },
+   "withMetadata": {
+    "returns": "DataFrame"
+   },
+   "withWatermark": {
+    "returns": "DataFrame"
+   },
+   "write": {
+    "property": true,
+    "returns": "DataFrameWriter"
+   },
+   "writeStream": {
+    "property": true,
+    "returns": "DataStreamWriter"
+   },
+   "writeTo": {
+    "returns": "DataFrameWriterV2"
+   },
+   "zipWithIndex": {
+    "returns": "DataFrame"
+   }
+  },
+  "DataFrameNaFunctions": {
+   "drop": {
+    "returns": "DataFrame"
+   },
+   "fill": {
+    "returns": "DataFrame"
+   },
+   "replace": {
+    "returns": "DataFrame"
+   }
+  },
+  "DataFrameReader": {
+   "changes": {
+    "returns": "DataFrame"
+   },
+   "csv": {
+    "returns": "DataFrame"
+   },
+   "format": {
+    "returns": "DataFrameReader"
+   },
+   "jdbc": {
+    "returns": "DataFrame"
+   },
+   "json": {
+    "returns": "DataFrame"
+   },
+   "load": {
+    "returns": "DataFrame"
+   },
+   "option": {
+    "returns": "DataFrameReader"
+   },
+   "options": {
+    "returns": "DataFrameReader"
+   },
+   "orc": {
+    "returns": "DataFrame"
+   },
+   "parquet": {
+    "returns": "DataFrame"
+   },
+   "schema": {
+    "returns": "DataFrameReader"
+   },
+   "table": {
+    "returns": "DataFrame"
+   },
+   "text": {
+    "returns": "DataFrame"
+   },
+   "xml": {
+    "returns": "DataFrame"
+   }
+  },
+  "DataFrameStatFunctions": {
+   "approxQuantile": {
+    "returns": "other"
+   },
+   "corr": {
+    "returns": "float"
+   },
+   "cov": {
+    "returns": "float"
+   },
+   "crosstab": {
+    "returns": "DataFrame"
+   },
+   "freqItems": {
+    "returns": "DataFrame"
+   },
+   "sampleBy": {
+    "returns": "DataFrame"
+   }
+  },
+  "DataFrameWriter": {
+   "bucketBy": {
+    "returns": "DataFrameWriter"
+   },
+   "clusterBy": {
+    "returns": "DataFrameWriter"
+   },
+   "csv": {
+    "returns": "None"
+   },
+   "format": {
+    "returns": "DataFrameWriter"
+   },
+   "insertInto": {
+    "returns": "None"
+   },
+   "jdbc": {
+    "returns": "None"
+   },
+   "json": {
+    "returns": "None"
+   },
+   "mode": {
+    "returns": "DataFrameWriter"
+   },
+   "option": {
+    "returns": "DataFrameWriter"
+   },
+   "options": {
+    "returns": "DataFrameWriter"
+   },
+   "orc": {
+    "returns": "None"
+   },
+   "parquet": {
+    "returns": "None"
+   },
+   "partitionBy": {
+    "returns": "DataFrameWriter"
+   },
+   "save": {
+    "returns": "other"
+   },
+   "saveAsTable": {
+    "returns": "other"
+   },
+   "sortBy": {
+    "returns": "DataFrameWriter"
+   },
+   "text": {
+    "returns": "None"
+   },
+   "xml": {
+    "returns": "None"
+   }
+  },
+  "DataFrameWriterV2": {
+   "append": {
+    "returns": "None"
+   },
+   "clusterBy": {
+    "returns": "DataFrameWriterV2"
+   },
+   "create": {
+    "returns": "None"
+   },
+   "createOrReplace": {
+    "returns": "None"
+   },
+   "option": {
+    "returns": "DataFrameWriterV2"
+   },
+   "options": {
+    "returns": "DataFrameWriterV2"
+   },
+   "overwrite": {
+    "returns": "other"
+   },
+   "overwritePartitions": {
+    "returns": "None"
+   },
+   "partitionedBy": {
+    "returns": "DataFrameWriterV2"
+   },
+   "replace": {
+    "returns": "None"
+   },
+   "tableProperty": {
+    "returns": "DataFrameWriterV2"
+   },
+   "using": {
+    "returns": "DataFrameWriterV2"
+   }
+  },
+  "DataStreamReader": {
+   "changes": {
+    "returns": "DataFrame"
+   },
+   "csv": {
+    "returns": "DataFrame"
+   },
+   "format": {
+    "returns": "DataStreamReader"
+   },
+   "json": {
+    "returns": "DataFrame"
+   },
+   "load": {
+    "returns": "DataFrame"
+   },
+   "name": {
+    "returns": "DataStreamReader"
+   },
+   "option": {
+    "returns": "DataStreamReader"
+   },
+   "options": {
+    "returns": "DataStreamReader"
+   },
+   "orc": {
+    "returns": "DataFrame"
+   },
+   "parquet": {
+    "returns": "DataFrame"
+   },
+   "schema": {
+    "returns": "DataStreamReader"
+   },
+   "table": {
+    "returns": "DataFrame"
+   },
+   "text": {
+    "returns": "DataFrame"
+   },
+   "xml": {
+    "returns": "DataFrame"
+   }
+  },
+  "DataStreamWriter": {
+   "clusterBy": {
+    "returns": "DataStreamWriter"
+   },
+   "foreach": {
+    "returns": "DataStreamWriter"
+   },
+   "foreachBatch": {
+    "returns": "DataStreamWriter"
+   },
+   "format": {
+    "returns": "DataStreamWriter"
+   },
+   "option": {
+    "returns": "DataStreamWriter"
+   },
+   "options": {
+    "returns": "DataStreamWriter"
+   },
+   "outputMode": {
+    "returns": "DataStreamWriter"
+   },
+   "partitionBy": {
+    "returns": "DataStreamWriter"
+   },
+   "queryName": {
+    "returns": "DataStreamWriter"
+   },
+   "start": {
+    "returns": "StreamingQuery"
+   },
+   "toTable": {
+    "returns": "StreamingQuery"
+   },
+   "trigger": {
+    "returns": "DataStreamWriter"
+   }
+  },
+  "GroupedData": {
+   "agg": {
+    "returns": "DataFrame"
+   },
+   "apply": {
+    "returns": "DataFrame"
+   },
+   "applyInArrow": {
+    "returns": "DataFrame"
+   },
+   "applyInPandas": {
+    "returns": "DataFrame"
+   },
+   "applyInPandasWithState": {
+    "returns": "DataFrame"
+   },
+   "avg": {
+    "returns": "DataFrame"
+   },
+   "cogroup": {
+    "returns": "PandasCogroupedOps"
+   },
+   "count": {
+    "returns": "DataFrame"
+   },
+   "max": {
+    "returns": "DataFrame"
+   },
+   "mean": {
+    "returns": "DataFrame"
+   },
+   "min": {
+    "returns": "DataFrame"
+   },
+   "pivot": {
+    "returns": "GroupedData"
+   },
+   "sum": {
+    "returns": "DataFrame"
+   },
+   "transformWithState": {
+    "returns": "DataFrame"
+   },
+   "transformWithStateInPandas": {
+    "returns": "DataFrame"
+   }
+  },
+  "MergeIntoWriter": {
+   "WhenMatched": {
+    "returns": "other"
+   },
+   "WhenNotMatched": {
+    "returns": "other"
+   },
+   "WhenNotMatchedBySource": {
+    "returns": "other"
+   },
+   "merge": {
+    "returns": "None"
+   },
+   "whenMatched": {
+    "returns": "other"
+   },
+   "whenNotMatched": {
+    "returns": "other"
+   },
+   "whenNotMatchedBySource": {
+    "returns": "other"
+   },
+   "withSchemaEvolution": {
+    "returns": "MergeIntoWriter"
+   }
+  },
+  "PandasCogroupedOps": {
+   "applyInArrow": {
+    "returns": "DataFrame"
+   },
+   "applyInPandas": {
+    "returns": "DataFrame"
+   }
+  },
+  "RDD": {
+   "aggregate": {
+    "returns": "other"
+   },
+   "aggregateByKey": {
+    "returns": "other"
+   },
+   "barrier": {
+    "returns": "other"
+   },
+   "cache": {
+    "returns": "other"
+   },
+   "cartesian": {
+    "returns": "other"
+   },
+   "checkpoint": {
+    "returns": "None"
+   },
+   "cleanShuffleDependencies": {
+    "returns": "None"
+   },
+   "coalesce": {
+    "returns": "other"
+   },
+   "cogroup": {
+    "returns": "other"
+   },
+   "collect": {
+    "returns": "list"
+   },
+   "collectAsMap": {
+    "returns": "other"
+   },
+   "collectWithJobGroup": {
+    "deprecated": "3.1.0",
+    "returns": "list"
+   },
+   "combineByKey": {
+    "returns": "other"
+   },
+   "context": {
+    "property": true,
+    "returns": "SparkContext"
+   },
+   "count": {
+    "returns": "int"
+   },
+   "countApprox": {
+    "returns": "int"
+   },
+   "countApproxDistinct": {
+    "returns": "int"
+   },
+   "countByKey": {
+    "returns": "other"
+   },
+   "countByValue": {
+    "returns": "other"
+   },
+   "distinct": {
+    "returns": "other"
+   },
+   "filter": {
+    "returns": "other"
+   },
+   "first": {
+    "returns": "other"
+   },
+   "flatMap": {
+    "returns": "other"
+   },
+   "flatMapValues": {
+    "returns": "other"
+   },
+   "fold": {
+    "returns": "other"
+   },
+   "foldByKey": {
+    "returns": "other"
+   },
+   "foreach": {
+    "returns": "None"
+   },
+   "foreachPartition": {
+    "returns": "None"
+   },
+   "fullOuterJoin": {
+    "returns": "other"
+   },
+   "getCheckpointFile": {
+    "returns": "other"
+   },
+   "getNumPartitions": {
+    "returns": "int"
+   },
+   "getResourceProfile": {
+    "returns": "other"
+   },
+   "getStorageLevel": {
+    "returns": "other"
+   },
+   "glom": {
+    "returns": "other"
+   },
+   "groupBy": {
+    "returns": "other"
+   },
+   "groupByKey": {
+    "returns": "other"
+   },
+   "groupWith": {
+    "returns": "other"
+   },
+   "histogram": {
+    "returns": "other"
+   },
+   "id": {
+    "returns": "int"
+   },
+   "intersection": {
+    "returns": "other"
+   },
+   "isCheckpointed": {
+    "returns": "bool"
+   },
+   "isEmpty": {
+    "returns": "bool"
+   },
+   "isLocallyCheckpointed": {
+    "returns": "bool"
+   },
+   "join": {
+    "returns": "other"
+   },
+   "keyBy": {
+    "returns": "other"
+   },
+   "keys": {
+    "returns": "other"
+   },
+   "leftOuterJoin": {
+    "returns": "other"
+   },
+   "localCheckpoint": {
+    "returns": "None"
+   },
+   "lookup": {
+    "returns": "list"
+   },
+   "map": {
+    "returns": "other"
+   },
+   "mapPartitions": {
+    "returns": "other"
+   },
+   "mapPartitionsWithIndex": {
+    "returns": "other"
+   },
+   "mapPartitionsWithSplit": {
+    "deprecated": "0.9.0",
+    "returns": "other"
+   },
+   "mapValues": {
+    "returns": "other"
+   },
+   "max": {
+    "returns": "other"
+   },
+   "mean": {
+    "returns": "float"
+   },
+   "meanApprox": {
+    "returns": "other"
+   },
+   "min": {
+    "returns": "other"
+   },
+   "name": {
+    "returns": "other"
+   },
+   "partitionBy": {
+    "returns": "other"
+   },
+   "persist": {
+    "returns": "other"
+   },
+   "pipe": {
+    "returns": "other"
+   },
+   "randomSplit": {
+    "returns": "list"
+   },
+   "reduce": {
+    "returns": "other"
+   },
+   "reduceByKey": {
+    "returns": "other"
+   },
+   "reduceByKeyLocally": {
+    "returns": "other"
+   },
+   "repartition": {
+    "returns": "other"
+   },
+   "repartitionAndSortWithinPartitions": {
+    "returns": "other"
+   },
+   "rightOuterJoin": {
+    "returns": "other"
+   },
+   "sample": {
+    "returns": "other"
+   },
+   "sampleByKey": {
+    "returns": "other"
+   },
+   "sampleStdev": {
+    "returns": "float"
+   },
+   "sampleVariance": {
+    "returns": "float"
+   },
+   "saveAsHadoopDataset": {
+    "returns": "None"
+   },
+   "saveAsHadoopFile": {
+    "returns": "None"
+   },
+   "saveAsNewAPIHadoopDataset": {
+    "returns": "None"
+   },
+   "saveAsNewAPIHadoopFile": {
+    "returns": "None"
+   },
+   "saveAsPickleFile": {
+    "returns": "None"
+   },
+   "saveAsSequenceFile": {
+    "returns": "None"
+   },
+   "saveAsTextFile": {
+    "returns": "None"
+   },
+   "setName": {
+    "returns": "other"
+   },
+   "sortBy": {
+    "returns": "RDD"
+   },
+   "sortByKey": {
+    "returns": "other"
+   },
+   "stats": {
+    "returns": "other"
+   },
+   "stdev": {
+    "returns": "float"
+   },
+   "subtract": {
+    "returns": "other"
+   },
+   "subtractByKey": {
+    "returns": "other"
+   },
+   "sum": {
+    "returns": "other"
+   },
+   "sumApprox": {
+    "returns": "other"
+   },
+   "take": {
+    "returns": "list"
+   },
+   "takeOrdered": {
+    "returns": "list"
+   },
+   "takeSample": {
+    "returns": "list"
+   },
+   "toDF": {
+    "returns": "DataFrame"
+   },
+   "toDebugString": {
+    "returns": "other"
+   },
+   "toLocalIterator": {
+    "returns": "other"
+   },
+   "top": {
+    "returns": "list"
+   },
+   "treeAggregate": {
+    "returns": "other"
+   },
+   "treeReduce": {
+    "returns": "other"
+   },
+   "union": {
+    "returns": "other"
+   },
+   "unpersist": {
+    "returns": "other"
+   },
+   "values": {
+    "returns": "other"
+   },
+   "variance": {
+    "returns": "float"
+   },
+   "withResources": {
+    "returns": "other"
+   },
+   "zip": {
+    "returns": "other"
+   },
+   "zipWithIndex": {
+    "returns": "other"
+   },
+   "zipWithUniqueId": {
+    "returns": "other"
+   }
+  },
+  "Row": {
+   "asDict": {
+    "returns": "other"
+   },
+   "count": {
+    "returns": "other"
+   },
+   "index": {
+    "returns": "other"
+   }
+  },
+  "RuntimeConfig": {
+   "get": {
+    "returns": "other"
+   },
+   "getAll": {
+    "property": true,
+    "returns": "other"
+   },
+   "isModifiable": {
+    "returns": "bool"
+   },
+   "set": {
+    "returns": "None"
+   },
+   "unset": {
+    "returns": "None"
+   }
+  },
+  "SparkContext": {
+   "accumulator": {
+    "returns": "other"
+   },
+   "addArchive": {
+    "returns": "None"
+   },
+   "addFile": {
+    "returns": "None"
+   },
+   "addJobTag": {
+    "returns": "None"
+   },
+   "addPyFile": {
+    "returns": "None"
+   },
+   "applicationId": {
+    "property": true,
+    "returns": "str"
+   },
+   "binaryFiles": {
+    "returns": "other"
+   },
+   "binaryRecords": {
+    "returns": "other"
+   },
+   "broadcast": {
+    "returns": "other"
+   },
+   "cancelAllJobs": {
+    "returns": "None"
+   },
+   "cancelJobGroup": {
+    "returns": "None"
+   },
+   "cancelJobsWithTag": {
+    "returns": "None"
+   },
+   "clearJobTags": {
+    "returns": "None"
+   },
+   "defaultMinPartitions": {
+    "property": true,
+    "returns": "int"
+   },
+   "defaultParallelism": {
+    "property": true,
+    "returns": "int"
+   },
+   "dump_profiles": {
+    "returns": "None"
+   },
+   "emptyRDD": {
+    "returns": "other"
+   },
+   "getCheckpointDir": {
+    "returns": "other"
+   },
+   "getConf": {
+    "returns": "other"
+   },
+   "getJobTags": {
+    "returns": "other"
+   },
+   "getLocalProperty": {
+    "returns": "other"
+   },
+   "getOrCreate": {
+    "returns": "SparkContext",
+    "static": true
+   },
+   "getSystemProperty": {
+    "returns": "str",
+    "static": true
+   },
+   "hadoopFile": {
+    "returns": "other"
+   },
+   "hadoopRDD": {
+    "returns": "other"
+   },
+   "listArchives": {
+    "property": true,
+    "returns": "list"
+   },
+   "listFiles": {
+    "property": true,
+    "returns": "list"
+   },
+   "newAPIHadoopFile": {
+    "returns": "other"
+   },
+   "newAPIHadoopRDD": {
+    "returns": "other"
+   },
+   "parallelize": {
+    "returns": "other"
+   },
+   "pickleFile": {
+    "returns": "other"
+   },
+   "range": {
+    "returns": "other"
+   },
+   "removeJobTag": {
+    "returns": "None"
+   },
+   "resources": {
+    "property": true,
+    "returns": "other"
+   },
+   "runJob": {
+    "returns": "list"
+   },
+   "sequenceFile": {
+    "returns": "other"
+   },
+   "setCheckpointDir": {
+    "returns": "None"
+   },
+   "setInterruptOnCancel": {
+    "returns": "None"
+   },
+   "setJobDescription": {
+    "returns": "None"
+   },
+   "setJobGroup": {
+    "returns": "None"
+   },
+   "setLocalProperty": {
+    "returns": "None"
+   },
+   "setLogLevel": {
+    "returns": "None"
+   },
+   "setSystemProperty": {
+    "returns": "None",
+    "static": true
+   },
+   "show_profiles": {
+    "returns": "None"
+   },
+   "sparkUser": {
+    "returns": "str"
+   },
+   "startTime": {
+    "property": true,
+    "returns": "int"
+   },
+   "statusTracker": {
+    "returns": "other"
+   },
+   "stop": {
+    "returns": "None"
+   },
+   "textFile": {
+    "returns": "other"
+   },
+   "uiWebUrl": {
+    "property": true,
+    "returns": "other"
+   },
+   "union": {
+    "returns": "other"
+   },
+   "version": {
+    "property": true,
+    "returns": "str"
+   },
+   "wholeTextFiles": {
+    "returns": "other"
+   }
+  },
+  "SparkSession": {
+   "Builder": {
+    "returns": "other"
+   },
+   "active": {
+    "returns": "SparkSession",
+    "static": true
+   },
+   "addArtifact": {
+    "returns": "None"
+   },
+   "addArtifacts": {
+    "returns": "None"
+   },
+   "addTag": {
+    "returns": "None"
+   },
+   "clearProgressHandlers": {
+    "returns": "None"
+   },
+   "clearTags": {
+    "returns": "None"
+   },
+   "client": {
+    "property": true,
+    "returns": "other"
+   },
+   "copyFromLocalToFs": {
+    "returns": "None"
+   },
+   "createDataFrame": {
+    "returns": "DataFrame"
+   },
+   "dataSource": {
+    "property": true,
+    "returns": "other"
+   },
+   "emptyDataFrame": {
+    "returns": "DataFrame"
+   },
+   "getActiveSession": {
+    "returns": "SparkSession",
+    "static": true
+   },
+   "getTags": {
+    "returns": "other"
+   },
+   "interruptAll": {
+    "returns": "list"
+   },
+   "interruptOperation": {
+    "returns": "list"
+   },
+   "interruptTag": {
+    "returns": "list"
+   },
+   "newSession": {
+    "returns": "SparkSession"
+   },
+   "profile": {
+    "property": true,
+    "returns": "other"
+   },
+   "range": {
+    "returns": "DataFrame"
+   },
+   "read": {
+    "property": true,
+    "returns": "DataFrameReader"
+   },
+   "readStream": {
+    "property": true,
+    "returns": "DataStreamReader"
+   },
+   "registerProgressHandler": {
+    "returns": "other"
+   },
+   "removeProgressHandler": {
+    "returns": "other"
+   },
+   "removeTag": {
+    "returns": "None"
+   },
+   "sparkContext": {
+    "property": true,
+    "returns": "SparkContext"
+   },
+   "sql": {
+    "returns": "DataFrame"
+   },
+   "stop": {
+    "returns": "None"
+   },
+   "table": {
+    "returns": "DataFrame"
+   },
+   "tvf": {
+    "property": true,
+    "returns": "other"
+   },
+   "udf": {
+    "property": true,
+    "returns": "other"
+   },
+   "udtf": {
+    "property": true,
+    "returns": "other"
+   }
+  },
+  "StreamingQuery": {
+   "awaitTermination": {
+    "returns": "other"
+   },
+   "exception": {
+    "returns": "other"
+   },
+   "explain": {
+    "returns": "None"
+   },
+   "id": {
+    "property": true,
+    "returns": "str"
+   },
+   "isActive": {
+    "property": true,
+    "returns": "bool"
+   },
+   "lastProgress": {
+    "property": true,
+    "returns": "other"
+   },
+   "name": {
+    "property": true,
+    "returns": "str"
+   },
+   "processAllAvailable": {
+    "returns": "None"
+   },
+   "recentProgress": {
+    "property": true,
+    "returns": "list"
+   },
+   "runId": {
+    "property": true,
+    "returns": "str"
+   },
+   "status": {
+    "property": true,
+    "returns": "other"
+   },
+   "stop": {
+    "returns": "None"
+   }
+  },
+  "Window": {
+   "orderBy": {
+    "returns": "WindowSpec",
+    "static": true
+   },
+   "partitionBy": {
+    "returns": "WindowSpec",
+    "static": true
+   },
+   "rangeBetween": {
+    "returns": "WindowSpec",
+    "static": true
+   },
+   "rowsBetween": {
+    "returns": "WindowSpec",
+    "static": true
+   }
+  },
+  "WindowSpec": {
+   "orderBy": {
+    "returns": "WindowSpec"
+   },
+   "partitionBy": {
+    "returns": "WindowSpec"
+   },
+   "rangeBetween": {
+    "returns": "WindowSpec"
+   },
+   "rowsBetween": {
+    "returns": "WindowSpec"
+   }
+  }
+ },
+ "functions": {
+  "AnalyzeArgument": {
+   "returns": "other"
+  },
+  "AnalyzeResult": {
+   "returns": "other"
+  },
+  "ArrowUDFType": {
+   "returns": "other"
+  },
+  "OrderingColumn": {
+   "returns": "other"
+  },
+  "PandasUDFType": {
+   "returns": "other"
+  },
+  "PartitioningColumn": {
+   "returns": "other"
+  },
+  "SelectedColumn": {
+   "returns": "other"
+  },
+  "SkipRestOfInputTableException": {
+   "returns": "other"
+  },
+  "UserDefinedFunction": {
+   "returns": "other"
+  },
+  "UserDefinedTableFunction": {
+   "returns": "other"
+  },
+  "abs": {
+   "returns": "Column"
+  },
+  "acos": {
+   "returns": "Column"
+  },
+  "acosh": {
+   "returns": "Column"
+  },
+  "add_months": {
+   "returns": "Column"
+  },
+  "aes_decrypt": {
+   "returns": "Column"
+  },
+  "aes_encrypt": {
+   "returns": "Column"
+  },
+  "aggregate": {
+   "returns": "Column"
+  },
+  "any_value": {
+   "returns": "Column"
+  },
+  "approx_count_distinct": {
+   "returns": "Column"
+  },
+  "approx_percentile": {
+   "returns": "Column"
+  },
+  "array": {
+   "returns": "Column"
+  },
+  "array_agg": {
+   "returns": "Column"
+  },
+  "array_append": {
+   "returns": "Column"
+  },
+  "array_compact": {
+   "returns": "Column"
+  },
+  "array_contains": {
+   "returns": "Column"
+  },
+  "array_distinct": {
+   "returns": "Column"
+  },
+  "array_except": {
+   "returns": "Column"
+  },
+  "array_insert": {
+   "returns": "Column"
+  },
+  "array_intersect": {
+   "returns": "Column"
+  },
+  "array_join": {
+   "returns": "Column"
+  },
+  "array_max": {
+   "returns": "Column"
+  },
+  "array_min": {
+   "returns": "Column"
+  },
+  "array_position": {
+   "returns": "Column"
+  },
+  "array_prepend": {
+   "returns": "Column"
+  },
+  "array_remove": {
+   "returns": "Column"
+  },
+  "array_repeat": {
+   "returns": "Column"
+  },
+  "array_size": {
+   "returns": "Column"
+  },
+  "array_sort": {
+   "returns": "Column"
+  },
+  "array_union": {
+   "returns": "Column"
+  },
+  "arrays_overlap": {
+   "returns": "Column"
+  },
+  "arrays_zip": {
+   "returns": "Column"
+  },
+  "arrow_udf": {
+   "returns": "other"
+  },
+  "arrow_udtf": {
+   "returns": "other"
+  },
+  "asc": {
+   "returns": "Column"
+  },
+  "asc_nulls_first": {
+   "returns": "Column"
+  },
+  "asc_nulls_last": {
+   "returns": "Column"
+  },
+  "ascii": {
+   "returns": "Column"
+  },
+  "asin": {
+   "returns": "Column"
+  },
+  "asinh": {
+   "returns": "Column"
+  },
+  "assert_true": {
+   "returns": "Column"
+  },
+  "atan": {
+   "returns": "Column"
+  },
+  "atan2": {
+   "returns": "Column"
+  },
+  "atanh": {
+   "returns": "Column"
+  },
+  "avg": {
+   "returns": "Column"
+  },
+  "base64": {
+   "returns": "Column"
+  },
+  "bin": {
+   "returns": "Column"
+  },
+  "bit_and": {
+   "returns": "Column"
+  },
+  "bit_count": {
+   "returns": "Column"
+  },
+  "bit_get": {
+   "returns": "Column"
+  },
+  "bit_length": {
+   "returns": "Column"
+  },
+  "bit_or": {
+   "returns": "Column"
+  },
+  "bit_xor": {
+   "returns": "Column"
+  },
+  "bitmap_and_agg": {
+   "returns": "Column"
+  },
+  "bitmap_bit_position": {
+   "returns": "Column"
+  },
+  "bitmap_bucket_number": {
+   "returns": "Column"
+  },
+  "bitmap_construct_agg": {
+   "returns": "Column"
+  },
+  "bitmap_count": {
+   "returns": "Column"
+  },
+  "bitmap_or_agg": {
+   "returns": "Column"
+  },
+  "bitwise_not": {
+   "returns": "Column"
+  },
+  "bool_and": {
+   "returns": "Column"
+  },
+  "bool_or": {
+   "returns": "Column"
+  },
+  "broadcast": {
+   "returns": "DataFrame"
+  },
+  "bround": {
+   "returns": "Column"
+  },
+  "btrim": {
+   "returns": "Column"
+  },
+  "bucket": {
+   "deprecated": "4.0.0",
+   "returns": "Column"
+  },
+  "call_function": {
+   "returns": "Column"
+  },
+  "call_udf": {
+   "returns": "Column"
+  },
+  "cardinality": {
+   "returns": "Column"
+  },
+  "cbrt": {
+   "returns": "Column"
+  },
+  "ceil": {
+   "returns": "Column"
+  },
+  "ceiling": {
+   "returns": "Column"
+  },
+  "char": {
+   "returns": "Column"
+  },
+  "char_length": {
+   "returns": "Column"
+  },
+  "character_length": {
+   "returns": "Column"
+  },
+  "coalesce": {
+   "returns": "Column"
+  },
+  "col": {
+   "returns": "Column"
+  },
+  "collate": {
+   "returns": "Column"
+  },
+  "collation": {
+   "returns": "Column"
+  },
+  "collect_list": {
+   "returns": "Column"
+  },
+  "collect_set": {
+   "returns": "Column"
+  },
+  "column": {
+   "returns": "Column"
+  },
+  "concat": {
+   "returns": "Column"
+  },
+  "concat_ws": {
+   "returns": "Column"
+  },
+  "contains": {
+   "returns": "Column"
+  },
+  "conv": {
+   "returns": "Column"
+  },
+  "convert_timezone": {
+   "returns": "Column"
+  },
+  "corr": {
+   "returns": "Column"
+  },
+  "cos": {
+   "returns": "Column"
+  },
+  "cosh": {
+   "returns": "Column"
+  },
+  "cot": {
+   "returns": "Column"
+  },
+  "count": {
+   "returns": "Column"
+  },
+  "count_distinct": {
+   "returns": "Column"
+  },
+  "count_if": {
+   "returns": "Column"
+  },
+  "count_min_sketch": {
+   "returns": "Column"
+  },
+  "covar_pop": {
+   "returns": "Column"
+  },
+  "covar_samp": {
+   "returns": "Column"
+  },
+  "crc32": {
+   "returns": "Column"
+  },
+  "create_map": {
+   "returns": "Column"
+  },
+  "csc": {
+   "returns": "Column"
+  },
+  "cume_dist": {
+   "returns": "Column"
+  },
+  "curdate": {
+   "returns": "Column"
+  },
+  "current_catalog": {
+   "returns": "Column"
+  },
+  "current_database": {
+   "returns": "Column"
+  },
+  "current_date": {
+   "returns": "Column"
+  },
+  "current_path": {
+   "returns": "Column"
+  },
+  "current_schema": {
+   "returns": "Column"
+  },
+  "current_time": {
+   "returns": "Column"
+  },
+  "current_timestamp": {
+   "returns": "Column"
+  },
+  "current_timezone": {
+   "returns": "Column"
+  },
+  "current_user": {
+   "returns": "Column"
+  },
+  "date_add": {
+   "returns": "Column"
+  },
+  "date_diff": {
+   "returns": "Column"
+  },
+  "date_format": {
+   "returns": "Column"
+  },
+  "date_from_unix_date": {
+   "returns": "Column"
+  },
+  "date_part": {
+   "returns": "Column"
+  },
+  "date_sub": {
+   "returns": "Column"
+  },
+  "date_trunc": {
+   "returns": "Column"
+  },
+  "dateadd": {
+   "returns": "Column"
+  },
+  "datediff": {
+   "returns": "Column"
+  },
+  "datepart": {
+   "returns": "Column"
+  },
+  "day": {
+   "returns": "Column"
+  },
+  "dayname": {
+   "returns": "Column"
+  },
+  "dayofmonth": {
+   "returns": "Column"
+  },
+  "dayofweek": {
+   "returns": "Column"
+  },
+  "dayofyear": {
+   "returns": "Column"
+  },
+  "days": {
+   "deprecated": "4.0.0",
+   "returns": "Column"
+  },
+  "decode": {
+   "returns": "Column"
+  },
+  "degrees": {
+   "returns": "Column"
+  },
+  "dense_rank": {
+   "returns": "Column"
+  },
+  "desc": {
+   "returns": "Column"
+  },
+  "desc_nulls_first": {
+   "returns": "Column"
+  },
+  "desc_nulls_last": {
+   "returns": "Column"
+  },
+  "e": {
+   "returns": "Column"
+  },
+  "element_at": {
+   "returns": "Column"
+  },
+  "elt": {
+   "returns": "Column"
+  },
+  "encode": {
+   "returns": "Column"
+  },
+  "endswith": {
+   "returns": "Column"
+  },
+  "equal_null": {
+   "returns": "Column"
+  },
+  "every": {
+   "returns": "Column"
+  },
+  "exists": {
+   "returns": "Column"
+  },
+  "exp": {
+   "returns": "Column"
+  },
+  "explode": {
+   "returns": "Column"
+  },
+  "explode_outer": {
+   "returns": "Column"
+  },
+  "expm1": {
+   "returns": "Column"
+  },
+  "expr": {
+   "returns": "Column"
+  },
+  "extract": {
+   "returns": "Column"
+  },
+  "factorial": {
+   "returns": "Column"
+  },
+  "filter": {
+   "returns": "Column"
+  },
+  "find_in_set": {
+   "returns": "Column"
+  },
+  "first": {
+   "returns": "Column"
+  },
+  "first_value": {
+   "returns": "Column"
+  },
+  "flatten": {
+   "returns": "Column"
+  },
+  "floor": {
+   "returns": "Column"
+  },
+  "forall": {
+   "returns": "Column"
+  },
+  "format_number": {
+   "returns": "Column"
+  },
+  "format_string": {
+   "returns": "Column"
+  },
+  "from_csv": {
+   "returns": "Column"
+  },
+  "from_json": {
+   "returns": "Column"
+  },
+  "from_unixtime": {
+   "returns": "Column"
+  },
+  "from_utc_timestamp": {
+   "returns": "Column"
+  },
+  "from_xml": {
+   "returns": "Column"
+  },
+  "get": {
+   "returns": "Column"
+  },
+  "get_json_object": {
+   "returns": "Column"
+  },
+  "getbit": {
+   "returns": "Column"
+  },
+  "greatest": {
+   "returns": "Column"
+  },
+  "grouping": {
+   "returns": "Column"
+  },
+  "grouping_id": {
+   "returns": "Column"
+  },
+  "hash": {
+   "returns": "Column"
+  },
+  "hex": {
+   "returns": "Column"
+  },
+  "histogram_numeric": {
+   "returns": "Column"
+  },
+  "hll_sketch_agg": {
+   "returns": "Column"
+  },
+  "hll_sketch_estimate": {
+   "returns": "Column"
+  },
+  "hll_union": {
+   "returns": "Column"
+  },
+  "hll_union_agg": {
+   "returns": "Column"
+  },
+  "hour": {
+   "returns": "Column"
+  },
+  "hours": {
+   "deprecated": "4.0.0",
+   "returns": "Column"
+  },
+  "hypot": {
+   "returns": "Column"
+  },
+  "ifnull": {
+   "returns": "Column"
+  },
+  "ilike": {
+   "returns": "Column"
+  },
+  "initcap": {
+   "returns": "Column"
+  },
+  "inline": {
+   "returns": "Column"
+  },
+  "inline_outer": {
+   "returns": "Column"
+  },
+  "input_file_block_length": {
+   "returns": "Column"
+  },
+  "input_file_block_start": {
+   "returns": "Column"
+  },
+  "input_file_name": {
+   "returns": "Column"
+  },
+  "instr": {
+   "returns": "Column"
+  },
+  "is_valid_utf8": {
+   "returns": "Column"
+  },
+  "is_valid_variant": {
+   "returns": "Column"
+  },
+  "is_variant_null": {
+   "returns": "Column"
+  },
+  "isnan": {
+   "returns": "Column"
+  },
+  "isnotnull": {
+   "returns": "Column"
+  },
+  "isnull": {
+   "returns": "Column"
+  },
+  "java_method": {
+   "returns": "Column"
+  },
+  "json_array_length": {
+   "returns": "Column"
+  },
+  "json_object_keys": {
+   "returns": "Column"
+  },
+  "json_tuple": {
+   "returns": "Column"
+  },
+  "kll_merge_agg_bigint": {
+   "returns": "Column"
+  },
+  "kll_merge_agg_double": {
+   "returns": "Column"
+  },
+  "kll_merge_agg_float": {
+   "returns": "Column"
+  },
+  "kll_sketch_agg_bigint": {
+   "returns": "Column"
+  },
+  "kll_sketch_agg_double": {
+   "returns": "Column"
+  },
+  "kll_sketch_agg_float": {
+   "returns": "Column"
+  },
+  "kll_sketch_get_n_bigint": {
+   "returns": "Column"
+  },
+  "kll_sketch_get_n_double": {
+   "returns": "Column"
+  },
+  "kll_sketch_get_n_float": {
+   "returns": "Column"
+  },
+  "kll_sketch_get_quantile_bigint": {
+   "returns": "Column"
+  },
+  "kll_sketch_get_quantile_double": {
+   "returns": "Column"
+  },
+  "kll_sketch_get_quantile_float": {
+   "returns": "Column"
+  },
+  "kll_sketch_get_rank_bigint": {
+   "returns": "Column"
+  },
+  "kll_sketch_get_rank_double": {
+   "returns": "Column"
+  },
+  "kll_sketch_get_rank_float": {
+   "returns": "Column"
+  },
+  "kll_sketch_merge_bigint": {
+   "returns": "Column"
+  },
+  "kll_sketch_merge_double": {
+   "returns": "Column"
+  },
+  "kll_sketch_merge_float": {
+   "returns": "Column"
+  },
+  "kll_sketch_to_string_bigint": {
+   "returns": "Column"
+  },
+  "kll_sketch_to_string_double": {
+   "returns": "Column"
+  },
+  "kll_sketch_to_string_float": {
+   "returns": "Column"
+  },
+  "kurtosis": {
+   "returns": "Column"
+  },
+  "lag": {
+   "returns": "Column"
+  },
+  "last": {
+   "returns": "Column"
+  },
+  "last_day": {
+   "returns": "Column"
+  },
+  "last_value": {
+   "returns": "Column"
+  },
+  "lcase": {
+   "returns": "Column"
+  },
+  "lead": {
+   "returns": "Column"
+  },
+  "least": {
+   "returns": "Column"
+  },
+  "left": {
+   "returns": "Column"
+  },
+  "length": {
+   "returns": "Column"
+  },
+  "levenshtein": {
+   "returns": "Column"
+  },
+  "like": {
+   "returns": "Column"
+  },
+  "listagg": {
+   "returns": "Column"
+  },
+  "listagg_distinct": {
+   "returns": "Column"
+  },
+  "lit": {
+   "returns": "Column"
+  },
+  "ln": {
+   "returns": "Column"
+  },
+  "localtimestamp": {
+   "returns": "Column"
+  },
+  "locate": {
+   "returns": "Column"
+  },
+  "log": {
+   "returns": "Column"
+  },
+  "log10": {
+   "returns": "Column"
+  },
+  "log1p": {
+   "returns": "Column"
+  },
+  "log2": {
+   "returns": "Column"
+  },
+  "lower": {
+   "returns": "Column"
+  },
+  "lpad": {
+   "returns": "Column"
+  },
+  "ltrim": {
+   "returns": "Column"
+  },
+  "make_date": {
+   "returns": "Column"
+  },
+  "make_dt_interval": {
+   "returns": "Column"
+  },
+  "make_interval": {
+   "returns": "Column"
+  },
+  "make_time": {
+   "returns": "Column"
+  },
+  "make_timestamp": {
+   "returns": "Column"
+  },
+  "make_timestamp_ltz": {
+   "returns": "Column"
+  },
+  "make_timestamp_ntz": {
+   "returns": "Column"
+  },
+  "make_valid_utf8": {
+   "returns": "Column"
+  },
+  "make_ym_interval": {
+   "returns": "Column"
+  },
+  "map_concat": {
+   "returns": "Column"
+  },
+  "map_contains_key": {
+   "returns": "Column"
+  },
+  "map_entries": {
+   "returns": "Column"
+  },
+  "map_filter": {
+   "returns": "Column"
+  },
+  "map_from_arrays": {
+   "returns": "Column"
+  },
+  "map_from_entries": {
+   "returns": "Column"
+  },
+  "map_keys": {
+   "returns": "Column"
+  },
+  "map_values": {
+   "returns": "Column"
+  },
+  "map_zip_with": {
+   "returns": "Column"
+  },
+  "mask": {
+   "returns": "Column"
+  },
+  "max": {
+   "returns": "Column"
+  },
+  "max_by": {
+   "returns": "Column"
+  },
+  "md5": {
+   "returns": "Column"
+  },
+  "mean": {
+   "returns": "Column"
+  },
+  "median": {
+   "returns": "Column"
+  },
+  "min": {
+   "returns": "Column"
+  },
+  "min_by": {
+   "returns": "Column"
+  },
+  "minute": {
+   "returns": "Column"
+  },
+  "mode": {
+   "returns": "Column"
+  },
+  "monotonically_increasing_id": {
+   "returns": "Column"
+  },
+  "month": {
+   "returns": "Column"
+  },
+  "monthname": {
+   "returns": "Column"
+  },
+  "months": {
+   "deprecated": "4.0.0",
+   "returns": "Column"
+  },
+  "months_between": {
+   "returns": "Column"
+  },
+  "named_struct": {
+   "returns": "Column"
+  },
+  "nanvl": {
+   "returns": "Column"
+  },
+  "negate": {
+   "returns": "Column"
+  },
+  "negative": {
+   "returns": "Column"
+  },
+  "next_day": {
+   "returns": "Column"
+  },
+  "now": {
+   "returns": "Column"
+  },
+  "nth_value": {
+   "returns": "Column"
+  },
+  "ntile": {
+   "returns": "Column"
+  },
+  "nullif": {
+   "returns": "Column"
+  },
+  "nullifzero": {
+   "returns": "Column"
+  },
+  "nvl": {
+   "returns": "Column"
+  },
+  "nvl2": {
+   "returns": "Column"
+  },
+  "octet_length": {
+   "returns": "Column"
+  },
+  "overlay": {
+   "returns": "Column"
+  },
+  "pandas_udf": {
+   "returns": "other"
+  },
+  "parse_json": {
+   "returns": "Column"
+  },
+  "parse_url": {
+   "returns": "Column"
+  },
+  "percent_rank": {
+   "returns": "Column"
+  },
+  "percentile": {
+   "returns": "Column"
+  },
+  "percentile_approx": {
+   "returns": "Column"
+  },
+  "pi": {
+   "returns": "Column"
+  },
+  "pmod": {
+   "returns": "Column"
+  },
+  "posexplode": {
+   "returns": "Column"
+  },
+  "posexplode_outer": {
+   "returns": "Column"
+  },
+  "position": {
+   "returns": "Column"
+  },
+  "positive": {
+   "returns": "Column"
+  },
+  "pow": {
+   "returns": "Column"
+  },
+  "power": {
+   "returns": "Column"
+  },
+  "printf": {
+   "returns": "Column"
+  },
+  "product": {
+   "returns": "Column"
+  },
+  "quarter": {
+   "returns": "Column"
+  },
+  "quote": {
+   "returns": "Column"
+  },
+  "radians": {
+   "returns": "Column"
+  },
+  "raise_error": {
+   "returns": "Column"
+  },
+  "rand": {
+   "returns": "Column"
+  },
+  "randn": {
+   "returns": "Column"
+  },
+  "randstr": {
+   "returns": "Column"
+  },
+  "rank": {
+   "returns": "Column"
+  },
+  "reduce": {
+   "returns": "Column"
+  },
+  "reflect": {
+   "returns": "Column"
+  },
+  "regexp": {
+   "returns": "Column"
+  },
+  "regexp_count": {
+   "returns": "Column"
+  },
+  "regexp_extract": {
+   "returns": "Column"
+  },
+  "regexp_extract_all": {
+   "returns": "Column"
+  },
+  "regexp_instr": {
+   "returns": "Column"
+  },
+  "regexp_like": {
+   "returns": "Column"
+  },
+  "regexp_replace": {
+   "returns": "Column"
+  },
+  "regexp_substr": {
+   "returns": "Column"
+  },
+  "regr_avgx": {
+   "returns": "Column"
+  },
+  "regr_avgy": {
+   "returns": "Column"
+  },
+  "regr_count": {
+   "returns": "Column"
+  },
+  "regr_intercept": {
+   "returns": "Column"
+  },
+  "regr_r2": {
+   "returns": "Column"
+  },
+  "regr_slope": {
+   "returns": "Column"
+  },
+  "regr_sxx": {
+   "returns": "Column"
+  },
+  "regr_sxy": {
+   "returns": "Column"
+  },
+  "regr_syy": {
+   "returns": "Column"
+  },
+  "repeat": {
+   "returns": "Column"
+  },
+  "replace": {
+   "returns": "Column"
+  },
+  "reverse": {
+   "returns": "Column"
+  },
+  "right": {
+   "returns": "Column"
+  },
+  "rint": {
+   "returns": "Column"
+  },
+  "rlike": {
+   "returns": "Column"
+  },
+  "round": {
+   "returns": "Column"
+  },
+  "row_number": {
+   "returns": "Column"
+  },
+  "rpad": {
+   "returns": "Column"
+  },
+  "rtrim": {
+   "returns": "Column"
+  },
+  "schema_of_csv": {
+   "returns": "Column"
+  },
+  "schema_of_json": {
+   "returns": "Column"
+  },
+  "schema_of_variant": {
+   "returns": "Column"
+  },
+  "schema_of_variant_agg": {
+   "returns": "Column"
+  },
+  "schema_of_xml": {
+   "returns": "Column"
+  },
+  "sec": {
+   "returns": "Column"
+  },
+  "second": {
+   "returns": "Column"
+  },
+  "sentences": {
+   "returns": "Column"
+  },
+  "sequence": {
+   "returns": "Column"
+  },
+  "session_user": {
+   "returns": "Column"
+  },
+  "session_window": {
+   "returns": "Column"
+  },
+  "sha": {
+   "returns": "Column"
+  },
+  "sha1": {
+   "returns": "Column"
+  },
+  "sha2": {
+   "returns": "Column"
+  },
+  "shiftleft": {
+   "returns": "Column"
+  },
+  "shiftright": {
+   "returns": "Column"
+  },
+  "shiftrightunsigned": {
+   "returns": "Column"
+  },
+  "shuffle": {
+   "returns": "Column"
+  },
+  "sign": {
+   "returns": "Column"
+  },
+  "signum": {
+   "returns": "Column"
+  },
+  "sin": {
+   "returns": "Column"
+  },
+  "sinh": {
+   "returns": "Column"
+  },
+  "size": {
+   "returns": "Column"
+  },
+  "skewness": {
+   "returns": "Column"
+  },
+  "slice": {
+   "returns": "Column"
+  },
+  "some": {
+   "returns": "Column"
+  },
+  "sort_array": {
+   "returns": "Column"
+  },
+  "soundex": {
+   "returns": "Column"
+  },
+  "spark_partition_id": {
+   "returns": "Column"
+  },
+  "split": {
+   "returns": "Column"
+  },
+  "split_part": {
+   "returns": "Column"
+  },
+  "sqrt": {
+   "returns": "Column"
+  },
+  "st_asbinary": {
+   "returns": "Column"
+  },
+  "st_geogfromwkb": {
+   "returns": "Column"
+  },
+  "st_geomfromwkb": {
+   "returns": "Column"
+  },
+  "st_setsrid": {
+   "returns": "Column"
+  },
+  "st_srid": {
+   "returns": "Column"
+  },
+  "stack": {
+   "returns": "Column"
+  },
+  "startswith": {
+   "returns": "Column"
+  },
+  "std": {
+   "returns": "Column"
+  },
+  "stddev": {
+   "returns": "Column"
+  },
+  "stddev_pop": {
+   "returns": "Column"
+  },
+  "stddev_samp": {
+   "returns": "Column"
+  },
+  "str_to_map": {
+   "returns": "Column"
+  },
+  "string_agg": {
+   "returns": "Column"
+  },
+  "string_agg_distinct": {
+   "returns": "Column"
+  },
+  "struct": {
+   "returns": "Column"
+  },
+  "substr": {
+   "returns": "Column"
+  },
+  "substring": {
+   "returns": "Column"
+  },
+  "substring_index": {
+   "returns": "Column"
+  },
+  "sum": {
+   "returns": "Column"
+  },
+  "sum_distinct": {
+   "returns": "Column"
+  },
+  "tan": {
+   "returns": "Column"
+  },
+  "tanh": {
+   "returns": "Column"
+  },
+  "theta_difference": {
+   "returns": "Column"
+  },
+  "theta_intersection": {
+   "returns": "Column"
+  },
+  "theta_intersection_agg": {
+   "returns": "Column"
+  },
+  "theta_sketch_agg": {
+   "returns": "Column"
+  },
+  "theta_sketch_estimate": {
+   "returns": "Column"
+  },
+  "theta_union": {
+   "returns": "Column"
+  },
+  "theta_union_agg": {
+   "returns": "Column"
+  },
+  "time_bucket": {
+   "returns": "Column"
+  },
+  "time_diff": {
+   "returns": "Column"
+  },
+  "time_from_micros": {
+   "returns": "Column"
+  },
+  "time_from_millis": {
+   "returns": "Column"
+  },
+  "time_from_seconds": {
+   "returns": "Column"
+  },
+  "time_to_micros": {
+   "returns": "Column"
+  },
+  "time_to_millis": {
+   "returns": "Column"
+  },
+  "time_to_seconds": {
+   "returns": "Column"
+  },
+  "time_trunc": {
+   "returns": "Column"
+  },
+  "timestamp_add": {
+   "returns": "Column"
+  },
+  "timestamp_diff": {
+   "returns": "Column"
+  },
+  "timestamp_micros": {
+   "returns": "Column"
+  },
+  "timestamp_millis": {
+   "returns": "Column"
+  },
+  "timestamp_seconds": {
+   "returns": "Column"
+  },
+  "to_binary": {
+   "returns": "Column"
+  },
+  "to_char": {
+   "returns": "Column"
+  },
+  "to_csv": {
+   "returns": "Column"
+  },
+  "to_date": {
+   "returns": "Column"
+  },
+  "to_json": {
+   "returns": "Column"
+  },
+  "to_number": {
+   "returns": "Column"
+  },
+  "to_time": {
+   "returns": "Column"
+  },
+  "to_timestamp": {
+   "returns": "Column"
+  },
+  "to_timestamp_ltz": {
+   "returns": "Column"
+  },
+  "to_timestamp_ntz": {
+   "returns": "Column"
+  },
+  "to_unix_timestamp": {
+   "returns": "Column"
+  },
+  "to_utc_timestamp": {
+   "returns": "Column"
+  },
+  "to_varchar": {
+   "returns": "Column"
+  },
+  "to_variant_object": {
+   "returns": "Column"
+  },
+  "to_xml": {
+   "returns": "Column"
+  },
+  "transform": {
+   "returns": "Column"
+  },
+  "transform_keys": {
+   "returns": "Column"
+  },
+  "transform_values": {
+   "returns": "Column"
+  },
+  "translate": {
+   "returns": "Column"
+  },
+  "trim": {
+   "returns": "Column"
+  },
+  "trunc": {
+   "returns": "Column"
+  },
+  "try_add": {
+   "returns": "Column"
+  },
+  "try_aes_decrypt": {
+   "returns": "Column"
+  },
+  "try_avg": {
+   "returns": "Column"
+  },
+  "try_divide": {
+   "returns": "Column"
+  },
+  "try_element_at": {
+   "returns": "Column"
+  },
+  "try_make_interval": {
+   "returns": "Column"
+  },
+  "try_make_timestamp": {
+   "returns": "Column"
+  },
+  "try_make_timestamp_ltz": {
+   "returns": "Column"
+  },
+  "try_make_timestamp_ntz": {
+   "returns": "Column"
+  },
+  "try_mod": {
+   "returns": "Column"
+  },
+  "try_multiply": {
+   "returns": "Column"
+  },
+  "try_parse_json": {
+   "returns": "Column"
+  },
+  "try_parse_url": {
+   "returns": "Column"
+  },
+  "try_reflect": {
+   "returns": "Column"
+  },
+  "try_subtract": {
+   "returns": "Column"
+  },
+  "try_sum": {
+   "returns": "Column"
+  },
+  "try_to_binary": {
+   "returns": "Column"
+  },
+  "try_to_date": {
+   "returns": "Column"
+  },
+  "try_to_number": {
+   "returns": "Column"
+  },
+  "try_to_time": {
+   "returns": "Column"
+  },
+  "try_to_timestamp": {
+   "returns": "Column"
+  },
+  "try_url_decode": {
+   "returns": "Column"
+  },
+  "try_validate_utf8": {
+   "returns": "Column"
+  },
+  "try_variant_get": {
+   "returns": "Column"
+  },
+  "tuple_difference_double": {
+   "returns": "Column"
+  },
+  "tuple_difference_integer": {
+   "returns": "Column"
+  },
+  "tuple_difference_theta_double": {
+   "returns": "Column"
+  },
+  "tuple_difference_theta_integer": {
+   "returns": "Column"
+  },
+  "tuple_intersection_agg_double": {
+   "returns": "Column"
+  },
+  "tuple_intersection_agg_integer": {
+   "returns": "Column"
+  },
+  "tuple_intersection_double": {
+   "returns": "Column"
+  },
+  "tuple_intersection_integer": {
+   "returns": "Column"
+  },
+  "tuple_intersection_theta_double": {
+   "returns": "Column"
+  },
+  "tuple_intersection_theta_integer": {
+   "returns": "Column"
+  },
+  "tuple_sketch_agg_double": {
+   "returns": "Column"
+  },
+  "tuple_sketch_agg_integer": {
+   "returns": "Column"
+  },
+  "tuple_sketch_estimate_double": {
+   "returns": "Column"
+  },
+  "tuple_sketch_estimate_integer": {
+   "returns": "Column"
+  },
+  "tuple_sketch_summary_double": {
+   "returns": "Column"
+  },
+  "tuple_sketch_summary_integer": {
+   "returns": "Column"
+  },
+  "tuple_sketch_theta_double": {
+   "returns": "Column"
+  },
+  "tuple_sketch_theta_integer": {
+   "returns": "Column"
+  },
+  "tuple_union_agg_double": {
+   "returns": "Column"
+  },
+  "tuple_union_agg_integer": {
+   "returns": "Column"
+  },
+  "tuple_union_double": {
+   "returns": "Column"
+  },
+  "tuple_union_integer": {
+   "returns": "Column"
+  },
+  "tuple_union_theta_double": {
+   "returns": "Column"
+  },
+  "tuple_union_theta_integer": {
+   "returns": "Column"
+  },
+  "typeof": {
+   "returns": "Column"
+  },
+  "ucase": {
+   "returns": "Column"
+  },
+  "udf": {
+   "returns": "other"
+  },
+  "udtf": {
+   "returns": "other"
+  },
+  "unbase64": {
+   "returns": "Column"
+  },
+  "unhex": {
+   "returns": "Column"
+  },
+  "uniform": {
+   "returns": "Column"
+  },
+  "unix_date": {
+   "returns": "Column"
+  },
+  "unix_micros": {
+   "returns": "Column"
+  },
+  "unix_millis": {
+   "returns": "Column"
+  },
+  "unix_seconds": {
+   "returns": "Column"
+  },
+  "unix_timestamp": {
+   "returns": "Column"
+  },
+  "unwrap_udt": {
+   "returns": "Column"
+  },
+  "upper": {
+   "returns": "Column"
+  },
+  "url_decode": {
+   "returns": "Column"
+  },
+  "url_encode": {
+   "returns": "Column"
+  },
+  "user": {
+   "returns": "Column"
+  },
+  "validate_utf8": {
+   "returns": "Column"
+  },
+  "var_pop": {
+   "returns": "Column"
+  },
+  "var_samp": {
+   "returns": "Column"
+  },
+  "variance": {
+   "returns": "Column"
+  },
+  "variant_get": {
+   "returns": "Column"
+  },
+  "version": {
+   "returns": "Column"
+  },
+  "weekday": {
+   "returns": "Column"
+  },
+  "weekofyear": {
+   "returns": "Column"
+  },
+  "when": {
+   "returns": "Column"
+  },
+  "width_bucket": {
+   "returns": "Column"
+  },
+  "window": {
+   "returns": "Column"
+  },
+  "window_time": {
+   "returns": "Column"
+  },
+  "xpath": {
+   "returns": "Column"
+  },
+  "xpath_boolean": {
+   "returns": "Column"
+  },
+  "xpath_double": {
+   "returns": "Column"
+  },
+  "xpath_float": {
+   "returns": "Column"
+  },
+  "xpath_int": {
+   "returns": "Column"
+  },
+  "xpath_long": {
+   "returns": "Column"
+  },
+  "xpath_number": {
+   "returns": "Column"
+  },
+  "xpath_short": {
+   "returns": "Column"
+  },
+  "xpath_string": {
+   "returns": "Column"
+  },
+  "xxhash64": {
+   "returns": "Column"
+  },
+  "year": {
+   "returns": "Column"
+  },
+  "years": {
+   "deprecated": "4.0.0",
+   "returns": "Column"
+  },
+  "zeroifnull": {
+   "returns": "Column"
+  },
+  "zip_with": {
+   "returns": "Column"
+  }
+ },
+ "pyspark_version": "4.2.0"
+}
