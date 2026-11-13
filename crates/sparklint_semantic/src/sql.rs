@@ -368,12 +368,12 @@ impl SqlText {
             .flatten()
     }
 
-    /// Whether the query provably returns at most one row: `DESCRIBE DETAIL`, a
-    /// `SELECT` without `FROM`, or a `SELECT` of only aggregates with no `GROUP BY`
+    /// Whether the query provably returns at most one row: `DESCRIBE DETAIL`, an
+    /// `EXPLAIN` (one row of plan text), a `SELECT` without `FROM`, or a `SELECT` of only aggregates with no `GROUP BY`
     /// (`SELECT max(d) FROM t`).
     pub fn single_row(&self) -> bool {
         let up = self.code.trim().trim_end_matches(';').trim();
-        if self.words().starts_with(&["DESCRIBE", "DETAIL"]) {
+        if self.words().starts_with(&["DESCRIBE", "DETAIL"]) || self.explain() {
             return true;
         }
         let Some(rest) = up.strip_prefix("SELECT") else {
@@ -408,35 +408,39 @@ impl SqlText {
         if end == rest.len() {
             return !self.has_keyword("FROM") && !self.has_keyword("WHERE");
         }
-        const AGGS: &[&str] = &[
-            "COUNT",
-            "MAX",
-            "MIN",
-            "SUM",
-            "AVG",
-            "MEAN",
-            "ANY_VALUE",
-            "FIRST",
-            "LAST",
-            "COUNT_IF",
-            "BOOL_AND",
-            "BOOL_OR",
-            "MAX_BY",
-            "MIN_BY",
-            "APPROX_COUNT_DISTINCT",
-            "COLLECT_SET",
-            "COLLECT_LIST",
-            "PERCENTILE",
-            "PERCENTILE_APPROX",
-            "MEDIAN",
-            "STDDEV",
-            "VARIANCE",
-        ];
-        split_top_commas(&rest[..end]).iter().all(|it| {
-            let it = it.trim().trim_start_matches("DISTINCT ").trim();
-            AGGS.iter()
-                .any(|a| is_word_at(it, 0, a) && it[a.len()..].trim_start().starts_with('('))
-        })
+        // A window aggregate (`max(x) OVER (..)`) is one value per row.
+        !self.has_keyword("OVER")
+            && split_top_commas(&rest[..end])
+                .iter()
+                .all(|it| is_aggregate_item(it))
+    }
+
+    /// Whether the text, read as ONE select-list expression (a `selectExpr` argument),
+    /// is a global aggregate: `min(d) AS lo`, `count(*)`, `variance(a - b)`. A window
+    /// aggregate (`OVER`) or a list of several expressions is not.
+    pub fn aggregate_expression(&self) -> bool {
+        let items = split_top_commas(&self.code);
+        !self.has_keyword("OVER") && items.len() == 1 && is_aggregate_item(items[0])
+    }
+
+    /// Whether the statement is `EXPLAIN [EXTENDED|CODEGEN|COST|FORMATTED] <query>`:
+    /// Spark only plans the inner query and returns its plan as one row of text.
+    pub fn explain(&self) -> bool {
+        self.words().first() == Some(&"EXPLAIN")
+    }
+
+    /// Whether the statement is a catalog metadata command whose result is sized by
+    /// the catalog, not by table data: `SHOW TABLES` / `SHOW TBLPROPERTIES` / `SHOW
+    /// COLUMNS` / `SHOW CATALOGS` ..., `DESCRIBE [TABLE|EXTENDED|SCHEMA|FUNCTION ..] x`.
+    /// `SHOW PARTITIONS` and `DESCRIBE HISTORY` grow with the data / commit count and
+    /// are not metadata here.
+    pub fn catalog_metadata(&self) -> bool {
+        let w = self.words();
+        match w.as_slice() {
+            ["SHOW", second, ..] => *second != "PARTITIONS",
+            ["DESCRIBE" | "DESC", second, ..] => !matches!(*second, "HISTORY" | "QUERY"),
+            _ => false,
+        }
     }
 
     /// Whether the query contains `NOT IN (SELECT|WITH ...)`.
@@ -727,6 +731,54 @@ fn is_word_at(up: &str, i: usize, w: &str) -> bool {
         && b.get(i + w.len()).is_none_or(|c| !ident(*c))
 }
 
+/// SQL aggregate functions: one value per group.
+const SQL_AGGREGATES: &[&str] = &[
+    "COUNT",
+    "MAX",
+    "MIN",
+    "SUM",
+    "AVG",
+    "MEAN",
+    "ANY_VALUE",
+    "FIRST",
+    "LAST",
+    "COUNT_IF",
+    "BOOL_AND",
+    "BOOL_OR",
+    "EVERY",
+    "MAX_BY",
+    "MIN_BY",
+    "APPROX_COUNT_DISTINCT",
+    "COLLECT_SET",
+    "COLLECT_LIST",
+    "ARRAY_AGG",
+    "PERCENTILE",
+    "PERCENTILE_APPROX",
+    "APPROX_PERCENTILE",
+    "MEDIAN",
+    "MODE",
+    "STDDEV",
+    "STDDEV_SAMP",
+    "STDDEV_POP",
+    "VARIANCE",
+    "VAR_SAMP",
+    "VAR_POP",
+    "CORR",
+    "COVAR_POP",
+    "COVAR_SAMP",
+    "SKEWNESS",
+    "KURTOSIS",
+];
+
+/// Whether one select-list item of the upper-cased code view starts with an aggregate
+/// call (`MAX(x)`, `COUNT(DISTINCT k) AS n`).
+fn is_aggregate_item(it: &str) -> bool {
+    let it = it.trim().trim_start_matches("DISTINCT ").trim();
+    SQL_AGGREGATES
+        .iter()
+        .any(|a| is_word_at(it, 0, a) && it[a.len()..].trim_start().starts_with('('))
+}
+
 fn split_top_commas(s: &str) -> Vec<&str> {
     let mut items = Vec::new();
     let (mut d, mut start) = (0i32, 0usize);
@@ -1012,11 +1064,20 @@ impl SemanticModel<'_> {
         None
     }
 
-    /// The query of a `sql(sqlQuery, ...)` call, resolved (see [`Self::resolve_text`]).
-    /// The caller checks the receiver.
-    pub fn sql_query(&self, c: &ast::ExprCall) -> Option<SqlText> {
+    /// The statement of a `sql(sqlQuery, ...)` call, resolved (see
+    /// [`Self::resolve_text`]), `EXPLAIN` included. The caller checks the receiver.
+    /// Only the result's shape (row bound) is read from it; rules about what the
+    /// query RUNS use [`Self::sql_query`].
+    pub fn sql_statement(&self, c: &ast::ExprCall) -> Option<SqlText> {
         let q = call_arg(c, 0, "sqlQuery")?;
         self.resolve_text(q).map(|t| SqlText::new(&t))
+    }
+
+    /// The query a `sql(sqlQuery, ...)` call executes ([`Self::sql_statement`]);
+    /// `None` for an `EXPLAIN`, which only plans its query (nothing is scanned,
+    /// sorted or written). The caller checks the receiver.
+    pub fn sql_query(&self, c: &ast::ExprCall) -> Option<SqlText> {
+        self.sql_statement(c).filter(|q| !q.explain())
     }
 
     /// `spark.sql(...)` on a session: its query.
@@ -1155,6 +1216,56 @@ mod tests {
         ));
         assert!(!s("DESCRIBE HISTORY t"));
         assert!(!s("SELECT maximum(x) FROM t"));
+        assert!(s("SELECT var_samp(x), stddev_pop(y) FROM t"));
+        assert!(!s("SELECT max(x) OVER (PARTITION BY k) FROM t"));
+        assert!(s("explain cost select * from view"));
+        assert!(s("EXPLAIN FORMATTED SELECT * FROM big ORDER BY rand()"));
+    }
+
+    #[test]
+    fn explain_statements() {
+        let e = |x: &str| q(x).explain();
+        assert!(e("EXPLAIN SELECT * FROM t"));
+        assert!(e("explain extended select a from t"));
+        assert!(e("-- plan\n EXPLAIN CODEGEN SELECT 1;"));
+        assert!(!e("SELECT 'EXPLAIN' FROM t"));
+        assert!(!e("SELECT explain FROM t"));
+        assert!(!e("DESCRIBE QUERY SELECT * FROM t"));
+    }
+
+    #[test]
+    fn aggregate_select_expressions() {
+        let a = |x: &str| q(x).aggregate_expression();
+        assert!(a("min(post_date) as min_post_date"));
+        assert!(a("variance(label-prediction)"));
+        assert!(a("COUNT(DISTINCT k) n"));
+        assert!(a("max(order_id)"));
+        assert!(a("max({})"));
+        assert!(!a("max(x) over (partition by k)"));
+        assert!(!a("min(a), b"));
+        assert!(!a("k"));
+        assert!(!a("maximum(x)"));
+        assert!(!a("'max(x)'"));
+        assert!(!a(""));
+    }
+
+    #[test]
+    fn catalog_metadata_commands() {
+        let m = |x: &str| q(x).catalog_metadata();
+        assert!(m("DESCRIBE TABLE EXTENDED cat.sch.t"));
+        assert!(m("describe `a`.`b`"));
+        assert!(m("DESC FORMATTED t"));
+        assert!(m("SHOW TBLPROPERTIES t"));
+        assert!(m("show tables in sales like 'x*'"));
+        assert!(m("SHOW CATALOGS"));
+        assert!(m("SHOW COLUMNS IN t"));
+        assert!(m("-- props\nSHOW TBLPROPERTIES t;"));
+        assert!(!m("SHOW PARTITIONS t"));
+        assert!(!m("DESCRIBE HISTORY t"));
+        assert!(!m("DESCRIBE QUERY SELECT * FROM t"));
+        assert!(!m("SELECT * FROM t"));
+        assert!(!m("SELECT 'SHOW TABLES' FROM t"));
+        assert!(!m("SHOW"));
     }
 
     #[test]

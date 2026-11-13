@@ -7,4 +7,4 @@ spark = SparkSession.builder.getOrCreate()
 raw = spark.read.table("bronze.events")
 
 # JSON schema inferred over an RDD of strings: IOD016 reports it
-schema = spark.read.json(raw.rdd.map(lambda r: r.payload)).schema  # expect: IOD001
+parsed = spark.read.json(raw.rdd.map(lambda r: r.payload))  # expect: IOD001

@@ -11,6 +11,9 @@ rust-version.workspace = true
 
 [dependencies]
 ruff_notebook = { workspace = true }
+ruff_diagnostics = { workspace = true }
+# Only for its `float_roundtrip` feature: notebook outputs are written back unchanged.
+serde_json = { workspace = true }
 ruff_python_ast = { workspace = true }
 ruff_text_size = { workspace = true }
 ruff_source_file = { workspace = true }

@@ -41,7 +41,7 @@ enum Command {
     Rules {
         #[arg(long, value_enum, default_value_t = ListFormat::Text)]
         format: ListFormat,
-        /// Only show implemented rules (hide planned ones).
+        /// Only show implemented rules.
         #[arg(long)]
         implemented: bool,
     },
@@ -65,8 +65,13 @@ pub enum OutputFormat {
 
 #[derive(Debug, Args)]
 pub struct CheckArgs {
-    /// Files or directories to lint (default: current directory).
+    /// Files or directories to lint (default: current directory); `-` reads one file
+    /// from standard input.
     pub paths: Vec<PathBuf>,
+    /// Path of the file read from standard input: picks the config, the file kind
+    /// (`.ipynb`) and the name in the output. Implies `-` when no path is given.
+    #[arg(long, value_name = "PATH")]
+    pub stdin_filename: Option<PathBuf>,
     /// Rule selectors to enable (codes, prefixes, `tag:x`, presets); replaces the config.
     #[arg(long, value_delimiter = ',')]
     pub select: Option<Vec<String>>,

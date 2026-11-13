@@ -11,7 +11,8 @@ use ruff_python_ast::{self as ast, Expr, ExprContext, Stmt};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::api::{self, DATAFRAME_ONLY_METHODS, SESSION_ONLY_ATTRS, canonical_qualified};
+use crate::api::{self, canonical_qualified};
+use crate::evidence::{self, Evidence};
 use crate::model::*;
 use crate::types::{Elem, Ty, TypeInfo};
 
@@ -25,7 +26,18 @@ pub fn build_model<'a>(
     external: &'a dyn SummaryProvider,
 ) -> SemanticModel<'a> {
     // Pass 1: compute summaries.
-    let pass1 = Walker::run(module, source_len, opts.clone(), external, Prior::default());
+    let mut pass1 = Walker::run(module, source_len, opts.clone(), external, Prior::default());
+    // Usage evidence needs every use of a binding, so it is read off pass 1. A value
+    // with a pandas-only use must not be guessed a DataFrame in the summaries either:
+    // when there is one, pass 1 runs again knowing it.
+    let pandas_used = pandas_used_bindings(&pass1);
+    if !pandas_used.is_empty() {
+        let prior = Prior {
+            pandas_used: pandas_used.clone(),
+            ..Prior::default()
+        };
+        pass1 = Walker::run(module, source_len, opts.clone(), external, prior);
+    }
     let mut prior = Prior::default();
     for f in &pass1.functions {
         let t = f.return_type();
@@ -35,6 +47,7 @@ pub fn build_model<'a>(
     }
     prior.class_attrs = pass1.class_attrs.clone();
     prior.arg_evidence = pass1.arg_evidence.clone();
+    prior.pandas_used = pandas_used;
     drop(pass1);
     // Pass 2: the final model.
     Walker::run(module, source_len, opts, external, prior)
@@ -173,7 +186,7 @@ impl<'a> Walker<'a> {
         if reaching.is_empty() {
             let t = self.m.unbound_type(name);
             return if t.is_unknown() {
-                self.m.name_heuristic(name)
+                self.m.name_heuristic(name, reaching)
             } else {
                 t
             };
@@ -184,7 +197,7 @@ impl<'a> Walker<'a> {
             .reduce(TypeInfo::join)
             .unwrap_or(TypeInfo::UNKNOWN);
         if t.is_unknown() {
-            self.m.name_heuristic(name)
+            self.m.name_heuristic(name, reaching)
         } else {
             t
         }
@@ -1468,11 +1481,25 @@ impl<'a> Visitor<'a> for Walker<'a> {
 }
 
 /// Usage evidence for untyped parameters: `p.withColumn(...)` ⇒ DataFrame,
-/// `p.read` / `p.createDataFrame(...)` ⇒ SparkSession.
+/// `p.read` / `p.createDataFrame(...)` ⇒ SparkSession, `p.iloc` ⇒ pandas; mixed
+/// evidence is none ([`evidence::Evidence::verdict`]).
 fn param_evidence(body: &[Stmt], params: &[&str]) -> FxHashMap<String, Ty> {
     struct Ev<'p> {
         params: &'p [&'p str],
-        out: FxHashMap<String, Ty>,
+        found: FxHashMap<String, Evidence>,
+    }
+    impl Ev<'_> {
+        /// `x.attr` / `x.attr(..)` with `x` a parameter.
+        fn param_use(&mut self, a: &ast::ExprAttribute, call: Option<&ast::ExprCall>) {
+            if let Expr::Name(n) = &*a.value
+                && self.params.contains(&n.id.as_str())
+            {
+                let u = evidence::of_use(a.attr.as_str(), call);
+                if u.is_some() {
+                    self.found.entry(n.id.to_string()).or_default().add(u);
+                }
+            }
+        }
     }
     impl<'b> Visitor<'b> for Ev<'_> {
         fn visit_stmt(&mut self, stmt: &'b Stmt) {
@@ -1483,28 +1510,52 @@ fn param_evidence(body: &[Stmt], params: &[&str]) -> FxHashMap<String, Ty> {
             visitor::walk_stmt(self, stmt);
         }
         fn visit_expr(&mut self, expr: &'b Expr) {
-            if let Expr::Attribute(a) = expr
-                && let Expr::Name(n) = &*a.value
-                && self.params.contains(&n.id.as_str())
-            {
-                let attr = a.attr.as_str();
-                if DATAFRAME_ONLY_METHODS.contains(&attr) {
-                    self.out.entry(n.id.to_string()).or_insert(Ty::DataFrame);
-                } else if SESSION_ONLY_ATTRS.contains(&attr) {
-                    self.out.entry(n.id.to_string()).or_insert(Ty::SparkSession);
+            match expr {
+                // A called attribute: the call shape is part of the evidence.
+                Expr::Call(c) if matches!(&*c.func, Expr::Attribute(_)) => {
+                    let Expr::Attribute(a) = &*c.func else {
+                        unreachable!()
+                    };
+                    self.param_use(a, Some(c));
+                    self.visit_expr(&a.value);
+                    for arg in &*c.arguments.args {
+                        self.visit_expr(arg);
+                    }
+                    for k in &*c.arguments.keywords {
+                        self.visit_expr(&k.value);
+                    }
                 }
+                Expr::Attribute(a) => {
+                    self.param_use(a, None);
+                    visitor::walk_expr(self, expr);
+                }
+                _ => visitor::walk_expr(self, expr),
             }
-            visitor::walk_expr(self, expr);
         }
     }
     let mut ev = Ev {
         params,
-        out: FxHashMap::default(),
+        found: FxHashMap::default(),
     };
     for s in body {
         ev.visit_stmt(s);
     }
-    ev.out
+    ev.found
+        .into_iter()
+        .filter_map(|(name, e)| e.verdict().map(|t| (name, t)))
+        .collect()
+}
+
+/// Bindings with a pandas-only use (`x.iloc`, `x.shape`, `x.sort_values(..)`) →
+/// whether the uses say pandas frame (no Spark evidence beside it).
+fn pandas_used_bindings(m: &SemanticModel) -> FxHashMap<TextRange, bool> {
+    (0..m.bindings().len() as BindingId)
+        .filter_map(|b| {
+            let e = Evidence::of_attrs(m.binding_uses(b).filter_map(|u| u.attr.as_deref()));
+            e.has_pandas()
+                .then(|| (m.binding(b).range, e.verdict() == Some(Ty::PandasFrame)))
+        })
+        .collect()
 }
 
 fn contains_yield(body: &[Stmt]) -> bool {

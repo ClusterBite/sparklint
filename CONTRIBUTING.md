@@ -15,7 +15,7 @@ Please strip anything confidential (table names, paths, credentials) from the sn
 
 ## Development setup
 
-You need Rust 1.88+ (edition 2024) and, for the wheel, [maturin](https://www.maturin.rs/).
+You need Rust 1.97+ (edition 2024) and, for the wheel, [maturin](https://www.maturin.rs/).
 
 ```bash
 cargo build                                            # debug binary: target/debug/sparklint

@@ -18,6 +18,8 @@ use crate::{CheckArgs, EXIT_CLEAN, EXIT_ERROR, EXIT_FINDINGS};
 
 struct Loaded {
     path: PathBuf,
+    /// The text as read from standard input (`check -`); fixes go to stdout.
+    stdin: Option<String>,
     display: String,
     source: SourceFile,
     config: Arc<Configuration>,
@@ -34,7 +36,14 @@ fn display_path(cwd: &Path, path: &Path) -> String {
 pub fn run(args: &CheckArgs) -> anyhow::Result<u8> {
     let started = Instant::now();
     let cwd = std::env::current_dir().context("cannot determine the current directory")?;
-    let roots: Vec<PathBuf> = if args.paths.is_empty() {
+    let dash = args.paths.iter().any(|p| p.as_os_str() == "-");
+    if dash && args.paths.len() > 1 {
+        anyhow::bail!("`-` (standard input) cannot be combined with other paths");
+    }
+    let stdin = dash || (args.paths.is_empty() && args.stdin_filename.is_some());
+    let roots: Vec<PathBuf> = if stdin {
+        Vec::new()
+    } else if args.paths.is_empty() {
         vec![cwd.clone()]
     } else {
         args.paths
@@ -57,17 +66,39 @@ pub fn run(args: &CheckArgs) -> anyhow::Result<u8> {
             resolver.for_dir(r.parent().unwrap_or(&cwd))?;
         }
     }
+    // `check -`: one file from standard input, named by `--stdin-filename` (relative
+    // to the current directory) or `-`.
+    let stdin_path = stdin.then(|| match &args.stdin_filename {
+        Some(p) => std::path::absolute(p).unwrap_or_else(|_| p.clone()),
+        None => cwd.join("-"),
+    });
+    let stdin_text = match &stdin_path {
+        Some(_) => {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+                .context("cannot read standard input")?;
+            Some(text)
+        }
+        None => None,
+    };
     let (files, warnings) = crate::discover::discover(&roots, &resolver)?;
-    let mut had_error = false;
-    for w in &warnings {
-        eprintln!("sparklint: warning: {w}");
+    // A path that does not exist is an error (exit 2), shown relative to the current
+    // directory like every other path; other discovery problems (an unreadable
+    // directory entry) stay warnings.
+    let mut errors = 0usize;
+    for r in roots.iter().filter(|r| !r.is_file() && !r.is_dir()) {
+        eprintln!(
+            "sparklint: error: {}: no such file or directory",
+            display_path(&cwd, r)
+        );
+        errors += 1;
     }
-    if warnings.iter().any(|w| w.contains("no such file")) {
-        had_error = true;
+    for w in warnings.iter().filter(|w| !w.contains("no such file")) {
+        eprintln!("sparklint: warning: {w}");
     }
 
     // Load every file (parallel).
-    let loaded: Vec<Result<Loaded, String>> = files
+    let mut loaded: Vec<Result<Loaded, String>> = files
         .par_iter()
         .map(|path| {
             let display = display_path(&cwd, path);
@@ -78,6 +109,7 @@ pub fn run(args: &CheckArgs) -> anyhow::Result<u8> {
             let module = module_name_for_path(&cwd, path);
             Ok(Loaded {
                 path: path.clone(),
+                stdin: None,
                 display,
                 source,
                 config,
@@ -85,13 +117,16 @@ pub fn run(args: &CheckArgs) -> anyhow::Result<u8> {
             })
         })
         .collect();
+    if let (Some(path), Some(text)) = (stdin_path, stdin_text) {
+        loaded.push(load_stdin(&cwd, &resolver, path, text));
+    }
     let mut sources = Vec::with_capacity(loaded.len());
     for l in loaded {
         match l {
             Ok(l) => sources.push(l),
             Err(e) => {
                 eprintln!("sparklint: error: {e}");
-                had_error = true;
+                errors += 1;
             }
         }
     }
@@ -101,6 +136,11 @@ pub fn run(args: &CheckArgs) -> anyhow::Result<u8> {
         .iter()
         .map(|l| l.config.settings_for(&l.path))
         .collect();
+    for (l, s) in sources.iter_mut().zip(&settings) {
+        if s.ipython_syntax() {
+            l.source = l.source.clone().with_ipython_syntax(true);
+        }
+    }
     let files: Vec<ProjectFile> = sources
         .iter()
         .zip(&settings)
@@ -133,15 +173,38 @@ pub fn run(args: &CheckArgs) -> anyhow::Result<u8> {
     let mut reports = Vec::with_capacity(results.len());
     let mut fixed_total = 0;
     for (l, diagnostics, fixed_text, applied) in results {
+        if let Some(original) = &l.stdin {
+            if fix {
+                // Like ruff: the (fixed) source goes to stdout, the report to stderr.
+                let text = fixed_text.as_deref().unwrap_or(original);
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                out.write_all(text.as_bytes())?;
+                out.flush()?;
+                if fixed_text.is_some() {
+                    fixed_total += applied;
+                }
+            }
+            let source = match fixed_text {
+                Some(text) => l.source.with_contents(text).unwrap_or(l.source),
+                None => l.source,
+            };
+            reports.push(FileReport {
+                display: l.display,
+                source,
+                diagnostics,
+            });
+            continue;
+        }
         let source = match fixed_text {
             Some(text) => {
                 if let Err(e) = std::fs::write(&l.path, &text) {
                     eprintln!("sparklint: error: cannot write {}: {e}", l.display);
-                    had_error = true;
+                    errors += 1;
                     l.source
                 } else {
                     fixed_total += applied;
-                    SourceFile::from_text(&l.path, text)
+                    l.source.with_contents(text).unwrap_or(l.source)
                 }
             }
             None => l.source,
@@ -165,14 +228,19 @@ pub fn run(args: &CheckArgs) -> anyhow::Result<u8> {
         fixable_safe,
         fixable_unsafe,
         fix_mode: fix,
+        errors,
         started,
     };
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
+    // With `check - --fix` stdout carries the fixed source, so the report goes to stderr.
+    let mut out: Box<dyn Write> = if stdin && fix {
+        Box::new(std::io::stderr().lock())
+    } else {
+        Box::new(std::io::stdout().lock())
+    };
     print(&mut out, args, &reports, &summary)?;
     out.flush()?;
 
-    Ok(if had_error {
+    Ok(if errors > 0 {
         EXIT_ERROR
     } else if total > 0 && !args.exit_zero {
         EXIT_FINDINGS
@@ -202,6 +270,38 @@ fn print(
         output::summary(out, summary)?;
     }
     Ok(())
+}
+
+/// The file read from standard input: config and module name from its stated path,
+/// `.ipynb` JSON when that path says so; nothing is read from or written to disk.
+fn load_stdin(
+    cwd: &Path,
+    resolver: &ConfigResolver,
+    path: PathBuf,
+    text: String,
+) -> Result<Loaded, String> {
+    let display = display_path(cwd, &path);
+    let config = resolver
+        .for_dir(path.parent().unwrap_or(cwd))
+        .map_err(|e| format!("{display}: {e}"))?;
+    let ipynb = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("ipynb"));
+    let source = if ipynb {
+        SourceFile::from_ipynb_json(&path, &text).map_err(|e| format!("{display}: {e}"))?
+    } else {
+        SourceFile::from_text(&path, text.clone())
+    };
+    let module = module_name_for_path(cwd, &path);
+    Ok(Loaded {
+        path,
+        stdin: Some(text),
+        display,
+        source,
+        config,
+        module,
+    })
 }
 
 fn count_fixable(reports: &[FileReport], a: Applicability) -> usize {

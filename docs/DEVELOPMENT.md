@@ -2,7 +2,7 @@
 
 ## Toolchain
 
-Rust 1.88 or newer (edition 2024) and, for the wheel, [maturin](https://www.maturin.rs/).
+Rust 1.97 or newer (edition 2024) and, for the wheel, [maturin](https://www.maturin.rs/).
 
 ## Layout
 
@@ -16,6 +16,7 @@ Rust 1.88 or newer (edition 2024) and, for the wheel, [maturin](https://www.matu
 | `spec/pyspark_api.json` | Generated PySpark API model (`scripts/gen_api.py`) |
 | `spec/rules.json` | Rule metadata generated from `docs/RULES_CATALOG.md` (`scripts/gen_rules.py`) |
 | `tests/fixtures/<CODE>/` | Rule fixtures (see below) |
+| `docs/site/`, `mkdocs.yml` | Documentation site (see below) |
 
 ## Build, test, lint
 
@@ -66,9 +67,7 @@ verdict in `conf.rs` (its `verdict()` / `sev()` / `table()` helpers look the row
 plus the fixture directory.
 
 Rule metadata lives in `docs/RULES_CATALOG.md`; regenerate `spec/rules.json` with
-`python3 scripts/gen_rules.py > spec/rules.json`. A catalog rule that is not in the rule
-table yet is registered as `planned`: `sparklint rules` lists it, selecting it is allowed,
-and it never runs.
+`python3 scripts/gen_rules.py > spec/rules.json`.
 
 ## CLI
 
@@ -76,6 +75,8 @@ and it never runs.
 sparklint check [PATHS...] [--select S,..] [--extend-select S,..] [--ignore S,..]
                 [--output-format text|json|github|sarif] [--fix] [--unsafe-fixes]
                 [--statistics] [--config FILE] [--exit-zero] [-q]
+sparklint check - [--stdin-filename PATH] < file.py   # one file from stdin; with --fix the
+                                                      # fixed source goes to stdout
 sparklint rule ACT002            # explain a rule (code or kebab name)
 sparklint rules [--format json] [--implemented]
 sparklint version
@@ -101,7 +102,7 @@ extend-select = ["ACT001"]
 ignore = ["STY"]
 exclude = ["build", "generated/**"]   # replaces the default excludes; use extend-exclude to add
 known-spark-globals = ["ss", "ctx:SparkContext"]
-notebook = "auto"               # auto | on | off: Databricks notebook globals (spark, sc, display, dbutils)
+notebook = "auto"               # auto | on | off: Databricks notebook globals (spark, sc, display, dbutils); "on" also parses .py files with notebook magics (%pip, !cmd)
 heuristics = true               # name heuristics (df, *_df, ...) at Likely confidence
 spark-version = "3.5"           # gates fixes (isEmpty() needs >= 3.3)
 collect-limit = 1000            # N in the ACT002 unsafe fix .limit(N).collect()
@@ -123,6 +124,22 @@ ACT = "error"
 Suppressions: `# noqa`, `# noqa: ACT002,PRF001`, `# sparklint: ignore[ACT002]`,
 `# sparklint: file-ignore[ACT002]`, and cylint's `# cy:ignore CY001` (mapped via
 RULES_CATALOG §4).
+
+## Documentation site
+
+The site at https://clusterbite.github.io/sparklint/ is MkDocs Material. Hand-written
+pages are in `docs/site/`; `scripts/gen_docs.py` generates one page per rule from
+`spec/rules.json`, the cylint mapping from `docs/RULES_CATALOG.md` §4, and the changelog
+(generated files are git-ignored). To change a rule's page, edit its catalog entry and
+regenerate `spec/rules.json`.
+
+```bash
+pip install -r docs/requirements.txt
+python3 scripts/gen_docs.py && mkdocs serve      # http://127.0.0.1:8000
+```
+
+`.github/workflows/docs.yml` builds it with `--strict` on pull requests and deploys it to
+GitHub Pages on every push to `main`.
 
 ## Packaging (maturin, like ruff)
 

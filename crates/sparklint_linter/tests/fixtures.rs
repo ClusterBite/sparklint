@@ -4,9 +4,9 @@
 //!
 //! Each fixture is linted with only `<CODE>` selected. Every line carrying a trailing
 //! `# expect: CODE[, CODE…]` comment must produce that diagnostic (on its first line),
-//! and no other line may produce it. If `<name>.py.fixed` exists, applying the safe
-//! fixes to `<name>.py` must give exactly that text; likewise `<name>.py.unsafe-fixed`
-//! for safe + unsafe fixes (`--unsafe-fixes`).
+//! and no other line may produce it. If `<name>.py.fixed` (`<name>.ipynb.fixed`) exists, applying the safe
+//! fixes to `<name>.py` must give exactly that text (for `.ipynb`: the notebook JSON);
+//! likewise `<name>.py.unsafe-fixed` for safe + unsafe fixes (`--unsafe-fixes`).
 //!
 //! A `sparklint.toml` in a unit's root (the rule directory for single files, the case
 //! directory for projects) supplies non-selection options (rule thresholds and the
@@ -189,7 +189,8 @@ fn rule_fixtures() {
                     failures.push(format!("{name}:{l}: unexpected {code}: {msg}"));
                 }
                 if single {
-                    let fixed_path = file.with_extension("py.fixed");
+                    let ext = file.extension().unwrap().to_string_lossy();
+                    let fixed_path = file.with_extension(format!("{}.fixed", ext));
                     if fixed_path.is_file() {
                         let want = std::fs::read_to_string(&fixed_path).unwrap();
                         let out = lint_and_fix(&source, &settings, &NoSummaries, None, false);
@@ -200,7 +201,7 @@ fn rule_fixtures() {
                             failures.push(format!("{name}: fix output differs:\n{got}"));
                         }
                     }
-                    let unsafe_path = file.with_extension("py.unsafe-fixed");
+                    let unsafe_path = file.with_extension(format!("{}.unsafe-fixed", ext));
                     if unsafe_path.is_file() {
                         let want = std::fs::read_to_string(&unsafe_path).unwrap();
                         let out = lint_and_fix(&source, &settings, &NoSummaries, None, true);

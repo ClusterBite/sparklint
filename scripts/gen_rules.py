@@ -67,9 +67,10 @@ def main() -> None:
         if code not in rules:
             continue
         rules[code]["docs"] = body
-        m = re.search(r"\*\*Msg:\*\*\s*`([^`]+)`", body)
+        # a message holding backticks is written as a ``double-backtick`` code span
+        m = re.search(r"\*\*Msg:\*\*\s*(?:``\s?(.+?)\s?``|`([^`]+)`)", body)
         if m:
-            rules[code]["message"] = m.group(1)
+            rules[code]["message"] = m.group(1) or m.group(2)
         else:
             # short entries (STY005+): "style · info · T1 · none · palantir — text"
             first = body.splitlines()[0] if body else ""

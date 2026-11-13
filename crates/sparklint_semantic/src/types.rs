@@ -1,5 +1,8 @@
 //! The Spark type lattice (DESIGN §3.1, RULES_CATALOG §2).
 
+pub use crate::facts::Facts;
+use crate::library::Lib;
+
 /// Element type of a Python list/iterator value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Elem {
@@ -58,6 +61,9 @@ pub enum Ty {
     NonSpark,
     DeltaTable,
     DbUtils,
+    /// `pyspark.sql.Observation`: metrics filled in by the next action on an
+    /// observed DataFrame (`df.observe(obs, ..)`).
+    Observation,
 
     // ---- Python / misc (known non-Spark) ----
     Logger,
@@ -74,6 +80,9 @@ pub enum Ty {
     Function,
     /// An instance of a class defined in this module (payload: class scope id).
     Instance(u32),
+    /// An object of another library whose Spark-producing members are known
+    /// (`dbldatagen.DataGenerator`, `tempo.TSDF`, …; see `crate::library`).
+    Library(Lib),
     /// Some other known, non-Spark value (module, class, opaque object).
     Object,
 }
@@ -131,6 +140,19 @@ impl Ty {
     }
 
     /// A session-like receiver (`spark.read`, `spark.sql`, …).
+    /// A reader or writer builder (`DataFrameReader`, `DataStreamReader`,
+    /// `DataFrameWriter`, `DataFrameWriterV2`, `DataStreamWriter`).
+    pub fn is_io_builder(self) -> bool {
+        matches!(
+            self,
+            Ty::DataFrameReader
+                | Ty::DataStreamReader
+                | Ty::DataFrameWriter
+                | Ty::DataFrameWriterV2
+                | Ty::DataStreamWriter
+        )
+    }
+
     pub fn is_session(self) -> bool {
         matches!(self, Ty::SparkSession | Ty::SqlContext)
     }
@@ -168,6 +190,7 @@ impl Ty {
             Ty::NonSpark => "non-Spark data object",
             Ty::DeltaTable => "DeltaTable",
             Ty::DbUtils => "dbutils",
+            Ty::Observation => "Observation",
             Ty::Logger => "Logger",
             Ty::Int => "int",
             Ty::Float => "float",
@@ -184,6 +207,7 @@ impl Ty {
             Ty::List(_) => "list",
             Ty::Function => "function",
             Ty::Instance(_) => "object",
+            Ty::Library(l) => l.display_name(),
             Ty::Object => "object",
         }
     }
@@ -321,50 +345,6 @@ pub enum Confidence {
     Certain,
 }
 
-/// Dataflow facts attached to a value (mostly DataFrame values).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Facts {
-    /// At most this many rows (`u64::MAX` = bounded by a non-literal `limit`).
-    pub bounded: Option<u64>,
-    /// Passed through filter/where/groupBy-agg/distinct/sample.
-    pub reduced: bool,
-    /// The value itself is the result of `cache()`/`persist()`.
-    pub cached: bool,
-    /// A streaming DataFrame (`readStream`).
-    pub streaming: bool,
-    /// For lists / pandas frames: produced on the driver from a Spark value
-    /// (`collect`, `toPandas`, …).
-    pub from_spark: bool,
-    /// WindowSpec: has `partitionBy` with at least one argument.
-    pub win_partitioned: bool,
-    /// WindowSpec: has `orderBy`.
-    pub win_ordered: bool,
-    /// WindowSpec: has `rowsBetween`/`rangeBetween`.
-    pub win_framed: bool,
-    /// WindowSpec: the (last) explicit frame starts unbounded preceding and ends at a
-    /// finite offset (a running frame that grows with every row).
-    pub win_frame_growing: bool,
-}
-
-impl Facts {
-    pub fn meet(self, other: Facts) -> Facts {
-        Facts {
-            bounded: match (self.bounded, other.bounded) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                _ => None,
-            },
-            reduced: self.reduced && other.reduced,
-            cached: self.cached && other.cached,
-            streaming: self.streaming || other.streaming,
-            from_spark: self.from_spark || other.from_spark,
-            win_partitioned: self.win_partitioned && other.win_partitioned,
-            win_ordered: self.win_ordered || other.win_ordered,
-            win_framed: self.win_framed || other.win_framed,
-            win_frame_growing: self.win_frame_growing && other.win_frame_growing,
-        }
-    }
-}
-
 /// A type with confidence and facts — what [`crate::SemanticModel::ty_of`] returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeInfo {
@@ -383,17 +363,7 @@ impl TypeInfo {
     pub const UNKNOWN: TypeInfo = TypeInfo {
         ty: Ty::Unknown,
         confidence: Confidence::Likely,
-        facts: Facts {
-            bounded: None,
-            reduced: false,
-            cached: false,
-            streaming: false,
-            from_spark: false,
-            win_partitioned: false,
-            win_ordered: false,
-            win_framed: false,
-            win_frame_growing: false,
-        },
+        facts: Facts::NONE,
     };
 
     pub fn certain(ty: Ty) -> Self {
@@ -441,6 +411,12 @@ impl TypeInfo {
     /// Bounded to a known number of rows.
     pub fn bounded(&self) -> Option<u64> {
         self.facts.bounded
+    }
+
+    /// Known to fit in driver memory: a known row bound, or driver-built / catalog
+    /// metadata data ([`crate::facts::Local`]).
+    pub fn driver_sized(&self) -> bool {
+        self.facts.bounded.is_some() || self.facts.local
     }
 
     /// Join of two branch types (if/else, loop back edges, multiple returns).

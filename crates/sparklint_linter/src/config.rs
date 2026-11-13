@@ -299,6 +299,12 @@ impl Default for LinterSettings {
 }
 
 impl LinterSettings {
+    /// `notebook = "on"`: plain modules are read as notebooks, so they are parsed in
+    /// IPython mode (magics and shell escapes are not syntax errors).
+    pub fn ipython_syntax(&self) -> bool {
+        self.notebook == NotebookMode::On
+    }
+
     /// Settings that enable exactly the given selectors (used by tests).
     pub fn for_selectors(select: &[&str]) -> Result<Self, ConfigError> {
         let sel: Vec<String> = select.iter().map(|s| s.to_string()).collect();

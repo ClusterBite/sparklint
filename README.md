@@ -23,6 +23,8 @@ idle time, job compute versus all-purpose compute, spot instances, tables nobody
 
 [ClusterBite](https://clusterbite.com/?utm_source=github&utm_medium=readme&utm_campaign=sparklint) finds those from your workspace's own usage data and measures what each change saved.
 
+**Documentation: [clusterbite.github.io/sparklint](https://clusterbite.github.io/sparklint/)**
+
 **Status: early (0.x).** Rules, codes and output may still change between minor versions.
 Reports of false positives are especially welcome.
 
@@ -35,7 +37,7 @@ sparklint --version
 
 Wheels are published for Linux (x86_64, aarch64), macOS (x86_64, arm64) and Windows
 (x86_64). They contain a native binary, so Python is only needed to install it. Other
-platforms build from the source distribution, which needs a Rust toolchain (1.88+).
+platforms build from the source distribution, which needs a Rust toolchain (1.97+).
 
 ## Quickstart
 
@@ -45,6 +47,7 @@ sparklint check src/ notebooks/    # .py files, Databricks source notebooks, .ip
 sparklint check --fix              # apply safe fixes
 sparklint check --unsafe-fixes     # also apply fixes that can change behaviour
 sparklint check --statistics       # counts per rule
+sparklint check - --stdin-filename etl.py < etl.py   # read stdin (editors); --fix prints the fixed source
 sparklint rules                    # list the rules
 sparklint rule ACT002              # explain one rule (code or name, e.g. collect-unbounded)
 ```
@@ -132,7 +135,7 @@ Test code usually calls actions on purpose: an assert like `df.count() > 0` or a
 "tests/**" = ["ACT"]
 ```
 
-All options are listed in [docs/DEVELOPMENT.md](https://github.com/clusterbite/sparklint/blob/main/docs/DEVELOPMENT.md#cli).
+All options are listed in the [configuration docs](https://clusterbite.github.io/sparklint/configuration/).
 
 ### Suppressions
 
@@ -142,8 +145,9 @@ are honoured too.
 
 ## Rules
 
-Every rule, with its rationale, detection logic and examples, is in
-[docs/RULES_CATALOG.md](https://github.com/clusterbite/sparklint/blob/main/docs/RULES_CATALOG.md).
+Every rule, with its rationale, detection logic and examples, has a page on the
+[documentation site](https://clusterbite.github.io/sparklint/rules/) (source:
+[docs/RULES_CATALOG.md](https://github.com/clusterbite/sparklint/blob/main/docs/RULES_CATALOG.md)).
 `sparklint rules` lists the rules of your installed version, and `sparklint rule <CODE>`
 prints the details of one.
 

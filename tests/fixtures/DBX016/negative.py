@@ -64,3 +64,9 @@ pairs = [(i, t) for i, t in enumerate(spark.catalog.listTables("sales")) if t.na
 # Suppressed.
 if name in [t.name for t in spark.catalog.listTables("sales")]:  # noqa: DBX016
     pass
+
+# The name test sits in a nested loop over other names: a join of two lists, not one lookup.
+for t in spark.catalog.listTables("sales"):
+    for wanted in names:
+        if t.name == wanted:
+            print(wanted)

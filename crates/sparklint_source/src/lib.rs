@@ -34,6 +34,9 @@
 //!   [`SourceFile::text`]: every byte except line breaks becomes a space, so offsets and
 //!   line numbers are unchanged. The untouched text stays available through
 //!   [`SourceFile::raw_text`] (what fixes are applied to and what is shown to the user).
+//!   In a plain Jupyter notebook (no Databricks metadata) `%sql <query>` and
+//!   `%R <code>` with arguments on the same line are IPython LINE magics (ipython-sql /
+//!   JupySQL, rpy2): the rest of the cell is Python ([`IPYTHON_LINE_MAGICS`]).
 
 use std::path::{Path, PathBuf};
 
@@ -131,6 +134,13 @@ pub const LANGUAGE_MAGICS: &[&str] = &[
     "bash",
     "fs",
 ];
+
+/// Language magic names that are also IPython LINE magics in plain Jupyter
+/// (ipython-sql / JupySQL `%sql`, rpy2 `%R`; matched case-sensitively). With arguments
+/// on the magic line they run only that line, so the rest of the cell is Python. A bare
+/// `%sql` line (no arguments) is still a language cell: that is a Databricks export
+/// that lost its metadata.
+pub const IPYTHON_LINE_MAGICS: &[&str] = &["sql", "R"];
 
 /// `%name rest` at the start of a line → `(name, rest)`. `None` for `%%name`, for a
 /// lone `%` and for `%name(` (the `%` operator on a continuation line).
@@ -264,6 +274,11 @@ pub struct SourceFile {
     raw: Option<String>,
     /// A Databricks notebook: source format, or `.ipynb` with Databricks metadata.
     databricks: bool,
+    /// The parsed `.ipynb` (kept so fixes can be written back into its cells).
+    notebook: Option<Box<Notebook>>,
+    /// A plain module parsed in IPython mode (`notebook = "on"`), so magics and shell
+    /// escapes are not syntax errors.
+    ipython: bool,
 }
 
 impl SourceFile {
@@ -301,6 +316,8 @@ impl SourceFile {
                 line_index,
                 raw: None,
                 databricks: false,
+                notebook: None,
+                ipython: false,
             };
         }
         let (cells, language_cells) = databricks_cells(&text);
@@ -313,6 +330,8 @@ impl SourceFile {
             line_index,
             raw,
             databricks: true,
+            notebook: None,
+            ipython: false,
         }
     }
 
@@ -354,7 +373,7 @@ impl SourceFile {
                     .collect::<Vec<_>>()
                     .join("\n");
                 (CellKind::from_magic(&name), Some(after))
-            } else if let Some(bare) = classify_bare_cell(body) {
+            } else if let Some(bare) = classify_bare_cell(body, !databricks) {
                 if bare.language {
                     language_cells.push(range);
                 }
@@ -379,11 +398,71 @@ impl SourceFile {
             line_index,
             raw,
             databricks,
+            notebook: Some(Box::new(notebook.clone())),
+            ipython: false,
         }
+    }
+
+    /// The same file, a plain module read as a notebook when `on` (the `notebook = "on"`
+    /// setting): it is parsed in IPython mode, so `%magic` / `!shell` lines are escape
+    /// commands rather than syntax errors. Notebooks are unaffected.
+    pub fn with_ipython_syntax(mut self, on: bool) -> Self {
+        self.ipython = on && self.kind == SourceKind::Python;
+        self
     }
 
     pub fn is_notebook(&self) -> bool {
         self.kind.is_notebook()
+    }
+
+    /// The file contents as stored on disk: the notebook JSON for `.ipynb`, the text
+    /// otherwise.
+    pub fn contents(&self) -> String {
+        match &self.notebook {
+            Some(nb) => {
+                let mut out = Vec::new();
+                match nb.write(&mut out) {
+                    Ok(()) => String::from_utf8_lossy(&out).into_owned(),
+                    Err(_) => self.raw_text().to_string(),
+                }
+            }
+            None => self.raw_text().to_string(),
+        }
+    }
+
+    /// The same file with new contents (as stored on disk: notebook JSON for `.ipynb`).
+    pub fn with_contents(&self, contents: String) -> Result<Self, SourceError> {
+        if self.notebook.is_some() {
+            return Self::from_ipynb_json(&self.path, &contents);
+        }
+        Ok(Self::from_text(&self.path, contents).with_ipython_syntax(self.ipython))
+    }
+
+    /// The same file after edits to [`Self::raw_text`] that produced `transformed`.
+    /// `markers` are `(offset in the old text, offset in the new text)` pairs at the
+    /// start and end of every edit, in order. For `.ipynb` the edited text is written
+    /// back into the code cells (every edit must stay inside one cell); the result's
+    /// [`Self::contents`] is the new notebook JSON.
+    pub fn with_edits(
+        &self,
+        markers: &[(TextSize, TextSize)],
+        transformed: String,
+    ) -> Result<Self, SourceError> {
+        let Some(nb) = &self.notebook else {
+            return Ok(Self::from_text(&self.path, transformed).with_ipython_syntax(self.ipython));
+        };
+        let mut map = ruff_diagnostics::SourceMap::default();
+        for &(source, dest) in markers {
+            map.push_marker(source, dest);
+        }
+        let mut nb = nb.as_ref().clone();
+        nb.update(&map, transformed);
+        let mut out = Vec::new();
+        nb.write(&mut out).map_err(|e| SourceError::Notebook {
+            path: self.path.clone(),
+            message: e.to_string(),
+        })?;
+        Self::from_ipynb_json(&self.path, &String::from_utf8_lossy(&out))
     }
 
     /// A Databricks notebook: source format (`# Databricks notebook source`), or an
@@ -398,11 +477,13 @@ impl SourceFile {
         self.raw.as_deref().unwrap_or(&self.text)
     }
 
-    /// Source type for the parser. Both notebook kinds are parsed in IPython mode, so
-    /// `%magic` / `!shell` lines are escape commands instead of syntax errors.
+    /// Source type for the parser. Both notebook kinds (and a module read with
+    /// [`Self::with_ipython_syntax`]) are parsed in IPython mode, so `%magic` /
+    /// `!shell` lines are escape commands instead of syntax errors.
     pub fn py_source_type(&self) -> PySourceType {
         match self.kind {
             SourceKind::Jupyter | SourceKind::DatabricksNotebook => PySourceType::Ipynb,
+            SourceKind::Python if self.ipython => PySourceType::Ipynb,
             SourceKind::Python => PySourceType::Python,
         }
     }
@@ -536,7 +617,10 @@ struct BareCell {
 /// - Any other magic (`%run`, `%pip`, `%restart_python`, …) names the cell's kind only
 ///   when the cell holds no Python code besides magics; a cell mixing magics and
 ///   Python stays a Python cell (the magic lines are escape commands for the parser).
-fn classify_bare_cell(body: &str) -> Option<BareCell> {
+///
+/// `jupyter`: a plain Jupyter notebook, where [`IPYTHON_LINE_MAGICS`] with arguments
+/// are line magics, not language cells.
+fn classify_bare_cell(body: &str, jupyter: bool) -> Option<BareCell> {
     // `# DBTITLE 1,Title` is cell metadata written before the cell's first line.
     let content = |l: &&str| !l.trim().is_empty() && !l.trim_start().starts_with("# DBTITLE");
     // Logical lines: a line ending in a backslash continues on the next one.
@@ -571,8 +655,12 @@ fn classify_bare_cell(body: &str) -> Option<BareCell> {
         first
     };
     let (name, args) = line_magic(single)?;
+    let line_magic_here = jupyter
+        && single.len() == first.len()
+        && !args.is_empty()
+        && IPYTHON_LINE_MAGICS.contains(&name);
     let name = name.to_lowercase();
-    if LANGUAGE_MAGICS.contains(&name.as_str()) {
+    if LANGUAGE_MAGICS.contains(&name.as_str()) && !line_magic_here {
         // The cell's text in its own language: everything after the magic keyword.
         let mut out = Vec::new();
         if !args.is_empty() {
@@ -608,7 +696,7 @@ fn databricks_cells(text: &str) -> (Vec<Cell>, Vec<TextRange>) {
         let number = cells.len() as u32 + 1;
         let body = &text[start..end];
         let range = TextRange::new(TextSize::from(start as u32), TextSize::from(end as u32));
-        let (kind, magic_body) = match classify_bare_cell(body) {
+        let (kind, magic_body) = match classify_bare_cell(body, false) {
             Some(bare) => {
                 if bare.language {
                     language_cells.push(range);
@@ -686,6 +774,24 @@ mod tests {
     use super::*;
 
     const DBX: &str = "# Databricks notebook source\nimport x\n\n# COMMAND ----------\n\n# MAGIC %sql\n# MAGIC SELECT * FROM t\n\n# COMMAND ----------\n\ndf = spark.table('t')\ndf.collect()\n";
+
+    #[test]
+    fn ipython_syntax_only_changes_plain_modules() {
+        let f = SourceFile::from_text(Path::new("a.py"), "%pip install x\n".into());
+        assert_eq!(f.py_source_type(), PySourceType::Python);
+        let f = f.with_ipython_syntax(true);
+        assert_eq!(f.py_source_type(), PySourceType::Ipynb);
+        assert!(!f.is_notebook());
+        // Kept across a reload with new contents (the re-check after a fix).
+        let g = f.with_contents("x = 1\n".into()).unwrap();
+        assert_eq!(g.py_source_type(), PySourceType::Ipynb);
+        assert_eq!(
+            g.with_ipython_syntax(false).py_source_type(),
+            PySourceType::Python
+        );
+        let nb = SourceFile::from_text(Path::new("nb.py"), DBX.into()).with_ipython_syntax(false);
+        assert_eq!(nb.py_source_type(), PySourceType::Ipynb);
+    }
 
     #[test]
     fn plain_python_has_no_cells() {
@@ -932,6 +1038,68 @@ mod tests {
         assert_eq!(f.run_targets().len(), 1);
         assert_eq!(f.run_targets()[0].path, "./setup");
         assert_eq!(f.run_targets()[0].cell, 5);
+    }
+
+    #[test]
+    fn jupyter_sql_line_magic_keeps_python() {
+        let cells = [
+            // ipython-sql / JupySQL line magics: the rest of the cell is Python.
+            "%sql sqlite://\nrows = df.collect()",
+            "%sql SELECT 1\nres = df.toPandas()",
+            "%R x <- 1\ny = 2",
+            // A bare `%sql` / `%sh` / `%r` first line is still a language cell.
+            "%sql\nSELECT * FROM t",
+            "%sh ls /tmp\nwc -l x",
+            "%r x <- 1\nprint(x)",
+            // Only a line magic: kind and body as before, nothing to parse.
+            "%sql SELECT 2",
+        ];
+        let plain = ipynb(&cells, "", "");
+        let f = SourceFile::from_ipynb_json(Path::new("a.ipynb"), &plain).unwrap();
+        assert!(!f.is_databricks());
+        let kinds: Vec<&CellKind> = f.cells.iter().map(|c| &c.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                &CellKind::Python,
+                &CellKind::Python,
+                &CellKind::Python,
+                &CellKind::Sql,
+                &CellKind::Shell,
+                &CellKind::R,
+                &CellKind::Sql,
+            ]
+        );
+        assert_eq!(f.cells[6].magic_body.as_deref(), Some("SELECT 2"));
+        for keep in [
+            "%sql sqlite://\nrows = df.collect()\n",
+            "%sql SELECT 1\nres = df.toPandas()\n",
+            "%R x <- 1\ny = 2\n",
+        ] {
+            assert!(f.text.contains(keep), "{keep}");
+        }
+        for gone in ["SELECT * FROM t", "wc -l", "print(x)"] {
+            assert!(!f.text.contains(gone), "{gone}");
+        }
+        // In a Databricks export every first-line language magic owns the cell.
+        let dbx = ipynb(
+            &cells,
+            "",
+            r#""application/vnd.databricks.v1+notebook": {}"#,
+        );
+        let f = SourceFile::from_ipynb_json(Path::new("a.ipynb"), &dbx).unwrap();
+        assert!(f.is_databricks());
+        assert_eq!(f.cells[0].kind, CellKind::Sql);
+        assert_eq!(f.cells[1].kind, CellKind::Sql);
+        assert_eq!(f.cells[2].kind, CellKind::R);
+        assert!(!f.text.contains("rows = df.collect()"));
+        // So does `%sql` in a Databricks source notebook.
+        let f = SourceFile::from_text(
+            Path::new("nb.py"),
+            "# Databricks notebook source\n%sql SELECT 1\nFROM t\n".into(),
+        );
+        assert_eq!(f.cells[0].kind, CellKind::Sql);
+        assert!(!f.text.contains("FROM t"));
     }
 
     #[test]

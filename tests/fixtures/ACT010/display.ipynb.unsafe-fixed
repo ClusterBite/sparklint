@@ -1,0 +1,148 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "inputWidgets": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": [
+    "import pandas as pd\n",
+    "df = spark.table('events')\n",
+    "pdf = pd.DataFrame({'a': [1]})"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "inputWidgets": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": [
+    "displayHTML('<h1>title</h1>')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "inputWidgets": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": [
+    "display(dbutils.fs.ls('/mnt/data'))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "inputWidgets": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": [
+    "display(pdf)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "inputWidgets": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": [
+    "display(df.head(5))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "inputWidgets": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": [
+    "display(df.limit(10))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "inputWidgets": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": [
+    "display(df.toPandas().plot())"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "inputWidgets": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "inputWidgets": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "inputWidgets": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "application/vnd.databricks.v1+notebook": {
+   "language": "python",
+   "notebookName": "fixture"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}

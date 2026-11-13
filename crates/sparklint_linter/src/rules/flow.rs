@@ -1,5 +1,6 @@
-//! DataFrame def-use flow shared by PRF006 (recomputed lineage), PRF009 (cache never
-//! unpersisted) and PRF022 (`SELECT *` flowing into a sink).
+//! DataFrame def-use flow shared by PRF006 (recomputed lineage), PRF008 (cache reuse
+//! through derived frames), PRF009 (cache never unpersisted) and PRF022 (`SELECT *`
+//! flowing into a sink).
 //!
 //! During the walk, every load of a tracked DataFrame binding is classified by
 //! climbing the expression chain it heads (`df.filter(..).write.save(p)`) into a
@@ -14,6 +15,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use sparklint_semantic::api::{ActionKind, action_kind};
 use sparklint_semantic::{BindingId, BindingKind, BranchStep, Ty};
 
+use super::exec_context::Run;
 use crate::checker::{Checker, Node};
 
 /// What happens to a DataFrame value at one use site.
@@ -48,6 +50,9 @@ pub struct UseRecord {
     pub repeat: bool,
     /// The use is in another function/lambda than the binding.
     pub other_scope: bool,
+    /// How the use site runs (an `assert` message / `raise` / `pytest.raises` body
+    /// never completes on the passing path; see [`Run::completes`]).
+    pub run: Run,
 }
 
 #[derive(Debug, Default)]
@@ -107,6 +112,7 @@ pub fn on_name(ch: &mut Checker, n: &ast::ExprName) {
     // receiver use itself is the cache sink of the earlier binding.
     let sink = classify(ch, n.range);
     let path = ch.model.branch_path(n.range.start());
+    let run = ch.run_at(n.range);
     for b in reaching {
         let binding = ch.model.binding(b);
         let start = binding.stmt_range.start();
@@ -119,6 +125,7 @@ pub fn on_name(ch: &mut Checker, n: &ast::ExprName) {
             path: path.clone(),
             repeat,
             other_scope,
+            run,
         });
     }
 }
@@ -294,4 +301,83 @@ fn is_known_pure_call(ch: &Checker, c: &ast::ExprCall) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Sink;
+    use crate::checker::testing::with_walked_checker;
+    use sparklint_semantic::api::ActionKind;
+
+    const PRELUDE: &str = "from pyspark.sql import SparkSession\nspark = SparkSession.builder.getOrCreate()\nx = spark.table('t')\n";
+
+    /// The sink of each use of `x` in `body`, in source order, as text.
+    fn sinks(body: &str) -> Vec<String> {
+        let src = format!("{PRELUDE}{body}");
+        with_walked_checker(&src, &["PRF006"], |ch| {
+            let model = ch.model;
+            let mut uses: Vec<_> = ch
+                .state
+                .flow
+                .uses
+                .iter()
+                .filter(|(b, _)| model.binding(**b).name == "x")
+                .flat_map(|(_, us)| us.iter())
+                .collect();
+            uses.sort_by_key(|u| u.range.start());
+            uses.iter()
+                .map(|u| match &u.sink {
+                    Sink::Action {
+                        kind,
+                        method,
+                        projected,
+                    } => {
+                        let k = match kind {
+                            ActionKind::Write => "write",
+                            ActionKind::Display => "display",
+                            ActionKind::DriverCollect => "collect",
+                            _ => "job",
+                        };
+                        format!("{k}:{method}{}", if *projected { "+proj" } else { "" })
+                    }
+                    Sink::Derived(d) => format!("derived:{}", model.binding(*d).name),
+                    Sink::Cache { derived } => format!(
+                        "cache:{}",
+                        derived.map_or("-".into(), |d| model.binding(d).name.clone())
+                    ),
+                    Sink::Unpersist => "unpersist".into(),
+                    Sink::Escape => "escape".into(),
+                    Sink::Other => "other".into(),
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn sink_table() {
+        let cases: &[(&str, &[&str])] = &[
+            ("x.count()\n", &["job:count"]),
+            (
+                "x.filter('a').write.saveAsTable('o')\n",
+                &["write:saveAsTable"],
+            ),
+            ("x.select('a').collect()\n", &["collect:collect+proj"]),
+            ("x.show()\n", &["display:show"]),
+            ("display(x)\n", &["display:display"]),
+            ("y = x.filter('a')\n", &["derived:y"]),
+            ("y = x if c else None\n", &["derived:y"]),
+            ("y = spark.table('u').join(x, 'k')\n", &["derived:y"]),
+            ("y = x.cache()\n", &["cache:y"]),
+            ("x.cache()\n", &["cache:-"]),
+            ("x.unpersist()\n", &["unpersist"]),
+            ("def f():\n    return x\n", &["escape"]),
+            ("frames = [x]\n", &["escape"]),
+            ("helper(x)\n", &["escape"]),
+            ("print(x)\nisinstance(x, object)\n", &["other", "other"]),
+            ("x.columns\n", &["other"]),
+        ];
+        for (body, want) in cases {
+            assert_eq!(sinks(body), *want, "{body}");
+        }
+    }
 }

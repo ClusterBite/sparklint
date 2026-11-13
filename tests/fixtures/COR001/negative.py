@@ -22,3 +22,18 @@ def pick(c: Column | None = None) -> Column:
 def keep(cols: list) -> list:
     lines = [F.col(x) for x in cols]
     return [ln for ln in lines if ln is not None]
+
+
+# A helper's Column annotation is a hint; `helper(..) is None` is the Optional check.
+def segment_filter(values: dict | None) -> Column | None:
+    if not values:
+        return None
+    return F.col("seg") == values["seg"]
+
+
+def safe_expr(text: str) -> Column:
+    return F.expr(text)
+
+
+assert segment_filter(None) is None
+assert safe_expr("a > 1") is not None

@@ -125,7 +125,7 @@ pub fn collect_unbounded(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) {
     let Some(sc) = ch.model.spark_call_named(expr, &["collect"]) else {
         return;
     };
-    if !sc.has_no_args() || !sc.is_dataframe() || sc.bounded().is_some() {
+    if !sc.has_no_args() || !sc.is_dataframe() || sc.driver_sized() {
         return;
     }
     let (recv, t) = (sc.receiver, sc.receiver_ty);
@@ -210,7 +210,7 @@ fn row_iteration_source(ch: &Checker, iter: &Expr) -> Option<(String, TextRange)
                 if let Some(sc) = ch.model.spark_call(iter)
                     && sc.has_no_args()
                     && (sc.is_dataframe() || sc.class() == Ty::Rdd)
-                    && sc.bounded().is_none()
+                    && !sc.driver_sized()
                 {
                     let what = if sc.class() == Ty::Rdd { "rdd" } else { "df" };
                     return Some((format!("for row in {what}.{m}()"), iter.range()));
@@ -219,13 +219,13 @@ fn row_iteration_source(ch: &Checker, iter: &Expr) -> Option<(String, TextRange)
             "iterrows" | "itertuples" | "items" => {
                 if let Some(inner) = ch.model.spark_call_named(recv, &["toPandas"])
                     && inner.is_dataframe()
-                    && inner.bounded().is_none()
+                    && !inner.driver_sized()
                 {
                     return Some((format!("df.toPandas().{m}()"), recv.range()));
                 }
                 // A pandas frame (not Spark) produced on the driver from a Spark value.
                 let rt = ch.model.ty_of(recv);
-                if rt.ty == Ty::PandasFrame && rt.facts.from_spark && rt.bounded().is_none() {
+                if rt.ty == Ty::PandasFrame && rt.facts.from_spark && !rt.driver_sized() {
                     return Some((format!("df.toPandas().{m}()"), recv.range()));
                 }
             }
@@ -237,7 +237,7 @@ fn row_iteration_source(ch: &Checker, iter: &Expr) -> Option<(String, TextRange)
         let t = ch.model.ty_of(iter);
         if let Ty::List(e) = t.ty
             && t.facts.from_spark
-            && t.bounded().is_none()
+            && !t.driver_sized()
             && matches!(e, Elem::Row | Elem::Unknown)
         {
             return Some((
@@ -588,14 +588,15 @@ pub fn discarded_action(ch: &mut Checker, value: &Expr) {
     if (m == "count" && !sc.has_no_args()) || !sc.is_dataframe() || sc.bounded().is_some() {
         return;
     }
-    // `try: df.count() except ...:` forces evaluation to probe for errors (missing
-    // table, no grant): the action is run for its exception, not its result.
-    if let Some(Stmt::Try(t)) = ch.parent_stmt_of_current()
-        && !t.handlers.is_empty()
-        && t.body
-            .iter()
-            .any(|s| s.range().contains_range(value.range()))
-    {
+    // `try: df.count() except ...:` / `with pytest.raises(..):` forces evaluation to
+    // probe for errors (missing table, no grant, bad argument): the action is run for
+    // its exception (or warning), not its result.
+    if ch.run_at(value.range()).is_probe() {
+        return;
+    }
+    // The action that fills a `df.observe(obs, ..)` Observation is the point of the
+    // observe pattern (the rule's own advice), not discarded work.
+    if fills_observation(ch, value, recv) {
         return;
     }
     ch.report(
@@ -611,6 +612,48 @@ pub fn discarded_action(ch: &mut Checker, value: &Expr) {
             "Remove the call; use df.observe() or the write's Delta history for row counts.",
         ),
     );
+}
+
+/// A discarded action runs to fill a Spark `Observation` when its function (or the
+/// module, for top-level code) holds a value typed `pyspark.sql.Observation`
+/// (constructed there or an annotated parameter), or when the action's DataFrame was
+/// unpacked from the same call as a value whose `.get` property is read afterwards
+/// (`checked_df, observation = engine.apply_checks(df, ..)`; `checked_df.count()`;
+/// `observation.get`).
+fn fills_observation(ch: &Checker, action: &Expr, recv: &Expr) -> bool {
+    let model = ch.model;
+    let at = action.range().start();
+    let scope = model.function_scope_at(at);
+    let in_scope = |r: TextRange| model.function_scope_at(r.start()) == scope;
+    if model
+        .bindings()
+        .iter()
+        // A parameter sits in the def header, outside its function's range: use its scope.
+        .any(|b| b.ty.ty == Ty::Observation && (b.scope == scope || in_scope(b.range)))
+    {
+        return true;
+    }
+    let Some(name) = root_name(recv) else {
+        return false;
+    };
+    let unpacked: Vec<TextRange> = model
+        .reaching(name)
+        .iter()
+        .map(|&b| model.binding(b))
+        .filter(|b| b.kind == BindingKind::Assign)
+        .map(|b| b.stmt_range)
+        .collect();
+    model.bindings().iter().enumerate().any(|(i, b)| {
+        b.kind == BindingKind::Assign
+            && b.name != name.id.as_str()
+            && unpacked.contains(&b.stmt_range)
+            && model.binding_uses(i as u32).any(|u| {
+                u.range.start() > at
+                    && in_scope(u.range)
+                    && u.attr.as_deref() == Some("get")
+                    && !u.called
+            })
+    })
 }
 
 pub fn action_in_logging(ch: &mut Checker, c: &ast::ExprCall) {

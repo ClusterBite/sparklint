@@ -8,14 +8,20 @@
 //! builder calls closest to it):
 //!
 //! - the builder chain, followed back through variables (`r = spark.read.format(..)`
-//!   then `r.load()`), up to four bindings;
+//!   then `r.load()`); a name bound on several paths (`if`/`else`, or an `if`
+//!   expression) is gathered per path and merged: a format / option value counts when
+//!   every path agrees, an option set on some paths only is set with an unknown value,
+//!   and writers whose paths differ beyond options/format/schema are not analysed;
 //! - `.option(k, v)`, `.options(k=v)`, `.options(**{..})` and `.options(**d)` with `d`
 //!   a dict literal used only there; the terminal's keyword arguments, `load(format=)`
 //!   / `start(format=)` / `save(format=)`, positional `schema` / `format` / jdbc
 //!   arguments, and the jdbc `properties` dict;
 //! - completeness: `**kwargs` we cannot see, `.options(d)`, a non-literal option key,
-//!   or the stored builder configured by a separate statement (`r.option(..)` /
-//!   `r.schema(..)` on its own line: builders mutate in place) make the settings
+//!   the stored builder configured by a separate statement (`r.option(..)` /
+//!   `r.schema(..)` on its own line: builders mutate in place), a loop-carried builder,
+//!   or a builder the oracle does not know to be rooted at `spark.read` /
+//!   `spark.readStream` / `df.write` / `df.writeStream` / `df.writeTo` on every path
+//!   (`Facts::fresh_builder`: a parameter, a helper's result) make the settings
 //!   incomplete — rules that need to know an option is *absent* must check
 //!   [`IoSettings::complete`].
 
@@ -23,7 +29,7 @@ use ruff_python_ast::{self as ast, Expr};
 use ruff_text_size::Ranged;
 use rustc_hash::FxHashMap;
 use sparklint_semantic::api::{ActionKind, action_kind};
-use sparklint_semantic::{SparkCall, Ty, call_arg, static_text, str_literal};
+use sparklint_semantic::{BindingId, SparkCall, Ty, call_arg, static_text, str_literal};
 
 use super::helpers::{bool_literal, method_call};
 use crate::checker::Checker;
@@ -36,8 +42,9 @@ const FORMAT_METHODS: &[&str] = &[
 /// Builder methods that configure a stored reader/writer in place.
 const CONFIG_METHODS: &[&str] = &["option", "options", "format", "schema"];
 
-/// How many variable hops the chain walk follows.
-const MAX_HOPS: u32 = 4;
+/// How many bindings deep the chain walk follows names (a guard; real chains are
+/// a few hops).
+const MAX_BINDINGS: usize = 32;
 
 /// The settings of one reader/writer terminal call.
 #[derive(Debug)]
@@ -184,7 +191,12 @@ impl<'e> IoSettings<'e> {
             write_to: None,
         };
         s.terminal(ch);
-        s.walk(ch, sc.receiver, 0);
+        s.walk(ch, sc.receiver, &mut Vec::new());
+        // The origin comes from the oracle: a builder not rooted at `spark.read` /
+        // `df.write…` on every path may carry options set where it was built.
+        if !ch.model.ty_of(sc.receiver).facts.fresh_builder {
+            s.complete = false;
+        }
         Some(s)
     }
 
@@ -411,8 +423,12 @@ impl<'e> IoSettings<'e> {
         }
     }
 
-    /// Walk the builder chain backwards from `e`.
-    fn walk(&mut self, ch: &Checker<'e>, mut e: &'e Expr, depth: u32) {
+    /// Walk the builder chain backwards from `e`, gathering its builder calls. A name
+    /// is followed to every binding reaching it: one binding continues the chain,
+    /// several are walked one by one and merged ([`IoSettings::merge`]). Whether the
+    /// chain starts at a fresh builder is the oracle's answer ([`IoSettings::of`]),
+    /// not the walk's.
+    fn walk(&mut self, ch: &Checker<'e>, mut e: &'e Expr, seen: &mut Vec<BindingId>) {
         let writer = is_writer(self.class);
         loop {
             if writer
@@ -422,6 +438,12 @@ impl<'e> IoSettings<'e> {
             {
                 self.df = Some(&a.value);
                 return;
+            }
+            if !writer
+                && let Expr::Attribute(a) = e
+                && matches!(a.attr.as_str(), "read" | "readStream")
+            {
+                return; // `spark.read` / `spark.readStream`: a fresh reader
             }
             let Some((c, recv, m)) = method_call(e) else {
                 break;
@@ -434,17 +456,46 @@ impl<'e> IoSettings<'e> {
             }
             let rt = ch.model.ty_of(recv).ty;
             if !(if writer { is_writer(rt) } else { is_reader(rt) }) {
+                // Built by something we cannot see (a helper's return value …).
+                self.complete = false;
                 return;
             }
             self.builder(ch, m, c);
             e = recv;
         }
-        if depth < MAX_HOPS
-            && let Expr::Name(n) = e
-            && let Some(b) = ch.model.single_binding(n)
-            && let Some(v) = ch.model.binding(b).value
-            && v.range() != e.range()
-        {
+        if let Expr::If(x) = e {
+            // `spark.read.format("csv") if c else spark.read.format("json")`
+            self.indirect = true;
+            let paths = [&*x.body, &*x.orelse]
+                .into_iter()
+                .map(|v| {
+                    let mut p = self.empty_path();
+                    p.walk(ch, v, seen);
+                    p
+                })
+                .collect();
+            self.merge(ch, paths);
+            return;
+        }
+        let Expr::Name(n) = e else {
+            // A helper's result, an attribute: the calls that built it are not in view.
+            self.complete = false;
+            return;
+        };
+        let reaching = ch.model.reaching(n);
+        let mut values = Vec::with_capacity(reaching.len());
+        for &b in reaching {
+            let binding = ch.model.binding(b);
+            // A cycle (`r = r.option(k, v)` in a loop), a parameter or loop target, or
+            // a chain too long to follow: the calls that configured it are not in view.
+            let Some(v) = binding.value.filter(|v| v.range() != e.range()) else {
+                self.complete = false;
+                return;
+            };
+            if seen.contains(&b) || seen.len() >= MAX_BINDINGS {
+                self.complete = false;
+                return;
+            }
             // Builders mutate in place: `reader.option(k, v)` as a separate statement
             // also configures this reader.
             if ch.model.binding_uses(b).any(|u| {
@@ -456,8 +507,104 @@ impl<'e> IoSettings<'e> {
             }) {
                 self.complete = false;
             }
-            self.indirect = true;
-            self.walk(ch, v, depth + 1);
+            values.push((b, v));
+        }
+        if values.is_empty() {
+            // Unbound (a global): nothing to follow.
+            self.complete = false;
+            return;
+        }
+        self.indirect = true;
+        if let [(b, v)] = values[..] {
+            seen.push(b);
+            self.walk(ch, v, seen);
+            seen.pop();
+            return;
+        }
+        // Bound on several paths (`if a: r = spark.read.format("csv") else: ...`):
+        // walk each path on its own and keep what they agree on.
+        let paths: Vec<IoSettings<'e>> = values
+            .iter()
+            .map(|&(b, v)| {
+                let mut p = self.empty_path();
+                seen.push(b);
+                p.walk(ch, v, seen);
+                seen.pop();
+                p
+            })
+            .collect();
+        self.merge(ch, paths);
+    }
+
+    /// A blank picture for one path of a name bound on several paths.
+    fn empty_path(&self) -> IoSettings<'e> {
+        IoSettings {
+            class: self.class,
+            method: self.method,
+            call: self.call,
+            calls: Vec::new(),
+            df: None,
+            v2: false,
+            indirect: false,
+            format: None,
+            options: FxHashMap::default(),
+            schema: false,
+            complete: true,
+            write_to: None,
+        }
+    }
+
+    /// Merge the pictures of the paths reaching a name into this one (whose terminal
+    /// side is already gathered and takes precedence): a format or option value
+    /// counts only when every path agrees; an option set on some paths only is set
+    /// with an unknown value; a schema on any path counts; complete only if every
+    /// path is. Writers whose paths differ in anything but options / format /
+    /// schema (mode, partitioning, the source DataFrame, `writeTo` table) stay
+    /// unanalysed: incomplete, nothing gathered.
+    fn merge(&mut self, ch: &Checker<'e>, paths: Vec<IoSettings<'e>>) {
+        let text = |e: Option<&Expr>| e.map(|e| ch.slice(e.range()).to_string());
+        let shape = |p: &IoSettings<'e>| {
+            let calls: Vec<String> = p
+                .calls
+                .iter()
+                .filter(|(m, _)| {
+                    !matches!(*m, "option" | "options" | "format" | "using" | "schema")
+                })
+                .map(|(m, c)| format!("{m}{}", ch.slice(c.arguments.range)))
+                .collect();
+            (calls, text(p.df), p.v2, text(p.write_to))
+        };
+        let first = &paths[0];
+        if is_writer(self.class) && paths[1..].iter().any(|p| shape(p) != shape(first)) {
+            self.complete = false;
+            return;
+        }
+        let agreed_format = paths[1..]
+            .iter()
+            .all(|p| p.format == first.format)
+            .then(|| first.format.clone())
+            .flatten();
+        if self.format.is_none() {
+            self.format = agreed_format;
+        }
+        let mut keys: Vec<&String> = paths.iter().flat_map(|p| p.options.keys()).collect();
+        keys.sort();
+        keys.dedup();
+        for k in keys {
+            let v0 = first.options.get(k).copied().flatten();
+            let agreed = paths
+                .iter()
+                .all(|p| p.options.get(k).is_some_and(|v| text(*v) == text(v0)));
+            let k = k.clone();
+            self.set(&k, if agreed { v0 } else { None });
+        }
+        self.schema |= paths.iter().any(|p| p.schema);
+        self.complete &= paths.iter().all(|p| p.complete);
+        self.calls.extend(first.calls.iter().copied());
+        if self.df.is_none() {
+            self.df = first.df;
+            self.v2 = first.v2;
+            self.write_to = first.write_to;
         }
     }
 }
@@ -683,6 +830,111 @@ mod tests {
                 &["path"],
                 false,
                 false,
+                Some("'/p'"),
+                None,
+            ),
+            // a name bound on several paths, each a fresh builder: what the paths
+            // agree on (an option set on one path only is set, value unknown)
+            (
+                "if df:\n    r = spark.read.format('csv')\nelse:\n    r = spark.read.format('csv').option('header', True)\nx = r.load('/p')",
+                Some("csv"),
+                &["header", "path"],
+                false,
+                true,
+                Some("'/p'"),
+                None,
+            ),
+            (
+                "r = spark.read.format('csv').schema(s) if df else spark.read.format('json')\nx = r.load('/p')",
+                None,
+                &["path"],
+                true,
+                true,
+                Some("'/p'"),
+                None,
+            ),
+            (
+                "if df:\n    w = df.write.mode('append')\nelse:\n    w = df.write.mode('append').option('mergeSchema', True)\nw.saveAsTable('t')",
+                None,
+                &["mergeschema"],
+                false,
+                true,
+                Some("'t'"),
+                Some("append"),
+            ),
+            // writer paths that differ beyond options: not analysed
+            (
+                "if df:\n    w = df.write.mode('append')\nelse:\n    w = df.write.mode('overwrite')\nw.saveAsTable('t')",
+                None,
+                &[],
+                false,
+                false,
+                Some("'t'"),
+                None,
+            ),
+            // one path of unknown origin, a loop-carried builder, a long chain of names
+            (
+                "def mk():\n    return spark.read\nr = mk() if df else spark.read\nx = r.option('a', 1).csv('/p')",
+                Some("csv"),
+                &["a", "path"],
+                false,
+                false,
+                Some("'/p'"),
+                None,
+            ),
+            (
+                "r = spark.read\nfor k in ks:\n    r = r.option('a', k)\nx = r.csv('/p')",
+                Some("csv"),
+                &["a", "path"],
+                false,
+                false,
+                Some("'/p'"),
+                None,
+            ),
+            (
+                "r0 = spark.read.format('csv')\nr1 = r0\nr2 = r1\nr3 = r2\nr4 = r3\nr5 = r4\nx = r5.load('/p')",
+                Some("csv"),
+                &["path"],
+                false,
+                true,
+                Some("'/p'"),
+                None,
+            ),
+            // chain origin not visible (helper result, parameter) → incomplete;
+            // `spark.read` / `df.writeStream` roots → complete
+            (
+                "def mk():\n    return spark.read.option('sep', ';')\nx = mk().csv('/p')",
+                Some("csv"),
+                &["path"],
+                false,
+                false,
+                Some("'/p'"),
+                None,
+            ),
+            (
+                "from pyspark.sql.streaming import DataStreamWriter\ndef g(w: DataStreamWriter) -> DataStreamWriter:\n    return w\nx = g(df.writeStream).start('/p')",
+                None,
+                &["path"],
+                false,
+                false,
+                Some("'/p'"),
+                None,
+            ),
+            (
+                "r = spark.readStream\nx = r.format('delta').load('/p')",
+                Some("delta"),
+                &["path"],
+                false,
+                true,
+                Some("'/p'"),
+                None,
+            ),
+            (
+                "w = df.writeStream\nx = w.start('/p')",
+                None,
+                &["path"],
+                false,
+                true,
                 Some("'/p'"),
                 None,
             ),

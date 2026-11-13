@@ -971,10 +971,12 @@ dependencies = [
 name = "sparklint_source"
 version = "0.1.0"
 dependencies = [
+ "ruff_diagnostics",
  "ruff_notebook",
  "ruff_python_ast",
  "ruff_source_file",
  "ruff_text_size",
+ "serde_json",
  "thiserror",
 ]
 

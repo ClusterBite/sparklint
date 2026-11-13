@@ -32,6 +32,13 @@ for t in spark.catalog.listTables("sales"):  # expect: DBX016
     if t.name == name:
         print("found")
 
+# for-loop whose name test is an elif branch.
+for t in spark.catalog.listTables("sales"):  # expect: DBX016
+    if t.isTemporary:
+        continue
+    elif t.name == name:
+        print("found")
+
 # SHOW TABLES collected, then a membership test on tableName.
 if name in [r.tableName for r in spark.sql("SHOW TABLES IN sales").collect()]:  # expect: DBX016
     pass

@@ -26,6 +26,7 @@ pub mod config_stream;
 pub mod correctness;
 pub mod correctness2;
 pub mod driver;
+pub mod exec_context;
 pub mod flow;
 pub mod helpers;
 pub mod io;
@@ -188,23 +189,14 @@ pub struct CountVar {
     pub logging_uses: u32,
 }
 
-/// A cached DataFrame binding (PRF008).
-#[derive(Debug, Clone)]
-pub struct CacheCandidate {
-    pub report_range: TextRange,
-    pub name: String,
-    pub method: String,
-    pub weight: u32,
-    /// Range to delete to drop the `.cache()` suffix (unsafe fix).
-    pub delete_range: Option<TextRange>,
-}
-
 /// Per-file state of deferred rules.
 #[derive(Debug, Default)]
 pub struct State {
     pub count_vars: FxHashMap<BindingId, CountVar>,
-    pub cache: FxHashMap<BindingId, CacheCandidate>,
+    pub cache: FxHashMap<BindingId, lineage::CacheCandidate>,
     pub flow: flow::FlowState,
+    /// How each site runs ([`exec_context`]), built on first use.
+    pub exec: std::cell::OnceCell<exec_context::ExecIndex>,
     /// Loops already reported by PRF001 / PRF002 (one finding per loop).
     pub prf001_loops: FxHashSet<TextRange>,
     pub prf002_loops: FxHashSet<TextRange>,
@@ -239,7 +231,7 @@ pub(crate) fn init(ch: &mut Checker) {
         actions::init_count_vars(ch);
     }
     if ch.any_enabled(CACHE_RULES) {
-        perf::init_cache_candidates(ch);
+        lineage::init_cache_candidates(ch);
     }
     if ch.any_enabled(FLOW_RULES) {
         flow::init(ch);
@@ -263,7 +255,7 @@ pub(crate) fn on_expr(ch: &mut Checker, expr: &Expr) {
             actions::count_var_use(ch, n, expr);
         }
         if !ch.state.cache.is_empty() {
-            perf::cache_use(ch, n);
+            lineage::cache_use(ch, n);
         }
         if !ch.state.flow.tracked.is_empty() {
             flow::on_name(ch, n);

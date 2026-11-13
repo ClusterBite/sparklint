@@ -326,56 +326,6 @@ pub fn action_kind(receiver: Ty, method: &str) -> Option<ActionKind> {
     }
 }
 
-/// Methods that only exist on Spark DataFrames (used as evidence for untyped values).
-/// Deliberately excludes names shared with pandas, lists, strings or RDDs.
-pub const DATAFRAME_ONLY_METHODS: &[&str] = &[
-    "withColumn",
-    "withColumns",
-    "withColumnRenamed",
-    "withColumnsRenamed",
-    "groupBy",
-    "unionByName",
-    "unionAll",
-    "toPandas",
-    "createOrReplaceTempView",
-    "createTempView",
-    "createOrReplaceGlobalTempView",
-    "createGlobalTempView",
-    "registerTempTable",
-    "selectExpr",
-    "crossJoin",
-    "dropDuplicates",
-    "printSchema",
-    "repartitionByRange",
-    "sortWithinPartitions",
-    "withWatermark",
-    "writeTo",
-    "toLocalIterator",
-    "localCheckpoint",
-    "mapInPandas",
-    "mapInArrow",
-    "withMetadata",
-    "dropDuplicatesWithinWatermark",
-    "unpivot",
-    "writeStream",
-    "isStreaming",
-    "toDF",
-    "alias",
-    "colRegex",
-];
-
-/// Methods that only exist on a SparkSession (evidence for untyped parameters).
-pub const SESSION_ONLY_ATTRS: &[&str] = &[
-    "read",
-    "readStream",
-    "createDataFrame",
-    "sparkContext",
-    "catalog",
-    "udf",
-    "newSession",
-    "getActiveSession",
-];
-
 /// Canonicalise a dotted qualified name: collapse PySpark submodule paths and Spark
 /// Connect paths to the public names (`pyspark.sql.window.Window` → `pyspark.sql.Window`).
 pub fn canonical_qualified(q: &str) -> String {
@@ -410,6 +360,10 @@ pub fn canonical_qualified(q: &str) -> String {
         ("pyspark.sql.window.Window", "pyspark.sql.Window"),
         ("pyspark.sql.connect.window.Window", "pyspark.sql.Window"),
         ("pyspark.sql.group.GroupedData", "pyspark.sql.GroupedData"),
+        (
+            "pyspark.sql.observation.Observation",
+            "pyspark.sql.Observation",
+        ),
         (
             "pyspark.sql.readwriter.DataFrameReader",
             "pyspark.sql.DataFrameReader",
@@ -513,6 +467,7 @@ pub fn annotation_type(q: &str) -> Option<Ty> {
         "pyspark.sql.streaming.DataStreamReader" => Ty::DataStreamReader,
         "pyspark.sql.streaming.DataStreamWriter" => Ty::DataStreamWriter,
         "pyspark.sql.UserDefinedFunction" => Ty::Udf,
+        "pyspark.sql.Observation" => Ty::Observation,
         "pyspark.pandas.DataFrame" | "pyspark.pandas.Series" => Ty::PandasOnSparkFrame,
         "pandas.DataFrame" | "pandas.Series" => Ty::PandasFrame,
         "delta.tables.DeltaTable" | "delta.DeltaTable" => Ty::DeltaTable,

@@ -156,6 +156,16 @@ impl<'a> Checker<'a> {
         })
     }
 
+    /// How the code at `site` runs: normally, only after a failed check (assert
+    /// message, `raise`), or as a probe for an expected error (see
+    /// [`rules::exec_context`]). Built once per file on first use.
+    pub fn run_at(&self, site: TextRange) -> rules::exec_context::Run {
+        self.state
+            .exec
+            .get_or_init(|| rules::exec_context::ExecIndex::build(self.module, self.model))
+            .run_at(site)
+    }
+
     /// The statement enclosing the current statement (for sibling lookups).
     pub fn parent_stmt_of_current(&self) -> Option<&'a Stmt> {
         let mut it = self.parents.iter().rev().filter_map(|n| match n {
@@ -180,5 +190,51 @@ impl<'a> Visitor<'a> for Checker<'a> {
         rules::on_expr(self, expr);
         visitor::walk_expr(self, expr);
         self.parents.pop();
+    }
+}
+
+/// Test support: a [`Checker`] built from source.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::Checker;
+    use crate::config::LinterSettings;
+    use ruff_python_ast::visitor::Visitor;
+    use ruff_python_parser::parse_unchecked_source;
+    use ruff_text_size::TextSize;
+    use sparklint_semantic::{NoSummaries, build_model};
+    use sparklint_source::SourceFile;
+    use std::path::Path;
+
+    /// Parse `src` (no syntax errors allowed), build its model and a checker with
+    /// `selectors` enabled, run `f` on it before the walk.
+    pub(crate) fn with_checker<R>(
+        src: &str,
+        selectors: &[&str],
+        f: impl FnOnce(&mut Checker) -> R,
+    ) -> R {
+        let file = SourceFile::from_text(Path::new("t.py"), src.to_string());
+        let settings = LinterSettings::for_selectors(selectors).unwrap();
+        let parsed = parse_unchecked_source(&file.text, file.py_source_type());
+        assert!(parsed.errors().is_empty(), "{src}");
+        let module = parsed.syntax();
+        let opts = crate::semantic_options(&file, &settings, None);
+        let model = build_model(module, TextSize::of(src), opts, &NoSummaries);
+        let mut ch = Checker::new(&file, &model, &settings, module);
+        f(&mut ch)
+    }
+
+    /// Like [`with_checker`], but after the walk: the per-file state the rules'
+    /// name-load analyses fill (flow uses, cache weights) is there; finish hooks
+    /// have not run.
+    pub(crate) fn with_walked_checker<R>(
+        src: &str,
+        selectors: &[&str],
+        f: impl FnOnce(&mut Checker) -> R,
+    ) -> R {
+        with_checker(src, selectors, |ch| {
+            let module = ch.module;
+            ch.visit_body(&module.body);
+            f(ch)
+        })
     }
 }

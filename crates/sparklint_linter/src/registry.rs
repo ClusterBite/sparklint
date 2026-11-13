@@ -1,9 +1,8 @@
 //! Rule registry: metadata for every catalog rule (generated `spec/rules.json`, from
 //! docs/RULES_CATALOG.md via `scripts/gen_rules.py`) plus which ones are implemented.
 //!
-//! Every catalog rule is registered; a rule without an entry in the rule table
-//! (`crate::rules::TABLE`) is marked `implemented: false` (`sparklint rules` shows it
-//! as `planned`) and is never run (selecting it is allowed and simply has no effect).
+//! Every catalog rule is registered; `implemented` says whether the rule table
+//! (`crate::rules::TABLE`) runs it.
 
 use std::sync::LazyLock;
 

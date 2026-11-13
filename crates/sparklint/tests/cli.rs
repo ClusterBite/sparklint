@@ -11,6 +11,27 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .expect("run sparklint")
 }
 
+/// Run with `input` on standard input.
+fn run_stdin(dir: &Path, args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sparklint"))
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run sparklint");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().expect("wait for sparklint")
+}
+
 fn stdout(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
@@ -47,6 +68,119 @@ fn exit_codes_and_text_output() {
     assert_eq!(o.status.code(), Some(2));
     let o = run(t.path(), &["check", "missing_dir"]);
     assert_eq!(o.status.code(), Some(2));
+    let out = stdout(&o);
+    assert!(!out.contains("All checks passed"), "{out}");
+    assert!(
+        out.contains("No findings, but 1 error (see above): 0 files checked."),
+        "{out}"
+    );
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("sparklint: error: missing_dir: no such file or directory"),
+        "{err}"
+    );
+
+    // a missing path next to a clean file: still exit 2, still no "passed"
+    let o = run(t.path(), &["check", "clean.py", "missing.py"]);
+    assert_eq!(o.status.code(), Some(2));
+    let out = stdout(&o);
+    assert!(
+        out.contains("No findings, but 1 error (see above): 1 file checked."),
+        "{out}"
+    );
+
+    // findings and a missing path: the findings summary plus the error count
+    let o = run(t.path(), &["check", "bad.py", "missing.py"]);
+    assert_eq!(o.status.code(), Some(2));
+    let out = stdout(&o);
+    assert!(out.contains("Found 1 finding in 1 file"), "{out}");
+    assert!(out.contains("1 error (see above)."), "{out}");
+}
+
+#[test]
+fn stdin_input() {
+    let t = tempfile::tempdir().unwrap();
+    // Named `-` by default; nothing is written to disk.
+    let o = run_stdin(t.path(), &["check", "-"], COLLECT);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    assert!(stdout(&o).contains("-:2:"), "{}", stdout(&o));
+    assert!(stdout(&o).contains("1 file checked"), "{}", stdout(&o));
+    assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 0);
+
+    // `--stdin-filename` alone implies `-`, names the file and picks its config.
+    let o = run_stdin(
+        t.path(),
+        &["check", "--stdin-filename", "src/etl.py"],
+        COLLECT,
+    );
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).contains("src/etl.py:2:"), "{}", stdout(&o));
+    write(t.path(), "sub/sparklint.toml", "ignore = [\"ACT002\"]\n");
+    let o = run_stdin(
+        t.path(),
+        &["check", "-", "--stdin-filename", "sub/job.py"],
+        COLLECT,
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    // Even when that path does not exist on disk, and in JSON.
+    let o = run_stdin(
+        t.path(),
+        &[
+            "check",
+            "-",
+            "--stdin-filename",
+            "gone/job.py",
+            "--output-format",
+            "json",
+        ],
+        COLLECT,
+    );
+    assert_eq!(o.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v[0]["filename"], "gone/job.py");
+    assert_eq!(v[0]["code"], "ACT002");
+
+    // `.ipynb` input is read as notebook JSON.
+    let nb = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/ACT010/display.ipynb"),
+    )
+    .unwrap();
+    let o = run_stdin(
+        t.path(),
+        &[
+            "check",
+            "-",
+            "--stdin-filename",
+            "nb.ipynb",
+            "--select",
+            "ACT010",
+        ],
+        &nb,
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    assert!(stdout(&o).contains("nb.ipynb:cell "), "{}", stdout(&o));
+
+    // `--fix`: the fixed source on stdout, the report on stderr, no file written.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/ACT006");
+    let src = std::fs::read_to_string(fixture.join("fix.py")).unwrap();
+    let fixed = std::fs::read_to_string(fixture.join("fix.py.fixed")).unwrap();
+    let o = run_stdin(
+        t.path(),
+        &["check", "-", "--fix", "--select", "ACT006"],
+        &src,
+    );
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), fixed);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("Fixed 2 findings"));
+    // Nothing to fix: the source comes back unchanged.
+    let o = run_stdin(t.path(), &["check", "-", "--fix"], "x = 1\n");
+    assert_eq!(stdout(&o), "x = 1\n");
+
+    // `-` with other paths is a usage error.
+    write(t.path(), "a.py", "x = 1\n");
+    let o = run_stdin(t.path(), &["check", "-", "a.py"], "x = 1\n");
+    assert_eq!(o.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("cannot be combined"));
 }
 
 #[test]
@@ -163,6 +297,90 @@ fn fix_writes_files_and_syntax_errors_do_not_abort() {
     assert!(
         out.contains("broken.py:1:") && out.contains("SYN001"),
         "{out}"
+    );
+}
+
+#[test]
+fn notebook_on_reads_plain_module_magics() {
+    // `notebook = "on"` reads a plain .py as a notebook: magics and shell escapes
+    // parse (IPython mode) instead of hiding the file behind SYN001.
+    let t = tempfile::tempdir().unwrap();
+    let job = "%pip install x\nfiles = !ls\ndf = spark.read.table(\"t\")\nrows = df.collect()\n!echo hi\n";
+    write(t.path(), "job.py", job);
+    let o = run(t.path(), &["check", "--select", "SYN001,ACT002"]);
+    assert!(stdout(&o).contains("SYN001"), "{}", stdout(&o));
+    assert!(!stdout(&o).contains("ACT002"), "{}", stdout(&o));
+    write(
+        t.path(),
+        "pyproject.toml",
+        "[tool.sparklint]\nnotebook = \"on\"\n",
+    );
+    let o = run(t.path(), &["check", "--select", "SYN001,ACT002"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    assert!(!stdout(&o).contains("SYN001"), "{}", stdout(&o));
+    assert!(stdout(&o).contains("job.py:4:11: ACT002"), "{}", stdout(&o));
+    // Fixing keeps IPython mode for the re-check: the magics stay and nothing is
+    // reported as a syntax error afterwards.
+    let o = run(
+        t.path(),
+        &[
+            "check",
+            "--select",
+            "SYN001,ACT002",
+            "--fix",
+            "--unsafe-fixes",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("job.py")).unwrap(),
+        job.replace("df.collect()", "df.limit(1000).collect()")
+    );
+}
+
+#[test]
+fn fix_writes_ipynb_cells() {
+    let t = tempfile::tempdir().unwrap();
+    let nb = r##"{
+ "cells": [
+  {"cell_type": "markdown", "metadata": {}, "source": ["# Title"]},
+  {"cell_type": "code", "execution_count": null, "metadata": {}, "outputs": [],
+   "source": ["%pip install x\n", "df = spark.table('t')\n", "if df.count() == 0:\n", "    pass"]},
+  {"cell_type": "code", "execution_count": null, "metadata": {}, "outputs": [],
+   "source": ["s = <broken\n", "if df.count() == 0:\n", "    pass"]}
+ ],
+ "metadata": {},
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
+"##;
+    write(t.path(), "nb.ipynb", nb);
+    let o = run(t.path(), &["check", "--fix", "--select", "ACT006"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert!(stdout(&o).contains("Fixed 1 finding"), "{}", stdout(&o));
+    let fixed = std::fs::read_to_string(t.path().join("nb.ipynb")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&fixed).unwrap();
+    let cell = |i: usize| -> String {
+        v["cells"][i]["source"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l.as_str().unwrap())
+            .collect()
+    };
+    assert_eq!(cell(0), "# Title");
+    assert_eq!(
+        cell(1),
+        "%pip install x\ndf = spark.table('t')\nif df.isEmpty():\n    pass"
+    );
+    // The cell that does not parse is left as it is.
+    assert_eq!(cell(2), "s = <broken\nif df.count() == 0:\n    pass");
+    // A second run has nothing left to fix and leaves the file alone.
+    let o = run(t.path(), &["check", "--fix", "--select", "ACT006"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("nb.ipynb")).unwrap(),
+        fixed
     );
 }
 

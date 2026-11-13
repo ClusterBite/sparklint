@@ -210,14 +210,26 @@ pub fn input_file_name(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
         ch.report(d);
         return;
     }
-    // SQL text: spark.sql(...), F.expr(...), selectExpr(...), filter("...")
+    // SQL text: spark.sql(...) (the query it runs: `sqlQuery=`, a name bound once to
+    // the text; an EXPLAIN only plans), F.expr(...), selectExpr(...), filter("...").
+    if let Some(sc) = ch.model.spark_call_named(expr, &["sql"])
+        && sc.class().is_session()
+    {
+        if let Some(arg) = call_arg(c, 0, "sqlQuery")
+            && ch
+                .model
+                .sql_query(c)
+                .is_some_and(|q| q.calls("input_file_name"))
+        {
+            ch.report(Diagnostic::new("DBX003", IFN_MSG, arg.range()));
+        }
+        return;
+    }
     let sql_args: Vec<&Expr> = if ch.model.is_spark_function(&c.func, "expr") {
         c.arguments.args.iter().take(1).collect()
     } else if let Some(sc) = ch.model.spark_call(expr) {
-        let rt = sc.class();
         match sc.method {
-            "sql" if rt.is_session() => c.arguments.args.iter().take(1).collect(),
-            "selectExpr" | "filter" | "where" if rt == Ty::DataFrame => {
+            "selectExpr" | "filter" | "where" if sc.class() == Ty::DataFrame => {
                 c.arguments.args.iter().collect()
             }
             _ => Vec::new(),
@@ -226,7 +238,11 @@ pub fn input_file_name(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
         Vec::new()
     };
     for a in sql_args {
-        if static_text(a).is_some_and(|t| SqlText::new(&t).calls("input_file_name")) {
+        if ch
+            .model
+            .resolve_text(a)
+            .is_some_and(|t| SqlText::new(&t).calls("input_file_name"))
+        {
             ch.report(Diagnostic::new("DBX003", IFN_MSG, a.range()));
         }
     }
@@ -477,7 +493,13 @@ pub fn list_tables_existence_loop(ch: &mut Checker, stmt: &Stmt) {
         return;
     }
     let hit = f.body.iter().any(|s| match s {
-        Stmt::If(i) => has_name_equality(&i.test, &targets),
+        Stmt::If(i) => {
+            has_name_equality(&i.test, &targets)
+                || i.elif_else_clauses
+                    .iter()
+                    .filter_map(|c| c.test.as_ref())
+                    .any(|t| has_name_equality(t, &targets))
+        }
         _ => false,
     });
     if hit {

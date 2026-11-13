@@ -3,9 +3,13 @@
 use ruff_python_ast::{self as ast, Expr, Number, Operator, UnaryOp};
 use ruff_text_size::Ranged;
 
-use crate::api::{self, DATAFRAME_ONLY_METHODS, SESSION_ONLY_ATTRS, canonical_qualified};
-use crate::model::{BindingKind, SemanticModel};
-use crate::types::{Confidence, Elem, Facts, Ty, TypeInfo};
+use crate::api::{self, canonical_qualified};
+use crate::evidence::{self, Use};
+use crate::facts::{Facts, Local, Step};
+use crate::library;
+use crate::model::{BindingId, BindingKind, SemanticModel};
+use crate::sql::SqlText;
+use crate::types::{Confidence, Elem, Ty, TypeInfo};
 
 /// Bound under which `spark.range(n)` counts as a small, bounded DataFrame.
 const SMALL_RANGE: i64 = 10_000;
@@ -406,16 +410,21 @@ impl<'a> SemanticModel<'a> {
                 .unwrap_or(TypeInfo::UNKNOWN)
         };
         if t.is_unknown() {
-            return self.name_heuristic(name);
+            return self.name_heuristic(name, &use_site.reaching);
         }
         t
     }
 
-    pub(crate) fn name_heuristic(&self, name: &str) -> TypeInfo {
+    /// The name heuristic for a name of unknown type reached by `reaching`.
+    pub(crate) fn name_heuristic(&self, name: &str, reaching: &[BindingId]) -> TypeInfo {
         if !self.opts.heuristics {
             return TypeInfo::UNKNOWN;
         }
         if is_dataframe_name(name) {
+            // `result_df = fetch(); result_df.shape`: used as a pandas frame.
+            if self.pandas_used(reaching, true) {
+                return TypeInfo::UNKNOWN;
+            }
             TypeInfo::likely(Ty::DataFrame)
         } else if is_session_name(name) {
             TypeInfo::likely(Ty::SparkSession)
@@ -424,6 +433,20 @@ impl<'a> SemanticModel<'a> {
         } else {
             TypeInfo::UNKNOWN
         }
+    }
+
+    /// Some binding in `reaching` has a pandas-only use (`x.iloc`, `x.shape`): usage
+    /// evidence against guessing the value a Spark DataFrame from a DataFrame-only
+    /// method (mixed evidence is none). With `only`: the uses say pandas frame
+    /// and nothing else, which also overrides the `df` name heuristic (as for
+    /// parameters).
+    fn pandas_used(&self, reaching: &[BindingId], only: bool) -> bool {
+        let used = &self.prior.pandas_used;
+        !used.is_empty()
+            && reaching.iter().any(|b| {
+                used.get(&self.binding(*b).range)
+                    .is_some_and(|pandas_only| *pandas_only || !only)
+            })
     }
 
     /// Type of a name with no binding in any enclosing scope (globals/builtins).
@@ -462,7 +485,8 @@ impl<'a> SemanticModel<'a> {
         }
         let base = self.ty_of(&a.value);
         if let Some(q) = &q
-            && !(base.ty.is_spark() || matches!(base.ty, Ty::Instance(_) | Ty::DbUtils))
+            && !(base.ty.is_spark()
+                || matches!(base.ty, Ty::Instance(_) | Ty::DbUtils | Ty::Library(_)))
         {
             if q.starts_with("pyspark.sql.functions.") {
                 return TypeInfo::certain(Ty::Function);
@@ -471,6 +495,9 @@ impl<'a> SemanticModel<'a> {
         }
         match base.ty {
             Ty::Instance(c) => self.class_attr(c, attr).unwrap_or(TypeInfo::UNKNOWN),
+            Ty::Library(l) => library::attribute(l, attr)
+                .map(|t| TypeInfo::certain(t).with_confidence(base.confidence))
+                .unwrap_or(TypeInfo::UNKNOWN),
             Ty::DbUtils => TypeInfo::likely(Ty::DbUtils),
             // `pdf.values`, `pdf.loc`, `pdf.T`, `arr.shape`: still pandas / numpy.
             t if t.is_local_data() => non_spark(base),
@@ -478,13 +505,14 @@ impl<'a> SemanticModel<'a> {
                 Some(m) if m.property => {
                     let mut out = TypeInfo::certain(m.returns).with_confidence(base.confidence);
                     if t == Ty::DataFrame {
-                        out.facts = Facts {
-                            cached: false,
-                            ..base.facts
-                        };
+                        out.facts = base.facts.after(&Step::Other);
                     }
                     if t == Ty::SparkSession && attr == "readStream" {
                         out.facts.streaming = true;
+                    }
+                    // `spark.read`, `df.write`, `df.writeStream`: a fresh builder.
+                    if m.returns.is_io_builder() {
+                        out.facts.fresh_builder = Facts::FRESH_BUILDER.fresh_builder;
                     }
                     out
                 }
@@ -628,6 +656,9 @@ impl<'a> SemanticModel<'a> {
     }
 
     fn call_of_qualified(&self, q: &str, c: &ast::ExprCall) -> Option<TypeInfo> {
+        if let Some(l) = library::constructor(q) {
+            return Some(TypeInfo::certain(Ty::Library(l)));
+        }
         if let Some(f) = q.strip_prefix("pyspark.sql.functions.") {
             return Some(match f {
                 "udf" | "pandas_udf" | "arrow_udf" => TypeInfo::certain(Ty::Udf),
@@ -646,7 +677,7 @@ impl<'a> SemanticModel<'a> {
             });
         }
         if let Some(m) = q.strip_prefix("pyspark.sql.Window.") {
-            let facts = window_facts(Facts::default(), m, c);
+            let facts = window_facts(Facts::WINDOW_CLASS, m, c);
             return Some(TypeInfo::certain(Ty::WindowSpec).with_facts(facts));
         }
         let t = match q {
@@ -660,6 +691,7 @@ impl<'a> SemanticModel<'a> {
             | "pyspark.sql.HiveContext" => Ty::SqlContext,
             "pyspark.sql.Row" => Ty::Row,
             "pyspark.sql.Column" => Ty::Column,
+            "pyspark.sql.Observation" => Ty::Observation,
             "delta.tables.DeltaTable.forName"
             | "delta.tables.DeltaTable.forPath"
             | "delta.tables.DeltaTable.convertToDelta"
@@ -761,24 +793,47 @@ impl<'a> SemanticModel<'a> {
 
     /// Result of `recv.method(...)`.
     pub(crate) fn method_call(&self, recv: TypeInfo, m: &str, c: &ast::ExprCall) -> TypeInfo {
+        let mut out = self.method_result(recv, m, c);
+        // A builder call on a reader / writer (`option`, `format`, `mode`, ...)
+        // keeps the builder's origin.
+        if recv.ty.is_io_builder() && out.ty.is_io_builder() {
+            out.facts.fresh_builder = recv.facts.fresh_builder;
+        }
+        out
+    }
+
+    fn method_result(&self, recv: TypeInfo, m: &str, c: &ast::ExprCall) -> TypeInfo {
         let mut recv = recv;
         if recv.is_unknown() {
             if !self.opts.heuristics {
                 return TypeInfo::UNKNOWN;
             }
-            if DATAFRAME_ONLY_METHODS.contains(&m) {
-                // `dg.DataGenerator(..).withIdOutput().withColumn(..)`: a builder of
-                // another library that mirrors the DataFrame API is not a DataFrame.
-                if let Expr::Attribute(a) = &*c.func
-                    && self.foreign_object_chain(&a.value)
-                {
-                    return TypeInfo::UNKNOWN;
+            // What this call says about its receiver (the call shape included:
+            // `x.withColumn("a", "int")` is another library's builder).
+            match evidence::of_use(m, Some(c)) {
+                Some(Use::DataFrame) => {
+                    if let Expr::Attribute(a) = &*c.func {
+                        // `dg.DataGenerator(..).withIdOutput().withColumn(..)`: a builder
+                        // of another library that mirrors the DataFrame API is not a
+                        // DataFrame.
+                        if self.foreign_object_chain(&a.value) {
+                            return TypeInfo::UNKNOWN;
+                        }
+                        // `x.iloc[0]` elsewhere: mixed evidence is no evidence.
+                        if let Expr::Name(n) = &*a.value
+                            && self.pandas_used(self.reaching(n), false)
+                        {
+                            return TypeInfo::UNKNOWN;
+                        }
+                    }
+                    recv = TypeInfo::likely(Ty::DataFrame);
                 }
-                recv = TypeInfo::likely(Ty::DataFrame);
-            } else if SESSION_ONLY_ATTRS.contains(&m) && m == "createDataFrame" {
-                recv = TypeInfo::likely(Ty::SparkSession);
-            } else {
-                return TypeInfo::UNKNOWN;
+                // Of the session-only names only `createDataFrame` is trusted on a
+                // single call (the others are attributes, or rare enough not to guess).
+                Some(Use::Session) if m == "createDataFrame" => {
+                    recv = TypeInfo::likely(Ty::SparkSession);
+                }
+                _ => return TypeInfo::UNKNOWN,
             }
         }
         let conf = recv.confidence;
@@ -790,6 +845,19 @@ impl<'a> SemanticModel<'a> {
                 self.local_function_return(*scope)
                     .unwrap_or(TypeInfo::UNKNOWN)
             }
+            Ty::Library(l) => match library::method(l, m) {
+                Some(t) => {
+                    let mut out = TypeInfo::certain(t).with_confidence(conf);
+                    // `spec.build(withStreaming=True)` is a streaming DataFrame.
+                    out.facts.streaming = t == Ty::DataFrame
+                        && m == "build"
+                        && c.arguments.find_keyword("withStreaming").is_some_and(
+                            |k| matches!(&k.value, Expr::BooleanLiteral(b) if b.value),
+                        );
+                    out
+                }
+                None => TypeInfo::UNKNOWN,
+            },
             Ty::Logger => TypeInfo::certain(Ty::NoneTy),
             Ty::Udf => TypeInfo::certain(Ty::Udf),
             Ty::DataFrame => self.dataframe_method(recv, m, c),
@@ -809,8 +877,12 @@ impl<'a> SemanticModel<'a> {
             Ty::GroupedData => match api::api().method_of(Ty::GroupedData, m) {
                 Some(mi) => {
                     let mut t = TypeInfo::certain(mi.returns).with_confidence(conf);
+                    // `df.groupBy().agg(..)`: no grouping keys, one global group.
+                    let one_row = mi.returns == Ty::DataFrame
+                        && GROUPED_AGGREGATES.contains(&m)
+                        && keyless_grouping(&c.func);
                     t.facts = Facts {
-                        bounded: recv.facts.bounded,
+                        bounded: if one_row { Some(1) } else { recv.facts.bounded },
                         reduced: mi.returns == Ty::DataFrame,
                         streaming: recv.facts.streaming,
                         ..Facts::default()
@@ -894,6 +966,8 @@ impl<'a> SemanticModel<'a> {
                         Expr::Tuple(l) => t.facts.bounded = Some(l.elts.len() as u64),
                         _ => {}
                     }
+                    let d = self.ty_of(data).ty;
+                    t.facts.local = Local::of_data(d);
                 }
                 t
             }
@@ -917,11 +991,16 @@ impl<'a> SemanticModel<'a> {
             }
             "sql" => {
                 let mut t = TypeInfo::certain(Ty::DataFrame).with_confidence(conf);
-                if let Some(q) = self.sql_query(c) {
-                    if let Some(n) = q.trailing_limit() {
+                if let Some(q) = self.sql_statement(c) {
+                    // An EXPLAIN is one row of plan text whatever LIMIT its query has.
+                    if q.explain() {
+                        t.facts.bounded = Some(1);
+                    } else if let Some(n) = q.trailing_limit() {
                         t.facts.bounded = Some(n);
                     } else if q.single_row() {
                         t.facts.bounded = Some(1);
+                    } else if q.catalog_metadata() {
+                        t.facts.local = true;
                     }
                 }
                 t
@@ -936,12 +1015,12 @@ impl<'a> SemanticModel<'a> {
     fn dataframe_method(&self, recv: TypeInfo, m: &str, c: &ast::ExprCall) -> TypeInfo {
         let conf = recv.confidence;
         let args = &c.arguments.args;
-        let mut facts = recv.facts;
-        facts.cached = false;
         let rows = |ty: Ty, bounded: Option<u64>| {
             let mut t = TypeInfo::certain(ty).with_confidence(conf);
             t.facts.from_spark = true;
             t.facts.bounded = bounded;
+            // Rows of a driver-sized frame (driver-built data, catalog metadata).
+            t.facts.local = recv.facts.local;
             t
         };
         match m {
@@ -975,7 +1054,7 @@ impl<'a> SemanticModel<'a> {
                 return TypeInfo::certain(Ty::DataFrame)
                     .with_confidence(conf)
                     .with_facts(Facts {
-                        streaming: facts.streaming,
+                        streaming: recv.facts.streaming,
                         ..Facts::default()
                     });
             }
@@ -999,22 +1078,41 @@ impl<'a> SemanticModel<'a> {
             if let Ty::List(Elem::DataFrame) = mi.returns {
                 t.facts.bounded = recv.facts.bounded;
             }
+            // `df.writeTo(t)`: a fresh builder.
+            if mi.returns.is_io_builder() {
+                t.facts.fresh_builder = Facts::FRESH_BUILDER.fresh_builder;
+            }
             return t;
         }
-        match m {
-            "limit" => {
-                let n = args
-                    .first()
+        let step = match m {
+            "limit" => Step::Limit(
+                args.first()
                     .or_else(|| call_arg(c, 0, "num"))
                     .map(|a| int_literal(a).map_or(u64::MAX, |n| n.max(0) as u64))
-                    .unwrap_or(u64::MAX);
-                facts.bounded = Some(facts.bounded.map_or(n, |b| b.min(n)));
+                    .unwrap_or(u64::MAX),
+            ),
+            "agg" => Step::Aggregate,
+            "select" => {
+                let items = select_items(args);
+                if !items.is_empty() && items.iter().all(|a| self.is_aggregate_expr(a)) {
+                    Step::Aggregate
+                } else {
+                    Step::Other
+                }
             }
-            "agg" => facts.bounded = Some(1),
-            "select" if !args.is_empty() && args.iter().all(|a| self.is_aggregate_expr(a)) => {
-                facts.bounded = Some(1);
+            "selectExpr" => {
+                let items = select_items(args);
+                let agg = |a: &Expr| {
+                    self.resolve_text(a)
+                        .is_some_and(|t| SqlText::new(&t).aggregate_expression())
+                };
+                if !items.is_empty() && items.iter().all(agg) {
+                    Step::Aggregate
+                } else {
+                    Step::Other
+                }
             }
-            "describe" | "summary" => facts.bounded = Some(facts.bounded.map_or(10, |b| b.min(10))),
+            "describe" | "summary" => Step::Describe,
             "filter"
             | "where"
             | "distinct"
@@ -1027,19 +1125,17 @@ impl<'a> SemanticModel<'a> {
             | "intersectAll"
             | "subtract"
             | "exceptAll"
-            | "dropDuplicatesWithinWatermark" => facts.reduced = true,
-            "cache" | "persist" | "checkpoint" | "localCheckpoint" => facts.cached = true,
+            | "dropDuplicatesWithinWatermark" => Step::Reduce,
+            "cache" | "persist" | "checkpoint" | "localCheckpoint" => Step::Cache,
             "join" | "crossJoin" | "union" | "unionAll" | "unionByName" | "lateralJoin" => {
-                let other = args.first().map(|a| self.ty_of(a));
-                facts.bounded = match (facts.bounded, other.and_then(|o| o.facts.bounded)) {
-                    (Some(a), Some(b)) if m.starts_with("union") => Some(a.saturating_add(b)),
-                    (Some(a), Some(b)) => Some(a.saturating_mul(b)),
-                    _ => None,
-                };
-                facts.reduced = false;
+                Step::Combine {
+                    union: m.starts_with("union"),
+                    other: args.first().map(|a| self.ty_of(a).facts),
+                }
             }
-            _ => {}
-        }
+            _ => Step::Other,
+        };
+        let facts = recv.facts.after(&step);
         TypeInfo::certain(Ty::DataFrame)
             .with_confidence(conf)
             .with_facts(facts)
@@ -1164,8 +1260,55 @@ impl<'a> SemanticModel<'a> {
                 e = &a.value;
                 continue;
             }
-            return AGGS.iter().any(|f| self.is_spark_function(&c.func, f));
+            if AGGS.iter().any(|f| self.is_spark_function(&c.func, f)) {
+                return true;
+            }
+            return self.is_scalar_of_aggregates(c);
         }
+    }
+
+    /// `F.to_date(F.max("d"))`, `F.round(F.avg("x"), 2)`, `F.coalesce(F.sum("x"), F.lit(0))`:
+    /// a row-wise `pyspark.sql.functions` call whose arguments are aggregates or
+    /// literals (at least one aggregate) is still one value per group. Generators
+    /// (`explode(collect_list(..))`) produce several rows and are excluded.
+    fn is_scalar_of_aggregates(&self, c: &ast::ExprCall) -> bool {
+        const GENERATORS: &[&str] = &[
+            "explode",
+            "explode_outer",
+            "posexplode",
+            "posexplode_outer",
+            "inline",
+            "inline_outer",
+            "stack",
+            "udf",
+            "pandas_udf",
+        ];
+        let Some(q) = self.qualified_name(&c.func) else {
+            return false;
+        };
+        let Some(name) = q.strip_prefix("pyspark.sql.functions.") else {
+            return false;
+        };
+        if GENERATORS.contains(&name) || name.contains('.') {
+            return false;
+        }
+        let args = c
+            .arguments
+            .args
+            .iter()
+            .chain(c.arguments.keywords.iter().map(|k| &k.value));
+        let mut any_agg = false;
+        for a in args {
+            if self.is_aggregate_expr(a) {
+                any_agg = true;
+            } else if !(a.is_literal_expr()
+                || matches!(a, Expr::Call(lc) if self.is_spark_function(&lc.func, "lit")
+                    && lc.arguments.args.iter().all(Expr::is_literal_expr)))
+            {
+                return false;
+            }
+        }
+        any_agg
     }
 
     /// Element type when iterating over `iter` (`for x in iter`).
@@ -1236,35 +1379,37 @@ fn is_foreign_class(q: &str) -> bool {
 /// A method that, on a builder object, conventionally returns the builder itself:
 /// `withX(..)`, `option(..)`, and the DataFrame-only names a builder may mirror.
 fn is_fluent_method(m: &str) -> bool {
-    m.starts_with("with")
-        || matches!(m, "option" | "options")
-        || DATAFRAME_ONLY_METHODS.contains(&m)
+    m.starts_with("with") || matches!(m, "option" | "options") || evidence::is_dataframe_only(m)
 }
 
 /// WindowSpec fact transitions for `Window.<m>(…)` / `spec.<m>(…)`.
-fn window_facts(mut facts: Facts, m: &str, c: &ast::ExprCall) -> Facts {
+fn window_facts(facts: Facts, m: &str, c: &ast::ExprCall) -> Facts {
+    match window_step(m, c) {
+        Some(step) => facts.after(&step),
+        None => facts,
+    }
+}
+
+/// The [`Step`] a WindowSpec method takes, if it changes any fact.
+fn window_step(m: &str, c: &ast::ExprCall) -> Option<Step> {
     match m {
         "partitionBy" => {
-            if !c.arguments.args.is_empty() || !c.arguments.keywords.is_empty() {
-                let only_empty_list = c.arguments.args.len() == 1
-                    && matches!(&c.arguments.args[0], Expr::List(l) if l.elts.is_empty());
-                if !only_empty_list {
-                    facts.win_partitioned = true;
-                }
-            }
+            let any_key = !c.arguments.args.is_empty() || !c.arguments.keywords.is_empty();
+            let only_empty_list = c.arguments.args.len() == 1
+                && matches!(&c.arguments.args[0], Expr::List(l) if l.elts.is_empty());
+            (any_key && !only_empty_list).then_some(Step::PartitionBy)
         }
-        "orderBy" => facts.win_ordered = true,
+        "orderBy" => Some(Step::OrderBy),
         "rowsBetween" | "rangeBetween" => {
-            facts.win_framed = true;
             let start = ast_arg(c, 0, "start");
             let end = ast_arg(c, 1, "end");
-            facts.win_frame_growing = start
-                .is_some_and(|s| frame_bound(s) == Some(Bound::Unbounded))
-                && end.is_some_and(|e| frame_bound(e) == Some(Bound::Finite));
+            Some(Step::Frame {
+                growing: start.is_some_and(|s| frame_bound(s) == Some(Bound::Unbounded))
+                    && end.is_some_and(|e| frame_bound(e) == Some(Bound::Finite)),
+            })
         }
-        _ => {}
+        _ => None,
     }
-    facts
 }
 
 fn ast_arg<'a>(c: &'a ast::ExprCall, pos: usize, kw: &str) -> Option<&'a Expr> {
@@ -1313,5 +1458,40 @@ fn frame_bound(e: &Expr) -> Option<Bound> {
             }
         }
         _ => None,
+    }
+}
+
+/// `GroupedData` methods that return one row per group.
+const GROUPED_AGGREGATES: &[&str] = &["agg", "count", "sum", "avg", "mean", "max", "min"];
+
+/// Whether `func` (the `.agg` attribute of a `GroupedData` call) hangs off a grouping
+/// call without keys: `df.groupBy()`, `df.groupby().pivot("c")`, `df.rollup()`.
+fn keyless_grouping(func: &Expr) -> bool {
+    let Expr::Attribute(a) = func else {
+        return false;
+    };
+    let mut e = &*a.value;
+    loop {
+        let Expr::Call(c) = e else { return false };
+        let Expr::Attribute(g) = &*c.func else {
+            return false;
+        };
+        match g.attr.as_str() {
+            "pivot" => e = &g.value,
+            "groupBy" | "groupby" | "rollup" | "cube" => {
+                return c.arguments.args.is_empty() && c.arguments.keywords.is_empty();
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// The items of a `select(..)` / `selectExpr(..)` call: its arguments, or the elements
+/// of a single list / tuple argument (`df.select([F.max("a"), F.min("b")])`).
+fn select_items(args: &[Expr]) -> &[Expr] {
+    match args {
+        [Expr::List(l)] => &l.elts,
+        [Expr::Tuple(t)] => &t.elts,
+        _ => args,
     }
 }

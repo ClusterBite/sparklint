@@ -73,6 +73,11 @@ impl<'e> SparkCall<'e> {
         self.receiver_ty.bounded()
     }
 
+    /// The receiver fits in driver memory (bounded, driver-built or catalog metadata).
+    pub fn driver_sized(&self) -> bool {
+        self.receiver_ty.driver_sized()
+    }
+
     /// Positional arguments.
     pub fn args(&self) -> &'e [Expr] {
         &self.call.arguments.args

@@ -2,20 +2,25 @@
 //! PRF015 collect-dedup-redundant, PRF023 pivot-without-values, PRF024 cube-many-columns,
 //! PRF025 not-in-subquery, PRF026 many-distinct-aggregates, PRF027 order-by-rand,
 //! PRF032 or-join-condition, PRF035 keyless-grouped-pandas,
-//! PRF036 forced-nested-loop-join-hint.
+//! PRF036 forced-nested-loop-join-hint, PRF022 sql-select-star (`SELECT *` flowing into
+//! a write / collect / cache, followed through [`super::flow`]).
 
 use ruff_python_ast::{self as ast, CmpOp, Expr};
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashSet;
-use sparklint_semantic::{SqlCond as JoinCond, SqlConjunct, SqlText, Ty, call_arg, str_literal};
+use sparklint_semantic::api::ActionKind;
+use sparklint_semantic::{
+    BindingId, SqlCond as JoinCond, SqlConjunct, SqlText, Ty, call_arg, str_literal,
+};
 
 use super::Rule;
 use super::actions::method_range;
+use super::flow::{self, Sink};
 use super::helpers::*;
 use crate::checker::{Checker, Node};
 use crate::diagnostic::{Diagnostic, Edit, Fix, Severity};
 
-/// PRF004/012/015/023/024/025/026/027/032/035/036 (see [`super::Rule`]).
+/// PRF004/012/015/022/023/024/025/026/027/032/035/036 (see [`super::Rule`]).
 pub const RULES: &[Rule] = &[
     Rule::new("PRF004").call(non_equi_join),
     Rule::new("PRF012").call(explode_before_filter),
@@ -28,6 +33,9 @@ pub const RULES: &[Rule] = &[
     Rule::new("PRF032").call(or_join_condition),
     Rule::new("PRF035").call(keyless_grouped_pandas),
     Rule::new("PRF036").call(forced_nested_loop_join_hint),
+    Rule::new("PRF022")
+        .call(sql_select_star)
+        .finish(finish_select_star),
 ];
 
 // ------------------------------------------------------------------ PRF004
@@ -1050,4 +1058,75 @@ pub fn forced_nested_loop_join_hint(ch: &mut Checker, c: &ast::ExprCall, expr: &
     ch.report(Diagnostic::new("PRF036", msg, method_range(expr)).with_help(
         "Drop the hint and let Spark pick the join (or use BROADCAST / MERGE / SHUFFLE_HASH for an equi-join); keep it only for a theta join of two small inputs, with a comment saying so.",
     ));
+}
+
+// ------------------------------------------------------------------ PRF022
+
+pub fn sql_select_star(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) {
+    if !ch.model.spark_sql(expr).is_some_and(|q| q.select_star()) {
+        return;
+    }
+    match flow::classify_current(ch) {
+        Sink::Action {
+            kind: ActionKind::Write | ActionKind::DriverCollect,
+            projected: false,
+            ..
+        } => report_select_star(ch, method_range(expr)),
+        Sink::Cache { .. } => report_select_star(ch, method_range(expr)),
+        Sink::Derived(b) => ch.state.select_star.push((b, method_range(expr))),
+        _ => {}
+    }
+}
+
+fn report_select_star(ch: &mut Checker, range: TextRange) {
+    ch.report(
+        Diagnostic::new(
+            "PRF022",
+            "SELECT * in spark.sql() flows into a write/collect/cache — list the columns you need.",
+            range,
+        )
+        .with_severity(Severity::Info),
+    );
+}
+
+fn reaches_sink(ch: &Checker, b: BindingId, seen: &mut FxHashSet<BindingId>) -> bool {
+    if !seen.insert(b) {
+        return false;
+    }
+    for u in ch.state.flow.uses.get(&b).map(Vec::as_slice).unwrap_or(&[]) {
+        match &u.sink {
+            Sink::Action {
+                kind: ActionKind::Write | ActionKind::DriverCollect,
+                projected: false,
+                ..
+            } => return true,
+            Sink::Cache { .. } => return true,
+            Sink::Derived(d) => {
+                // Only pass-through derivations keep `*`: a later select() prunes.
+                let pruned = ch
+                    .model
+                    .binding(*d)
+                    .value
+                    .and_then(method_call)
+                    .is_some_and(|(_, _, m)| {
+                        matches!(m, "select" | "selectExpr" | "agg" | "groupBy")
+                    });
+                if !pruned && reaches_sink(ch, *d, seen) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+pub fn finish_select_star(ch: &mut Checker) {
+    let cands = std::mem::take(&mut ch.state.select_star);
+    for (b, range) in cands {
+        let mut seen = FxHashSet::default();
+        if reaches_sink(ch, b, &mut seen) {
+            report_select_star(ch, range);
+        }
+    }
 }

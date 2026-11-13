@@ -30,7 +30,7 @@
 //! driver-result-limit-removed, CFG018 io-compression-disabled, CFG019
 //! deletion-vectors-disabled, CFG020 file-statistics-disabled, CFG021
 //! optimizer-rules-excluded and CFG022 delta-target-file-size-small (STM011 and
-//! IOD019 are rows in their own modules).
+//! IOD019 and PDS005 are rows in their own modules).
 
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{self as ast, Expr, Operator, UnaryOp};
@@ -1496,6 +1496,15 @@ mod tests {
     }
 
     #[test]
+    fn pandas_on_spark_ops_on_diff_frames_row() {
+        let key = "pandas_on_Spark.compute.ops_on_diff_frames";
+        assert_eq!(sev("PDS005", key, "true"), Some(None));
+        assert_eq!(sev("PDS005", &key.to_ascii_lowercase(), "TRUE"), Some(None));
+        assert_eq!(sev("PDS005", key, "false"), None);
+        assert_eq!(sev("PDS005", key, "1"), None);
+    }
+
+    #[test]
     fn compaction_wording() {
         let m = |k: &str| verdict("CFG009", k, "false").unwrap().message;
         assert!(
@@ -1809,5 +1818,58 @@ mod tests {
         assert!(m("3600").unwrap().contains("1 h"));
         assert!(m("600").unwrap().contains("10 min"));
         assert!(m("301").unwrap().contains("301 s"));
+    }
+
+    /// The message variants quoted in the CFG012-CFG017 catalog entries (the public
+    /// rule pages): keep both in step.
+    #[test]
+    fn catalog_quoted_messages_cfg012_to_cfg017() {
+        let msg = |code: &str, key: &str, v: &str, via: Via| {
+            verdict_via(code, key, v, via).unwrap().message
+        };
+        let rt = Via::RuntimeConf;
+        assert_eq!(
+            msg("CFG012", "spark.sql.files.maxPartitionBytes", "1m", rt),
+            "spark.sql.files.maxPartitionBytes set to 1 MB (default 128 MB): scan partitions this small turn every stage into thousands of tiny tasks (scheduling overhead, many small output files)."
+        );
+        assert_eq!(
+            msg("CFG012", "spark.sql.files.openCostInBytes", "0", rt),
+            "spark.sql.files.openCostInBytes=0 (default 4 MB): small files count as free to open, so one scan task gets packed with thousands of them (slow listing-bound straggler tasks)."
+        );
+        assert_eq!(
+            msg(
+                "CFG013",
+                "spark.sql.adaptive.coalescePartitions.minPartitionNum",
+                "400",
+                rt
+            ),
+            "spark.sql.adaptive.coalescePartitions.minPartitionNum=400 overrides AQE's minPartitionSize: AQE can no longer merge small post-shuffle partitions below this count, so small shuffles keep many tiny tasks (and small output files)."
+        );
+        assert_eq!(
+            msg(
+                "CFG014",
+                "spark.sql.parquet.enableVectorizedReader",
+                "False",
+                rt
+            ),
+            "spark.sql.parquet.enableVectorizedReader=false makes every Parquet/Delta scan decode values row by row instead of in columnar batches, multiplying CPU time for the whole session."
+        );
+        assert_eq!(
+            msg(
+                "CFG015",
+                "spark.sql.optimizer.dynamicPartitionPruning.enabled",
+                "false",
+                rt
+            ),
+            "spark.sql.optimizer.dynamicPartitionPruning.enabled=false turns off dynamic partition pruning: a join on a partition column reads every partition of the big table instead of only the ones the small side selects."
+        );
+        assert_eq!(
+            msg("CFG016", "spark.sql.broadcastTimeout", "-1", rt),
+            "spark.sql.broadcastTimeout=-1 (default 300 s): a negative value means a broadcast never times out, so an oversized or stuck broadcast holds the whole cluster until someone kills the job."
+        );
+        assert_eq!(
+            msg("CFG017", "spark.driver.maxResultSize", "64g", Via::Builder),
+            "spark.driver.maxResultSize raised to 64 GB (default 1g): results this large are serialised and held on the driver, which usually runs out of memory or stalls in garbage collection before the limit is reached."
+        );
     }
 }

@@ -1,17 +1,16 @@
-//! PRF — plan & shuffle performance: PRF001, PRF003, PRF005, PRF008, PRF029, PRF031.
+//! PRF — plan & shuffle performance: PRF001, PRF002, PRF003, PRF005, PRF029, PRF031.
 
-use ruff_python_ast::{self as ast, Expr, ExprContext, Stmt};
-use ruff_text_size::{Ranged, TextRange};
-use sparklint_semantic::{BindingKind, LoopInfo, LoopKind, SqlText, Ty, call_arg, int_literal};
+use ruff_python_ast::{self as ast, Expr, Stmt};
+use ruff_text_size::Ranged;
+use sparklint_semantic::{LoopInfo, LoopKind, Partitioning, SqlText, Ty, call_arg, int_literal};
 
-use super::CacheCandidate;
 use super::Rule;
 use super::actions::method_range;
 use super::helpers::*;
-use crate::checker::{Checker, Node};
+use crate::checker::Checker;
 use crate::diagnostic::{Diagnostic, Edit, Fix, Severity};
 
-/// PRF001/002/003/005/008/029/031 (see [`super::Rule`]).
+/// PRF001/002/003/005/029/031 (see [`super::Rule`]).
 pub const RULES: &[Rule] = &[
     Rule::new("PRF001")
         .stmt(prf001_stmt)
@@ -21,7 +20,6 @@ pub const RULES: &[Rule] = &[
     Rule::new("PRF005").call(global_window),
     Rule::new("PRF031").call(running_collect_list),
     Rule::new("PRF029").call(replicated_storage_level),
-    Rule::new("PRF008").finish(finish_cache),
 ];
 
 fn prf001_stmt(ch: &mut Checker, stmt: &Stmt) {
@@ -310,7 +308,8 @@ pub fn cartesian_join(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
     };
     if m == "join" {
         match call_arg(c, 1, "on") {
-            None => {}
+            // `on=None` is the same as no condition
+            None | Some(Expr::NoneLiteral(_)) => {}
             Some(on) => {
                 let lit_true = matches!(on, Expr::BooleanLiteral(b) if b.value)
                     || matches!(on, Expr::Call(lc) if ch.model.is_spark_function(&lc.func, "lit")
@@ -356,7 +355,10 @@ pub fn global_window(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
         return;
     };
     let t = ch.model.ty_of(w);
-    if t.ty != Ty::WindowSpec || t.facts.win_partitioned {
+    // Only a spec known to be unpartitioned on every path: one that is partitioned
+    // when the caller supplies keys (`if keys: w = w.partitionBy(*keys)`) is global
+    // only when there is a single series by design, and a parameter's origin is unknown.
+    if t.ty != Ty::WindowSpec || t.facts.win_partitioning != Partitioning::Global {
         return;
     }
     ch.report(
@@ -410,7 +412,7 @@ pub fn running_collect_list(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
     let mut msg = format!(
         "{name}() over a running window (ordered, frame from the partition start to the current row) gives every row its own growing array: O(N²) elements per partition."
     );
-    if !f.win_partitioned {
+    if f.win_partitioning != Partitioning::Partitioned {
         msg.push_str(" The window has no partitionBy(), so all rows land in one partition.");
     }
     ch.report(
@@ -543,148 +545,6 @@ fn sql_cache_level(q: &SqlText) -> Option<String> {
         .1
         .to_ascii_uppercase();
     replication_of(&level).map(|_| level)
-}
-
-// ------------------------------------------------------------------ PRF008
-
-const NON_CONSUMING: &[&str] = &[
-    "unpersist",
-    "is_cached",
-    "storageLevel",
-    "columns",
-    "schema",
-    "dtypes",
-    "printSchema",
-    "explain",
-    "cache",
-    "persist",
-    "isStreaming",
-];
-
-pub fn init_cache_candidates(ch: &mut Checker) {
-    let model = ch.model;
-    for (i, b) in model.bindings().iter().enumerate() {
-        let Some(v) = b.value else { continue };
-        let Some(sc) = model.spark_call_named(v, &["cache", "persist"]) else {
-            continue;
-        };
-        if !sc.is_dataframe() {
-            continue;
-        }
-        let (recv, m) = (sc.receiver, sc.method);
-        let delete_range = match b.kind {
-            BindingKind::Assign | BindingKind::AnnAssign | BindingKind::Walrus => {
-                Some(TextRange::new(recv.range().end(), v.range().end()))
-            }
-            BindingKind::CacheMarker => None,
-            _ => continue,
-        };
-        ch.state.cache.insert(
-            i as u32,
-            CacheCandidate {
-                report_range: method_range(v),
-                name: b.name.clone(),
-                method: m.to_string(),
-                weight: 0,
-                delete_range,
-            },
-        );
-    }
-}
-
-pub fn cache_use(ch: &mut Checker, n: &ast::ExprName) {
-    if n.ctx != ExprContext::Load {
-        return;
-    }
-    let reaching: Vec<u32> = ch
-        .model
-        .reaching(n)
-        .iter()
-        .copied()
-        .filter(|b| ch.state.cache.contains_key(b))
-        .collect();
-    if reaching.is_empty() {
-        return;
-    }
-    let r = n.range;
-    let weight = match ch.parent() {
-        Some(Node::Expr(Expr::Attribute(a))) if a.value.range() == r => {
-            let attr = a.attr.as_str();
-            if NON_CONSUMING.contains(&attr) {
-                0
-            } else if attr.contains("TempView") || attr == "registerTempTable" {
-                2
-            } else {
-                1
-            }
-        }
-        Some(Node::Stmt(Stmt::Return(_))) => 2,
-        Some(Node::Expr(Expr::Yield(_) | Expr::YieldFrom(_) | Expr::Lambda(_))) => 2,
-        Some(Node::Stmt(Stmt::Assign(_) | Stmt::AnnAssign(_))) => 2,
-        Some(Node::Expr(Expr::Call(c))) if c.func.range() != r => 2,
-        Some(Node::Expr(Expr::Starred(_) | Expr::List(_) | Expr::Tuple(_) | Expr::Dict(_))) => 2,
-        _ => 1,
-    };
-    for b in reaching {
-        let binding = ch.model.binding(b);
-        let mut w = weight;
-        if w > 0 {
-            let repeated = ch
-                .model
-                .in_loop_not_containing(r.start(), binding.stmt_range.start());
-            let other_fn = ch.model.function_scope_at(r.start())
-                != ch.model.function_scope_at(binding.stmt_range.start());
-            if repeated || other_fn {
-                w = 2;
-            }
-        }
-        if let Some(c) = ch.state.cache.get_mut(&b) {
-            c.weight += w;
-        }
-    }
-}
-
-pub fn finish_cache(ch: &mut Checker) {
-    let model = ch.model;
-    let mut cands: Vec<CacheCandidate> = ch
-        .state
-        .cache
-        .iter()
-        .filter(|(_, c)| c.weight <= 1)
-        .filter(|(id, _)| {
-            // A cache whose frame (or a frame derived from it) is returned, yielded or
-            // stored is consumed by code we cannot see: no single-use claim.
-            let b = model.binding(**id);
-            let Some((_, recv, _)) = b.value.and_then(method_call) else {
-                return true;
-            };
-            !super::lineage::cache_fate(ch, **id, recv, b.stmt_range.start()).1
-        })
-        .map(|(_, c)| c.clone())
-        .collect();
-    cands.sort_by_key(|c| c.report_range.start());
-    for c in cands {
-        let how = if c.weight == 0 {
-            "never consumed"
-        } else {
-            "consumed only once"
-        };
-        let mut d = Diagnostic::new(
-            "PRF008",
-            format!(
-                "`{}` is cached but {how} — .{}() costs a materialisation and memory with no reuse.",
-                c.name, c.method
-            ),
-            c.report_range,
-        );
-        if let Some(r) = c.delete_range {
-            d = d.with_fix(Fix::unsafe_(
-                format!("Remove .{}()", c.method),
-                vec![Edit::delete(r)],
-            ));
-        }
-        ch.report(d);
-    }
 }
 
 #[cfg(test)]

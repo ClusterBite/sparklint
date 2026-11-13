@@ -3,7 +3,7 @@
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 use sparklint_semantic::api::{ActionKind, action_kind};
-use sparklint_semantic::{LoopInfo, Ty, int_literal};
+use sparklint_semantic::{LoopInfo, LoopKind, Ty, int_literal};
 
 use super::Rule;
 use super::actions::method_range;
@@ -39,7 +39,7 @@ pub fn topandas_unbounded(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) {
     };
     let hit = sc.is(Ty::DataFrame, "toPandas")
         || sc.is_any(Ty::PandasOnSparkFrame, &["to_pandas", "to_numpy"]);
-    if !hit || !sc.has_no_args() || sc.bounded().is_some() {
+    if !hit || !sc.has_no_args() || sc.driver_sized() {
         return;
     }
     let (m, t) = (sc.method, sc.receiver_ty);
@@ -193,6 +193,61 @@ fn source_varies(ch: &Checker, mut e: &Expr, l: &LoopInfo, targets: &[String], d
     }
 }
 
+/// Whether `l` is a polling `while` loop: it waits for something outside the program
+/// (a table filled by a stream, a file landing) instead of iterating over data. Either
+/// the body sleeps (`time.sleep(..)`, not counting nested functions), or the action
+/// sits in the loop condition and its frame is the same on every iteration (nothing
+/// it reads is rebound in the loop), so only an outside change can end the loop.
+fn polling_loop(ch: &Checker, l: &LoopInfo, action: &Expr, recv: &Expr) -> bool {
+    use ruff_python_ast::visitor::{self, Visitor};
+    if l.kind != LoopKind::While {
+        return false;
+    }
+    let Some(wh) = ch.parents().iter().rev().find_map(|n| match n {
+        Node::Stmt(Stmt::While(w)) if w.range == l.range => Some(w),
+        _ => None,
+    }) else {
+        return false;
+    };
+    if wh.test.range().contains_range(action.range()) && !varies_per_iteration(ch, recv, l, &[]) {
+        return true;
+    }
+    struct V<'c, 'a> {
+        ch: &'c Checker<'a>,
+        found: bool,
+    }
+    impl<'b> Visitor<'b> for V<'_, '_> {
+        fn visit_stmt(&mut self, s: &'b Stmt) {
+            if !matches!(s, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) && !self.found {
+                visitor::walk_stmt(self, s);
+            }
+        }
+        fn visit_expr(&mut self, e: &'b Expr) {
+            if self.found {
+                return;
+            }
+            if let Expr::Call(c) = e
+                && self
+                    .ch
+                    .model
+                    .qualified_name(&c.func)
+                    .is_some_and(|q| q == "time.sleep")
+            {
+                self.found = true;
+                return;
+            }
+            if !matches!(e, Expr::Lambda(_)) {
+                visitor::walk_expr(self, e);
+            }
+        }
+    }
+    let mut v = V { ch, found: false };
+    for s in &wh.body {
+        v.visit_stmt(s);
+    }
+    v.found
+}
+
 pub fn action_in_loop(ch: &mut Checker, _call: &ast::ExprCall, expr: &Expr) {
     let Some(sc) = ch.model.spark_call(expr) else {
         return;
@@ -211,6 +266,9 @@ pub fn action_in_loop(ch: &mut Checker, _call: &ast::ExprCall, expr: &Expr) {
     let Some(inner) = loops.last().copied() else {
         return;
     };
+    if polling_loop(ch, inner, expr, recv) {
+        return;
+    }
     let targets = loop_targets(ch, inner);
     let small_literal = loops.iter().all(|l| l.literal_len.is_some_and(|n| n <= 10));
     let varies = !targets.is_empty() && source_varies(ch, recv, inner, &targets, 0);

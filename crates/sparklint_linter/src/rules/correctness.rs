@@ -48,7 +48,7 @@ pub fn column_eq_none(ch: &mut Checker, c: &ast::ExprCompare, expr: &Expr) {
     // `x is None` on a *variable* is the normal Optional[Column] check (a parameter
     // annotated `Column | None`, a helper returning a Column or None): only flag
     // identity tests on expressions that are always a Column (`F.col("a") is None`).
-    if matches!(op, CmpOp::Is | CmpOp::IsNot) && !is_always_column_expr(col) {
+    if matches!(op, CmpOp::Is | CmpOp::IsNot) && !is_always_column_expr(ch, col) {
         return;
     }
     let null = matches!(op, CmpOp::Eq | CmpOp::Is);
@@ -138,15 +138,31 @@ pub fn not_on_column(ch: &mut Checker, u: &ast::ExprUnaryOp, expr: &Expr) {
 }
 
 /// Expressions that can never evaluate to Python `None` when they are Columns
-/// (calls, `df.x`, `df["x"]`, operators) as opposed to variables.
-fn is_always_column_expr(e: &Expr) -> bool {
+/// (Spark calls, `df.x`, `df["x"]`, operators) as opposed to variables. A call
+/// to a user or library helper is not one: its `-> Column` / `-> Column | None`
+/// annotation is a hint, and `helper(..) is None` is the normal Optional check.
+fn is_always_column_expr(ch: &Checker, e: &Expr) -> bool {
     match e {
         Expr::Name(_) => false,
+        Expr::Call(c) => spark_api_call(ch, c),
         Expr::Attribute(a) => {
             !matches!(&*a.value, Expr::Name(n) if n.id.as_str() == "self" || n.id.as_str() == "cls")
         }
         _ => true,
     }
+}
+
+/// A call into pyspark itself (`F.col(..)`, `F.lit(..)`) or a method on a Spark
+/// receiver (`df.col(..)`, `F.col("a").alias(..)`).
+fn spark_api_call(ch: &Checker, c: &ast::ExprCall) -> bool {
+    if ch
+        .model
+        .qualified_name(&c.func)
+        .is_some_and(|q| q.starts_with("pyspark."))
+    {
+        return true;
+    }
+    matches!(&*c.func, Expr::Attribute(a) if ch.model.ty_of(&a.value).ty.is_spark())
 }
 
 /// Correctness rules are errors: only fire on operands that are Columns with

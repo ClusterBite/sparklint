@@ -39,7 +39,6 @@ pdf.plot().show()
 
 # Spark DataFrames: reported.
 built = testDataSpec.build()
-built.withColumn("x", built.id).explain()  # expect: ACT010
 
 
 def preview(events_df):

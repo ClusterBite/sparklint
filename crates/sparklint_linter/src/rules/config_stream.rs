@@ -157,9 +157,13 @@ pub struct SessionEvidence {
     /// `spark` / `sc` / `sqlContext` / `dbutils` / `displayHTML` used without the file
     /// ever defining them: the platform provides them, with a live session.
     implicit_session: bool,
-    /// First use of the undefined `display` global (IPython has one too, so it only
-    /// counts before the session is built).
+    /// First use of the undefined `display` global. IPython has a builtin `display`
+    /// too, so it only counts before the session is built AND with
+    /// [`Self::databricks_paths`].
     first_display: Option<TextSize>,
+    /// A string literal naming a Databricks-only storage location (`dbfs:/`, `/dbfs/`,
+    /// `/Volumes/`, `/Workspace/`): the notebook was written for Databricks.
+    databricks_paths: bool,
     /// End of the first `….getOrCreate()` call.
     first_get_or_create: Option<TextSize>,
 }
@@ -190,6 +194,9 @@ fn session_evidence(ch: &Checker) -> SessionEvidence {
                         _ => {}
                     }
                 }
+                Expr::StringLiteral(s) if is_databricks_path(s.value.to_str()) => {
+                    self.ev.databricks_paths = true;
+                }
                 Expr::Call(c) => {
                     if let Expr::Attribute(a) = &*c.func
                         && a.attr.as_str() == "getOrCreate"
@@ -214,12 +221,20 @@ fn session_evidence(ch: &Checker) -> SessionEvidence {
     v.ev
 }
 
+/// Storage paths that only exist on Databricks compute.
+fn is_databricks_path(s: &str) -> bool {
+    const PREFIXES: &[&str] = &["dbfs:/", "/dbfs/", "/Volumes/", "/Workspace/"];
+    let s = s.trim_start();
+    PREFIXES.iter().any(|p| s.starts_with(p))
+}
+
 /// Whether the session already runs when the builder / `SparkConf` code at `at`
 /// executes, so a static setting made there is ignored. True in a Databricks notebook
 /// (and when the user forces notebook mode on a module); in any other notebook (plain
 /// Jupyter, where `SparkSession.builder` normally *creates* the session) only with
-/// evidence in the file: the platform globals used without a definition, or an
-/// earlier `getOrCreate()`.
+/// evidence in the file: the platform globals used without a definition, an
+/// earlier `getOrCreate()`, or an earlier `display(..)` in a notebook that also names
+/// Databricks storage paths (IPython's own `display` alone proves nothing).
 fn session_already_running(ch: &mut Checker, at: TextRange) -> bool {
     if ch.source.is_databricks() || !ch.source.is_notebook() {
         return true;
@@ -233,7 +248,7 @@ fn session_already_running(ch: &mut Checker, at: TextRange) -> bool {
         }
     };
     ev.implicit_session
-        || ev.first_display.is_some_and(|d| d < at.start())
+        || (ev.databricks_paths && ev.first_display.is_some_and(|d| d < at.start()))
         || ev.first_get_or_create.is_some_and(|g| g <= at.start())
 }
 

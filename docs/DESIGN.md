@@ -119,9 +119,25 @@ Per module, flow-sensitive-lite, single forward pass per scope with loop re-visi
 8. **Heuristic fallback** (confidence `Likely`): names matching `df`, `*_df`, `df_*`,
    `sdf`; receivers of unmistakable DataFrame-only methods (`withColumn`, `groupBy`,
    `withColumnRenamed`, `unionByName`, `toPandas`, `createOrReplaceTempView`) are
-   DataFrames. Ambiguous methods (`count`, `filter`, `collect`, `first`, `join`, `select`,
+   DataFrames, unless the call's arguments rule the DataFrame method out (`withColumn` with
+   a literal value, a third argument or other keywords is another library's builder).
+   An untyped parameter used with pandas-only attributes (`p.iloc`, `p.loc`, `p.shape`,
+   `p.reset_index()`, ...) is a pandas frame, so the `df` name heuristic does not apply to
+   it; mixed evidence (also a DataFrame-only method) counts as none. The same holds for
+   any binding: a value with a pandas-only use anywhere (read off the first inference
+   pass) is not guessed a DataFrame from a DataFrame-only method on it, and one whose
+   uses are all pandas-only does not get the `df` name heuristic. Both walkers (the
+   parameter walker and the unknown-receiver heuristic) and the rules ask one module,
+   `sparklint_semantic::evidence` (`of_use(attr, call)` per use, `Evidence::verdict()`
+   over the uses), for what a use says.
+   Ambiguous methods (`count`, `filter`, `collect`, `first`, `join`, `select`,
    `show`, `limit`, `distinct`) are only treated as Spark when the receiver type is known —
    this is what kills the cylint false positives on pandas/lists/strings.
+
+Dataflow facts on a value (`bounded`, `reduced`, `cached`, `streaming`, `from_spark`,
+`local`, window partitioning/order/frame) are rows in `sparklint_semantic::facts`: each
+row states its unknown value, how it merges where paths meet and what one DataFrame /
+WindowSpec step does to it; `infer.rs` only classifies a call into a `Step`.
 
 The oracle exposes `ty_of(expr) -> (SparkType, Confidence)`, `qualified_name(expr)`,
 `spark_call(expr)`, `binding_uses(name)` (def-use for cache/unpersist/multiple-action
@@ -228,7 +244,9 @@ of untrusted variables).
 All SQL text goes through one module, `sparklint_semantic::sql` (the oracle needs it
 too). `model.spark_sql(expr)` / `model.sql_query(call)` take a `sql()` call's query once:
 the argument (positional or `sqlQuery=`), a literal or f-string (holes become `{}`) or a
-name bound once to one (`model.resolve_text`). `SqlText::new(text)` (also for `F.expr` /
+name bound once to one (`model.resolve_text`). An `EXPLAIN ...` statement only plans
+its query, so `sql_query` returns nothing for it (no query rule applies) and only the
+oracle reads it, through `model.sql_statement(call)`, as one row. `SqlText::new(text)` (also for `F.expr` /
 filter strings) tokenizes it once, dropping comments and masking string literals and
 quoted identifiers, and answers the questions rules ask: `keyword()` (statement kind),
 `set_pair()` (`SET k = v`), `properties("OPTIONS" | "TBLPROPERTIES")`, `has_keyword` /
@@ -261,9 +279,8 @@ hook on the same `Rule` (CFG008's JDBC reader option, IOD019's writer option).
 ## 5. Implementation notes
 
 - Rule metadata for every catalog rule is generated into `spec/rules.json`
-  (`scripts/gen_rules.py`) and compiled in. A catalog rule without an implementation is
-  registered as `planned`: `sparklint rules` lists it and it can be selected, but it never
-  runs. SYN001 is reported for files that do not parse (no rules run on them).
+  (`scripts/gen_rules.py`) and compiled in. SYN001 is reported for files that do not
+  parse (no rules run on them).
 - Every cylint rule (CY001-CY038) has its mapped rule running.
 - Dataflow for the def-use rules: the semantic model records `if`/`match` arms
   (`branch_path`, `mutually_exclusive`, `max_path_weight`) so counts are per execution
@@ -280,5 +297,9 @@ hook on the same `Rule` (CFG008's JDBC reader option, IOD019's writer option).
   scope (for example an import inside an `except` handler that returns).
 - `spark.sql(<literal, f-string or a name bound to one>)` whose query ends in a
   top-level `LIMIT n` (outside comments/strings) is `bounded(n)`.
+- `--fix` writes `.ipynb` fixes back into the code cells (the notebook JSON is
+  re-serialised like ruff does: sorted keys, one-space indent). In both notebook kinds an
+  edit must stay inside one cell, and a cell with a syntax error is left as it is while
+  the other cells are fixed; a plain module with a syntax error is never rewritten.
 - Not yet: junit output, SQL-cell checks, `small-tables` / `log-metrics-allowed` options,
-  fixes written back into `.ipynb`, a language server.
+  a language server.

@@ -80,6 +80,13 @@ fn mentioned_names(e: &Expr) -> Vec<String> {
     walk_exprs(e, &mut |x| {
         if let Some(s) = str_literal(x) {
             out.push(s.to_string());
+            // SQL expression strings (`F.expr("id + 1")`, `"t.id"`) name columns as
+            // identifier tokens.
+            out.extend(
+                s.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                    .filter(|t| !t.is_empty() && t != &s)
+                    .map(str::to_string),
+            );
         }
         if let Expr::Attribute(a) = x {
             out.push(a.attr.as_str().to_string());

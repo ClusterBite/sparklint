@@ -3,7 +3,7 @@
 
 use ruff_python_ast::{self as ast, AnyStringFlags, Expr, Operator, Stmt, StringFlags};
 use ruff_text_size::{Ranged, TextRange, TextSize};
-use sparklint_semantic::api::{DATAFRAME_ONLY_METHODS, action_kind};
+use sparklint_semantic::api::action_kind;
 use sparklint_semantic::{Confidence, Ty};
 
 use super::Rule;
@@ -29,9 +29,19 @@ fn cor003_expr(ch: &mut Checker, expr: &Expr) {
 }
 
 fn cor007_stmt(ch: &mut Checker, stmt: &Stmt) {
-    if let Stmt::Expr(e) = stmt {
+    if let Stmt::Expr(e) = stmt
+        && !expects_exception(ch, stmt)
+    {
         discarded_transformation(ch, &e.value);
     }
+}
+
+/// `stmt` sits directly in a `try:` body with an `except` handler or in a
+/// `with pytest.raises(..)` / `with self.assertRaises(..)` block: Classic Spark
+/// analyses a transformation eagerly, so a discarded `df.select("c")` there is a
+/// deliberate probe for the error (missing column, bad argument).
+fn expects_exception(ch: &Checker, stmt: &Stmt) -> bool {
+    ch.run_at(stmt.range()).is_probe()
 }
 
 fn cor016_expr(ch: &mut Checker, expr: &Expr) {
@@ -165,7 +175,6 @@ const EFFECTFUL: &[&str] = &[
     "foreachPartition",
     "writeTo",
     "observe",
-    "hint",
 ];
 
 pub fn discarded_transformation(ch: &mut Checker, value: &Expr) {
@@ -194,7 +203,7 @@ pub fn discarded_transformation(ch: &mut Checker, value: &Expr) {
     }
     // Heuristic receivers (a name that merely looks like a DataFrame) need a
     // DataFrame-only method as evidence: pandas has drop/fillna/rename too.
-    if rt.confidence == Confidence::Likely && !DATAFRAME_ONLY_METHODS.contains(&m) {
+    if rt.confidence == Confidence::Likely && !sparklint_semantic::evidence::is_dataframe_only(m) {
         return;
     }
     let sev = if ch.is_notebook() {
@@ -228,6 +237,57 @@ fn same_select(ch: &Checker, a: &Expr, b: &Expr) -> bool {
     }
 }
 
+/// A name or attribute chain with no calls (`df`, `self.df`): the same text names the
+/// same frame twice within one expression.
+fn plain_ref(e: &Expr) -> bool {
+    match e {
+        Expr::Name(_) => true,
+        Expr::Attribute(a) => plain_ref(&a.value),
+        _ => false,
+    }
+}
+
+/// The frame whose columns a `union` chain keeps: `a.union(b).union(c)` -> `a`.
+fn union_root(e: &Expr) -> &Expr {
+    match method_call(e) {
+        Some((_, recv, "union" | "unionAll" | "unionByName")) => union_root(recv),
+        _ => e,
+    }
+}
+
+/// `x.select(v.columns)` / `x.select(*v.columns)`: the frame `v` whose column order the
+/// select copies.
+fn select_columns_of(e: &Expr) -> Option<&Expr> {
+    let (c, _, "select") = method_call(e)? else {
+        return None;
+    };
+    if c.arguments.args.len() != 1 || !c.arguments.keywords.is_empty() {
+        return None;
+    }
+    let arg = match &c.arguments.args[0] {
+        Expr::Starred(s) => &*s.value,
+        a => a,
+    };
+    match arg {
+        Expr::Attribute(a) if a.attr.as_str() == "columns" && plain_ref(&a.value) => Some(&a.value),
+        _ => None,
+    }
+}
+
+/// Both sides have the same columns in the same order by construction: a frame unioned
+/// with itself, or one side re-selected with the other side's `.columns`.
+fn same_column_order(ch: &Checker, recv: &Expr, other: &Expr) -> bool {
+    let root = union_root(recv);
+    if plain_ref(root) && plain_ref(other) && ch.slice(root.range()) == ch.slice(other.range()) {
+        return true;
+    }
+    let aligned = |side: &Expr, to: &Expr| {
+        select_columns_of(side)
+            .is_some_and(|v| plain_ref(to) && ch.slice(v.range()) == ch.slice(to.range()))
+    };
+    aligned(other, root) || aligned(root, other)
+}
+
 pub fn union_by_position(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
     if let Some(q) = ch.model.qualified_name(&c.func)
         && q == "functools.reduce"
@@ -256,6 +316,9 @@ pub fn union_by_position(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
         return;
     };
     if !ch.model.is_dataframe(other) && !ch.model.ty_of(other).is_unknown() {
+        return;
+    }
+    if same_column_order(ch, recv, other) {
         return;
     }
     let mut d = Diagnostic::new(

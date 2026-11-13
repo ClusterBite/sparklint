@@ -199,6 +199,10 @@ pub(crate) struct Prior {
     pub func_returns: FxHashMap<ScopeId, TypeInfo>,
     pub class_attrs: FxHashMap<(ScopeId, String), TypeInfo>,
     pub arg_evidence: FxHashMap<ScopeId, Vec<TypeInfo>>,
+    /// Bindings (by target range) with a pandas-only use (`x.iloc`, `x.shape`), and
+    /// whether that is their only evidence (no DataFrame-only use): usage evidence
+    /// against the DataFrame heuristics (see [`crate::evidence`]).
+    pub pandas_used: FxHashMap<TextRange, bool>,
 }
 
 /// The semantic model of one module: scopes, bindings, uses, loops and summaries,

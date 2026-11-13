@@ -25,6 +25,9 @@ pub struct Summary {
     pub fixable_safe: usize,
     pub fixable_unsafe: usize,
     pub fix_mode: bool,
+    /// Errors reported on stderr (missing paths, unreadable or unwritable files): the
+    /// summary must not say "All checks passed!" when there were any.
+    pub errors: usize,
     /// When the run started (the summary line shows the elapsed time).
     pub started: Instant,
 }
@@ -179,6 +182,17 @@ pub fn summary(out: &mut impl Write, s: &Summary) -> io::Result<()> {
             s.findings
         )?;
     }
+    if s.findings == 0 && s.errors > 0 {
+        writeln!(
+            out,
+            "No findings, but {} error{} (see above): {} file{} checked.",
+            s.errors,
+            plural(s.errors),
+            s.files,
+            plural(s.files)
+        )?;
+        return Ok(());
+    }
     if s.findings == 0 {
         if !(s.fix_mode && s.fixed > 0) {
             writeln!(
@@ -199,6 +213,9 @@ pub fn summary(out: &mut impl Write, s: &Summary) -> io::Result<()> {
         plural(s.files),
         s.started.elapsed().as_secs_f64()
     )?;
+    if s.errors > 0 {
+        writeln!(out, "{} error{} (see above).", s.errors, plural(s.errors))?;
+    }
     if s.fixable_safe > 0 {
         writeln!(
             out,

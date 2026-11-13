@@ -8,6 +8,7 @@ df.withColumn("x", F.lit(1))  # expect: COR007
 df.dropDuplicates(["id"])  # expect: COR007
 df.filter(F.col("a") > 1)  # expect: COR007
 df.groupBy("a").count()  # expect: COR007
+df.hint("broadcast")  # expect: COR007
 
 
 def clean(frame: DataFrame):

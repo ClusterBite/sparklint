@@ -1,7 +1,15 @@
-//! PRF006 recomputed-lineage, PRF009 cache-never-unpersisted, PRF022 sql-select-star
-//! (the flow-based rules; see [`super::flow`]).
+//! Lineage counting: how often a DataFrame's plan is computed, and what happens to
+//! its caches. PRF006 recomputed-lineage, PRF008 cache-single-use, PRF009
+//! cache-never-unpersisted (the flow-based rules; see [`super::flow`]).
+//!
+//! - [`CountPolicy`]: the one answer to "does this consumer compute the frame's plan
+//!   again?" — asked by the per-file [`Counter`] (PRF006, PRF008's reuse count) and
+//!   by PRF008's direct-use weights.
+//! - [`Counter`]: binding → the use sites ending its chains, through every derived
+//!   frame, deduplicated by site, and the most of them on one execution path.
+//! - [`cache_fate`]: whether a cache is unpersisted / escapes (PRF008, PRF009).
 
-use ruff_python_ast::{self as ast, Expr};
+use ruff_python_ast::{self as ast, Expr, ExprContext, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashSet;
 use sparklint_semantic::api::ActionKind;
@@ -9,21 +17,86 @@ use sparklint_semantic::{BindingId, BindingKind, MODULE_SCOPE, SemanticModel, Ty
 
 use super::Rule;
 use super::actions::method_range;
-use super::flow::{self, Sink};
+use super::exec_context::Run;
+use super::flow::Sink;
 use super::helpers::*;
-use crate::checker::Checker;
-use crate::diagnostic::{Diagnostic, Severity};
+use crate::checker::{Checker, Node};
+use crate::diagnostic::{Diagnostic, Edit, Fix};
 
-/// PRF006/009/022 (see [`super::Rule`]).
+/// PRF006/008/009 (see [`super::Rule`]).
 pub const RULES: &[Rule] = &[
     Rule::new("PRF006").finish(finish_recomputed_lineage),
+    Rule::new("PRF008").finish(finish_cache),
     Rule::new("PRF009")
         .call(note_clear_cache)
         .finish(finish_cache_never_unpersisted),
-    Rule::new("PRF022")
-        .call(sql_select_star)
-        .finish(finish_select_star),
 ];
+
+// ------------------------------------------------------------------ counting policy
+
+/// What ends a chain over a frame, as far as counting recomputation cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Consumer {
+    /// A Spark job over the plan: a job action (`count`), a driver collect, a batch
+    /// write.
+    Job,
+    /// `show()` / `display()`: a job too, but usually debugging.
+    Display,
+    /// `cache()` / `persist()` / `checkpoint()`: computes the plan once; consumers of
+    /// the cached frame read the cache, so the walk ends here.
+    Cache,
+    /// Anything else (a metadata action, a streaming sink, ...).
+    Other,
+}
+
+impl Consumer {
+    pub(crate) fn of_action(kind: ActionKind) -> Self {
+        match kind {
+            ActionKind::Job | ActionKind::DriverCollect | ActionKind::Write => Consumer::Job,
+            ActionKind::Display => Consumer::Display,
+            _ => Consumer::Other,
+        }
+    }
+}
+
+/// The one counting policy for "this consumer computes the frame's plan again".
+///
+/// - Counted consumers: jobs and caches; `show()` / `display()` only with
+///   [`Self::displays`].
+/// - A site that never completes on the passing path ([`Run::completes`]: an
+///   `assert` message, a `raise`, a `pytest.raises` body) contributes nothing, not
+///   even the frames derived there.
+/// - A cache ends the walk: what reads the cached frame does not recompute the
+///   lineage above it.
+/// - How many: the most counted consumers on one execution path (exclusive
+///   `if`/`else` arms once each). The per-file [`Counter`] also weights a use in a
+///   loop that does not contain the frame's binding as 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CountPolicy {
+    /// `show()` / `display()` count as a consumer.
+    pub displays: bool,
+}
+
+impl CountPolicy {
+    /// PRF006: is the lineage recomputed? (display calls are debugging)
+    pub(crate) const RECOMPUTE: Self = Self { displays: false };
+    /// PRF008: is the cache read again? (a `show()` of a derived frame reads it too)
+    pub(crate) const CACHE_REUSE: Self = Self { displays: true };
+
+    /// Whether a use at a site that runs like `run` takes part at all.
+    pub(crate) fn site_counts(self, run: Run) -> bool {
+        run.completes()
+    }
+
+    /// Whether a consumer ending a chain counts as one computation of the plan.
+    pub(crate) fn consumer_counts(self, c: Consumer) -> bool {
+        match c {
+            Consumer::Job | Consumer::Cache => true,
+            Consumer::Display => self.displays,
+            Consumer::Other => false,
+        }
+    }
+}
 
 // ------------------------------------------------------------------ PRF006
 
@@ -135,64 +208,107 @@ pub fn lineage_expensive(ch: &Checker, e: &Expr, depth: u32) -> bool {
     }
 }
 
-fn counts_as_action(kind: ActionKind) -> bool {
-    matches!(
-        kind,
-        ActionKind::Job | ActionKind::DriverCollect | ActionKind::Write
-    )
+/// One action/write/cache reached from a binding: the use site that ends the
+/// chain, its branch path and its loop weight.
+#[derive(Debug, Clone)]
+pub(crate) struct Reached {
+    pub at: TextRange,
+    pub path: Vec<sparklint_semantic::BranchStep>,
+    pub w: u32,
 }
 
-struct Counter<'c, 'a> {
+/// Counts the consumers reached from a binding under a [`CountPolicy`].
+pub(crate) struct Counter<'c, 'a> {
     ch: &'c Checker<'a>,
-    memo: rustc_hash::FxHashMap<BindingId, u32>,
+    policy: CountPolicy,
+    memo: rustc_hash::FxHashMap<BindingId, std::rc::Rc<Vec<Reached>>>,
     visiting: FxHashSet<BindingId>,
 }
 
-impl Counter<'_, '_> {
-    /// Actions reachable on one execution path from binding `b` (derived
+impl<'c, 'a> Counter<'c, 'a> {
+    pub(crate) fn new(ch: &'c Checker<'a>, policy: CountPolicy) -> Self {
+        Self {
+            ch,
+            policy,
+            memo: Default::default(),
+            visiting: Default::default(),
+        }
+    }
+
+    /// Consumers reachable on one execution path from binding `b` (derived
     /// DataFrames included: their actions recompute `b` too).
-    fn count(&mut self, b: BindingId) -> u32 {
-        if let Some(n) = self.memo.get(&b) {
-            return *n;
+    pub(crate) fn count(&mut self, b: BindingId) -> u32 {
+        let items: Vec<_> = self
+            .reached(b)
+            .iter()
+            .map(|r| (r.path.clone(), r.w))
+            .collect();
+        SemanticModel::max_path_weight(&items)
+    }
+
+    /// The use sites ending `b`'s chains, each counted once: a name rebound on
+    /// one branch (`if c: df = df.join(x)`) makes a later `df.count()` reach
+    /// both bindings, but it runs once, through whichever binding was live.
+    pub(crate) fn reached(&mut self, b: BindingId) -> std::rc::Rc<Vec<Reached>> {
+        if let Some(r) = self.memo.get(&b) {
+            return r.clone();
         }
         if !self.visiting.insert(b) {
-            return 0;
+            return Default::default();
         }
+        let policy = self.policy;
         let uses = self.ch.state.flow.uses.get(&b).cloned().unwrap_or_default();
-        let mut items = Vec::new();
-        for u in &uses {
-            let w = match &u.sink {
-                Sink::Action { kind, .. } if counts_as_action(*kind) => 1,
-                Sink::Derived(d) if *d != b => {
-                    let db = self.ch.model.binding(*d);
-                    if db.ty.facts.cached {
-                        1
-                    } else {
-                        self.count(*d)
-                    }
+        let mut out: Vec<Reached> = Vec::new();
+        let mut push = |r: Reached| match out.iter_mut().find(|o| o.at == r.at) {
+            Some(o) => {
+                if r.w > o.w {
+                    *o = r;
                 }
-                Sink::Cache { .. } => 1,
-                _ => 0,
-            };
-            if w == 0 {
+            }
+            None => out.push(r),
+        };
+        for u in &uses {
+            if !policy.site_counts(u.run) {
                 continue;
             }
-            let w = if u.repeat { w.max(1) * 2 } else { w };
-            items.push((u.path.clone(), w));
+            let f = if u.repeat { 2 } else { 1 };
+            let own = Reached {
+                at: u.range,
+                path: u.path.clone(),
+                w: f,
+            };
+            match &u.sink {
+                Sink::Action { kind, .. } if policy.consumer_counts(Consumer::of_action(*kind)) => {
+                    push(own)
+                }
+                Sink::Derived(d) if *d != b => {
+                    // A derived frame that is cached itself ends the walk.
+                    if self.ch.model.binding(*d).ty.facts.cached {
+                        if policy.consumer_counts(Consumer::Cache) {
+                            push(own);
+                        }
+                    } else {
+                        for r in self.reached(*d).iter() {
+                            push(Reached {
+                                w: r.w.saturating_mul(f),
+                                ..r.clone()
+                            });
+                        }
+                    }
+                }
+                Sink::Cache { .. } if policy.consumer_counts(Consumer::Cache) => push(own),
+                _ => {}
+            }
         }
-        let n = SemanticModel::max_path_weight(&items);
         self.visiting.remove(&b);
-        self.memo.insert(b, n);
-        n
+        let out = std::rc::Rc::new(out);
+        self.memo.insert(b, out.clone());
+        out
     }
 }
 
 pub fn finish_recomputed_lineage(ch: &mut Checker) {
-    let mut counter = Counter {
-        ch,
-        memo: Default::default(),
-        visiting: Default::default(),
-    };
+    let mut counter = Counter::new(ch, CountPolicy::RECOMPUTE);
     let mut cands: Vec<BindingId> = counter.ch.state.flow.tracked.iter().copied().collect();
     cands.sort_unstable();
     let mut out: Vec<(TextRange, String)> = Vec::new();
@@ -319,7 +435,17 @@ pub(crate) fn cache_fate(
     // Dataset object), and plain-name copies.
     let mut aliases: Vec<BindingId> = vec![id];
     if let Expr::Name(rn) = recv {
-        aliases.extend(model.reaching(rn).iter().copied());
+        let reaching = model.reaching(rn);
+        // A bare `df.persist()` statement on a parameter caches the caller's
+        // DataFrame object for the caller: its uses are out of sight.
+        if model.binding(id).kind == BindingKind::CacheMarker
+            && reaching
+                .iter()
+                .any(|b| model.binding(*b).kind == BindingKind::Param)
+        {
+            return (false, true);
+        }
+        aliases.extend(reaching.iter().copied());
     }
     // Walk aliases (unpersist counts) and every DataFrame derived from them
     // (a derived frame that is returned or stored keeps needing the cache).
@@ -356,73 +482,270 @@ pub(crate) fn cache_fate(
     (unpersisted, escapes)
 }
 
-// ------------------------------------------------------------------ PRF022
+// ------------------------------------------------------------------ PRF008
 
-pub fn sql_select_star(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) {
-    if !ch.model.spark_sql(expr).is_some_and(|q| q.select_star()) {
+/// A cached DataFrame binding (PRF008).
+#[derive(Debug, Clone)]
+pub struct CacheCandidate {
+    pub report_range: TextRange,
+    pub name: String,
+    pub method: String,
+    pub weight: u32,
+    /// Range to delete to drop the `.cache()` suffix (unsafe fix).
+    pub delete_range: Option<TextRange>,
+}
+
+const NON_CONSUMING: &[&str] = &[
+    "unpersist",
+    "is_cached",
+    "storageLevel",
+    "columns",
+    "schema",
+    "dtypes",
+    "printSchema",
+    "explain",
+    "cache",
+    "persist",
+    "isStreaming",
+];
+
+pub fn init_cache_candidates(ch: &mut Checker) {
+    let model = ch.model;
+    for (i, b) in model.bindings().iter().enumerate() {
+        let Some(v) = b.value else { continue };
+        let Some(sc) = model.spark_call_named(v, &["cache", "persist"]) else {
+            continue;
+        };
+        if !sc.is_dataframe() {
+            continue;
+        }
+        let (recv, m) = (sc.receiver, sc.method);
+        let delete_range = match b.kind {
+            BindingKind::Assign | BindingKind::AnnAssign | BindingKind::Walrus => {
+                Some(TextRange::new(recv.range().end(), v.range().end()))
+            }
+            BindingKind::CacheMarker => None,
+            _ => continue,
+        };
+        ch.state.cache.insert(
+            i as u32,
+            CacheCandidate {
+                report_range: method_range(v),
+                name: b.name.clone(),
+                method: m.to_string(),
+                weight: 0,
+                delete_range,
+            },
+        );
+    }
+}
+
+pub fn cache_use(ch: &mut Checker, n: &ast::ExprName) {
+    if n.ctx != ExprContext::Load {
         return;
     }
-    match flow::classify_current(ch) {
-        Sink::Action {
-            kind: ActionKind::Write | ActionKind::DriverCollect,
-            projected: false,
-            ..
-        } => report_select_star(ch, method_range(expr)),
-        Sink::Cache { .. } => report_select_star(ch, method_range(expr)),
-        Sink::Derived(b) => ch.state.select_star.push((b, method_range(expr))),
-        _ => {}
+    let reaching: Vec<u32> = ch
+        .model
+        .reaching(n)
+        .iter()
+        .copied()
+        .filter(|b| ch.state.cache.contains_key(b))
+        .collect();
+    if reaching.is_empty() {
+        return;
     }
-}
-
-fn report_select_star(ch: &mut Checker, range: TextRange) {
-    ch.report(
-        Diagnostic::new(
-            "PRF022",
-            "SELECT * in spark.sql() flows into a write/collect/cache — list the columns you need.",
-            range,
-        )
-        .with_severity(Severity::Info),
-    );
-}
-
-fn reaches_sink(ch: &Checker, b: BindingId, seen: &mut FxHashSet<BindingId>) -> bool {
-    if !seen.insert(b) {
-        return false;
+    // Same policy as the derived-frame count: a use in an `assert` message, a
+    // `raise` or a `pytest.raises` body never completes on the passing path.
+    if !CountPolicy::CACHE_REUSE.site_counts(ch.run_at(n.range)) {
+        return;
     }
-    for u in ch.state.flow.uses.get(&b).map(Vec::as_slice).unwrap_or(&[]) {
-        match &u.sink {
-            Sink::Action {
-                kind: ActionKind::Write | ActionKind::DriverCollect,
-                projected: false,
-                ..
-            } => return true,
-            Sink::Cache { .. } => return true,
-            Sink::Derived(d) => {
-                // Only pass-through derivations keep `*`: a later select() prunes.
-                let pruned = ch
-                    .model
-                    .binding(*d)
-                    .value
-                    .and_then(method_call)
-                    .is_some_and(|(_, _, m)| {
-                        matches!(m, "select" | "selectExpr" | "agg" | "groupBy")
-                    });
-                if !pruned && reaches_sink(ch, *d, seen) {
-                    return true;
-                }
+    let r = n.range;
+    let weight = match ch.parent() {
+        Some(Node::Expr(Expr::Attribute(a))) if a.value.range() == r => {
+            let attr = a.attr.as_str();
+            if NON_CONSUMING.contains(&attr) {
+                0
+            } else if attr.contains("TempView") || attr == "registerTempTable" {
+                2
+            } else {
+                1
             }
-            _ => {}
+        }
+        Some(Node::Stmt(Stmt::Return(_))) => 2,
+        Some(Node::Expr(Expr::Yield(_) | Expr::YieldFrom(_) | Expr::Lambda(_))) => 2,
+        Some(Node::Stmt(Stmt::Assign(_) | Stmt::AnnAssign(_))) => 2,
+        Some(Node::Expr(Expr::Call(c))) if c.func.range() != r => 2,
+        Some(Node::Expr(Expr::Starred(_) | Expr::List(_) | Expr::Tuple(_) | Expr::Dict(_))) => 2,
+        _ => 1,
+    };
+    for b in reaching {
+        let binding = ch.model.binding(b);
+        let mut w = weight;
+        if w > 0 {
+            let repeated = ch
+                .model
+                .in_loop_not_containing(r.start(), binding.stmt_range.start());
+            let other_fn = ch.model.function_scope_at(r.start())
+                != ch.model.function_scope_at(binding.stmt_range.start());
+            if repeated || other_fn {
+                w = 2;
+            }
+        }
+        if let Some(c) = ch.state.cache.get_mut(&b) {
+            c.weight += w;
         }
     }
-    false
 }
 
-pub fn finish_select_star(ch: &mut Checker) {
-    let cands = std::mem::take(&mut ch.state.select_star);
-    for (b, range) in cands {
-        let mut seen = FxHashSet::default();
-        if reaches_sink(ch, b, &mut seen) {
-            report_select_star(ch, range);
+pub fn finish_cache(ch: &mut Checker) {
+    let model = ch.model;
+    let mut cands: Vec<CacheCandidate> = ch
+        .state
+        .cache
+        .iter()
+        .filter(|(_, c)| c.weight <= 1)
+        .filter(|(id, _)| {
+            // A cache whose frame (or a frame derived from it) is returned, yielded or
+            // stored is consumed by code we cannot see: no single-use claim.
+            let b = model.binding(**id);
+            let Some((_, recv, _)) = b.value.and_then(method_call) else {
+                return true;
+            };
+            // Read once, by a derived frame that feeds two actions
+            // (`s = df.agg(..); s.show(); s.collect()`): the cache is reused.
+            if Counter::new(ch, CountPolicy::CACHE_REUSE).count(**id) >= 2 {
+                return false;
+            }
+            !cache_fate(ch, **id, recv, b.stmt_range.start()).1
+        })
+        .map(|(_, c)| c.clone())
+        .collect();
+    cands.sort_by_key(|c| c.report_range.start());
+    for c in cands {
+        let how = if c.weight == 0 {
+            "never consumed"
+        } else {
+            "consumed only once"
+        };
+        let mut d = Diagnostic::new(
+            "PRF008",
+            format!(
+                "`{}` is cached but {how} — .{}() costs a materialisation and memory with no reuse.",
+                c.name, c.method
+            ),
+            c.report_range,
+        );
+        if let Some(r) = c.delete_range {
+            d = d.with_fix(Fix::unsafe_(
+                format!("Remove .{}()", c.method),
+                vec![Edit::delete(r)],
+            ));
+        }
+        ch.report(d);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CountPolicy, Counter};
+    use crate::checker::testing::with_walked_checker;
+    use sparklint_semantic::BindingKind;
+
+    const PRELUDE: &str = "import pytest\nfrom pyspark.sql import SparkSession\nspark = SparkSession.builder.getOrCreate()\n";
+
+    /// (PRF006 recompute count, PRF008 cache-reuse count) of the first assignment
+    /// of `x` in `body`.
+    fn counts(body: &str) -> (u32, u32) {
+        let src = format!("{PRELUDE}{body}");
+        with_walked_checker(&src, &["PRF006", "PRF008"], |ch| {
+            let (b, _) = ch
+                .model
+                .bindings()
+                .iter()
+                .enumerate()
+                .find(|(_, b)| b.name == "x" && b.kind == BindingKind::Assign)
+                .unwrap_or_else(|| panic!("no `x = ..` in {body}"));
+            let b = b as u32;
+            (
+                Counter::new(ch, CountPolicy::RECOMPUTE).count(b),
+                Counter::new(ch, CountPolicy::CACHE_REUSE).count(b),
+            )
+        })
+    }
+
+    #[test]
+    fn counter_table() {
+        let cases: &[(&str, (u32, u32))] = &[
+            ("x = spark.table('t')\nx.count()\nx.collect()\n", (2, 2)),
+            ("x = spark.table('t')\nx.write.saveAsTable('o')\n", (1, 1)),
+            // show()/display() count for cache reuse only
+            ("x = spark.table('t')\nx.show()\nx.count()\n", (1, 2)),
+            ("x = spark.table('t')\ndisplay(x)\nx.count()\n", (1, 2)),
+            // metadata is not a consumer
+            (
+                "x = spark.table('t')\nx.printSchema()\nx.columns\nx.count()\n",
+                (1, 1),
+            ),
+            // exclusive branches: one path
+            (
+                "x = spark.table('t')\nif c:\n    x.count()\nelse:\n    x.collect()\n",
+                (1, 1),
+            ),
+            // derived frames carry their actions back
+            (
+                "x = spark.table('t')\ny = x.filter('a')\ny.count()\ny.collect()\n",
+                (2, 2),
+            ),
+            ("x = spark.table('t')\ny = x.union(x)\ny.count()\n", (1, 1)),
+            // rebound on one branch: the later action runs once
+            (
+                "x = spark.table('t')\nif c:\n    x = x.filter('a')\nx.count()\n",
+                (1, 1),
+            ),
+            // a loop not containing the binding repeats the action
+            (
+                "x = spark.table('t')\nfor t in ts:\n    x.count()\n",
+                (2, 2),
+            ),
+            // a cache ends the walk and counts once
+            (
+                "x = spark.table('t')\ny = x.cache()\ny.count()\ny.collect()\n",
+                (1, 1),
+            ),
+            (
+                "x = spark.table('t')\ny = x.filter('a').cache()\ny.count()\nx.count()\n",
+                (2, 2),
+            ),
+            // sites that never complete on the passing path
+            (
+                "x = spark.table('t')\nx.count()\nassert ok, x.collect()\n",
+                (1, 1),
+            ),
+            (
+                "x = spark.table('t')\nx.count()\nif bad:\n    raise ValueError(x.count())\n",
+                (1, 1),
+            ),
+            (
+                "x = spark.table('t')\nx.count()\nwith pytest.raises(ValueError):\n    x.collect()\n",
+                (1, 1),
+            ),
+            // ... but a try probe and a warns block run to the end
+            (
+                "x = spark.table('t')\ntry:\n    x.count()\nexcept Exception:\n    pass\nx.collect()\n",
+                (2, 2),
+            ),
+            (
+                "x = spark.table('t')\nx.count()\nwith pytest.warns(UserWarning):\n    x.collect()\n",
+                (2, 2),
+            ),
+            // the assert condition itself runs
+            (
+                "x = spark.table('t')\nassert x.count() == x.distinct().count()\n",
+                (2, 2),
+            ),
+        ];
+        for (body, want) in cases {
+            assert_eq!(counts(body), *want, "{body}");
         }
     }
 }

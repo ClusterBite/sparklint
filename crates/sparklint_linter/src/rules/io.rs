@@ -60,6 +60,9 @@ pub fn read_schema_inference(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) 
     if format == "cloudfiles" {
         return; // Auto Loader: STM008 territory
     }
+    if !streaming && schema_probe(ch) {
+        return;
+    }
     if streaming && FILE_FORMATS.contains(&format.as_str()) && format != "text" {
         ch.report(
             Diagnostic::new(
@@ -111,6 +114,18 @@ pub fn read_schema_inference(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) 
         ),
         _ => {}
     }
+}
+
+/// The read is only asked for its schema (`spark.read.json(p).schema`, `.columns`,
+/// `.dtypes`, `.printSchema()`): inference is the point (typically to hand the schema
+/// to a streaming reader), so there is no extra scan to save.
+fn schema_probe(ch: &Checker) -> bool {
+    use crate::checker::Node;
+    matches!(
+        ch.parent(),
+        Some(Node::Expr(Expr::Attribute(a)))
+            if matches!(a.attr.as_str(), "schema" | "columns" | "dtypes" | "printSchema")
+    )
 }
 
 // ------------------------------------------------------------------ IOD015

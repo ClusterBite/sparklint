@@ -37,8 +37,8 @@ dynamic = ["version"]
 [project.urls]
 Homepage = "https://github.com/clusterbite/sparklint"
 Repository = "https://github.com/clusterbite/sparklint"
-Documentation = "https://github.com/clusterbite/sparklint#readme"
-Rules = "https://github.com/clusterbite/sparklint/blob/main/docs/RULES_CATALOG.md"
+Documentation = "https://clusterbite.github.io/sparklint/"
+Rules = "https://clusterbite.github.io/sparklint/rules/"
 Changelog = "https://github.com/clusterbite/sparklint/blob/main/CHANGELOG.md"
 Issues = "https://github.com/clusterbite/sparklint/issues"
 

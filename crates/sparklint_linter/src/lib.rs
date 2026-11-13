@@ -14,7 +14,7 @@ pub mod rules;
 
 use ruff_python_ast::token::TokenKind;
 use ruff_python_parser::parse_unchecked_source;
-use ruff_text_size::{Ranged, TextSize};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 use sparklint_semantic::{SemanticOptions, SummaryProvider, TypeInfo, build_model};
 use sparklint_source::SourceFile;
 
@@ -241,16 +241,29 @@ pub fn exported_summaries(
 pub struct FixOutcome {
     /// Diagnostics remaining after fixing.
     pub diagnostics: Vec<Diagnostic>,
-    /// The fixed source text, if anything changed.
+    /// The fixed file contents as stored on disk (notebook JSON for `.ipynb`), if
+    /// anything changed.
     pub fixed_text: Option<String>,
     pub fixes_applied: usize,
 }
 
+/// Cells (by number) that contain a syntax error.
+fn broken_cells(source: &SourceFile, parsed: &ParsedSource) -> Vec<u32> {
+    let mut cells: Vec<u32> = parsed
+        .syntax_errors
+        .iter()
+        .filter_map(|d| source.cell_at(d.range.start()).map(|c| c.number))
+        .collect();
+    cells.dedup();
+    cells
+}
+
 /// Lint, apply fixes (safe only unless `unsafe_fixes`), re-lint until stable (max
-/// 10 rounds). A round whose result does not parse is discarded, and a file with any
-/// syntax error (also in a single notebook cell) is never rewritten. Edits are applied
-/// to [`SourceFile::raw_text`], so bare magics and language cells are written back
-/// byte for byte.
+/// 10 rounds). A round whose result does not parse is discarded. In a notebook every
+/// edit must stay inside one cell, and a cell with a syntax error is left as it is while
+/// the other cells are fixed; any other file with a syntax error is never rewritten.
+/// Edits are applied to [`SourceFile::raw_text`], so bare magics and language cells are
+/// written back byte for byte; `.ipynb` edits are written back into the code cells.
 pub fn lint_and_fix(
     source: &SourceFile,
     settings: &LinterSettings,
@@ -261,8 +274,9 @@ pub fn lint_and_fix(
     let mut current = source.clone();
     let first = parse_source(&current);
     let mut diagnostics = lint_parsed(&current, &first, settings, index, module_name.clone());
-    // Writing fixes back into .ipynb JSON is not supported yet.
-    if source.kind == sparklint_source::SourceKind::Jupyter || !first.syntax_errors.is_empty() {
+    let broken = broken_cells(&current, &first);
+    // A syntax error that is not confined to notebook cells: nothing is safe to edit.
+    if !first.syntax_errors.is_empty() && (!first.lintable || broken.is_empty()) {
         return FixOutcome {
             diagnostics,
             fixed_text: None,
@@ -271,23 +285,40 @@ pub fn lint_and_fix(
     }
     let mut total = 0;
     for _ in 0..10 {
-        let (text, applied) = fix::apply_fixes(current.raw_text(), &diagnostics, unsafe_fixes);
+        let file = &current;
+        let allowed = |r: TextRange| {
+            if file.cells.is_empty() {
+                return true;
+            }
+            match file.cell_at(r.start()) {
+                Some(c) => r.end() <= c.range.end() && !broken.contains(&c.number),
+                None => false,
+            }
+        };
+        let (text, applied, markers) =
+            fix::apply_fixes_where(current.raw_text(), &diagnostics, unsafe_fixes, &allowed);
         if applied == 0 {
             break;
         }
-        let candidate = SourceFile::from_text(&source.path, text);
+        let Ok(candidate) = current.with_edits(&markers, text) else {
+            break;
+        };
         let parsed = parse_source(&candidate);
-        if !parsed.syntax_errors.is_empty() {
+        // The fixed file must parse as before: no new error, the same broken cells.
+        if parsed.syntax_errors.len() != first.syntax_errors.len()
+            || !parsed.lintable
+            || broken_cells(&candidate, &parsed) != broken
+        {
             break;
         }
         total += applied;
         diagnostics = lint_parsed(&candidate, &parsed, settings, index, module_name.clone());
         current = candidate;
     }
+    let changed = current.raw_text() != source.raw_text();
     FixOutcome {
         diagnostics,
-        fixed_text: (current.raw_text() != source.raw_text())
-            .then(|| current.raw_text().to_string()),
+        fixed_text: changed.then(|| current.contents()),
         fixes_applied: total,
     }
 }
@@ -301,6 +332,72 @@ mod tests {
         let s = LinterSettings::for_selectors(select).unwrap();
         let f = SourceFile::from_text(Path::new("t.py"), src.to_string());
         lint_source(&f, &s, &sparklint_semantic::NoSummaries, None)
+    }
+
+    fn ipynb_json(cells: &[&str]) -> String {
+        let cells: Vec<String> = cells
+            .iter()
+            .map(|c| {
+                format!(
+                    r#"{{"cell_type": "code", "execution_count": null, "metadata": {{}}, "outputs": [], "source": {}}}"#,
+                    serde_json::to_string(c).unwrap()
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"cells": [{}], "metadata": {{}}, "nbformat": 4, "nbformat_minor": 4}}"#,
+            cells.join(", ")
+        )
+    }
+
+    fn cell_sources(json: &str) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        v["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| match &c["source"] {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Array(a) => a.iter().map(|l| l.as_str().unwrap()).collect(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ipynb_fixes_are_written_into_cells() {
+        let json = ipynb_json(&[
+            "df = spark.table('t')\nrows = df.collect()",
+            "s = <bad syntax\nx = df.collect()",
+            "%pip install x\nmore = df.collect()\n",
+        ]);
+        let f = SourceFile::from_ipynb_json(Path::new("a.ipynb"), &json).unwrap();
+        let s = LinterSettings::for_selectors(&["ACT002"]).unwrap();
+        let out = lint_and_fix(&f, &s, &sparklint_semantic::NoSummaries, None, true);
+        assert_eq!(out.fixes_applied, 2);
+        let fixed = out.fixed_text.expect("notebook rewritten");
+        assert_eq!(
+            cell_sources(&fixed),
+            vec![
+                "df = spark.table('t')\nrows = df.limit(1000).collect()",
+                // The cell that does not parse is left untouched.
+                "s = <bad syntax\nx = df.collect()",
+                "%pip install x\nmore = df.limit(1000).collect()\n",
+            ]
+        );
+        // Safe fixes only: ACT002's fix is unsafe, so nothing changes.
+        let out = lint_and_fix(&f, &s, &sparklint_semantic::NoSummaries, None, false);
+        assert!(out.fixed_text.is_none());
+    }
+
+    #[test]
+    fn module_with_syntax_error_is_not_fixed() {
+        let src = "df = spark.table('t')\nrows = df.collect()\ns = <bad\n";
+        let f = SourceFile::from_text(Path::new("t.py"), src.to_string());
+        let s = LinterSettings::for_selectors(&["ACT002"]).unwrap();
+        let out = lint_and_fix(&f, &s, &sparklint_semantic::NoSummaries, None, true);
+        assert!(out.fixed_text.is_none());
+        assert_eq!(out.fixes_applied, 0);
     }
 
     #[test]
@@ -419,12 +516,15 @@ mod tests {
         // Nothing to fix: no rewrite (the blanked view is never written back).
         let safe = lint_and_fix(&f, &s, &sparklint_semantic::NoSummaries, None, false);
         assert!(safe.fixed_text.is_none());
-        // A notebook with a syntax error in any cell is not rewritten.
-        let broken = format!("{src}\n# COMMAND ----------\n\nx = 1 +\n");
-        let f = SourceFile::from_text(Path::new("t.py"), broken);
+        // A syntax error in one cell: that cell is kept, the others are fixed.
+        let broken = format!("{src}\n# COMMAND ----------\n\nx = 1 +\nrows = df.collect()\n");
+        let f = SourceFile::from_text(Path::new("t.py"), broken.clone());
         let out = lint_and_fix(&f, &s, &sparklint_semantic::NoSummaries, None, true);
-        assert!(out.fixed_text.is_none());
-        assert!(out.diagnostics.iter().any(|d| d.code == "ACT002"));
+        assert_eq!(out.fixes_applied, 1);
+        assert_eq!(
+            out.fixed_text.unwrap(),
+            broken.replacen("df.collect()", "df.limit(1000).collect()", 1)
+        );
     }
 
     #[test]

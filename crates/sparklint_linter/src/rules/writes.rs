@@ -110,13 +110,24 @@ pub fn repartition_before_write(ch: &mut Checker, _call: &ast::ExprCall, expr: &
     };
     let Some(df) = w.df else { return };
     let steps = df_steps(ch, df);
-    let Some(step) = steps
+    let Some(pos) = steps
         .iter()
         .take_while(|s| CHEAP.contains(&s.method) || s.method == "repartition")
-        .find(|s| s.method == "repartition")
+        .position(|s| s.method == "repartition")
     else {
         return;
     };
+    let step = &steps[pos];
+    // Driver-side data (`createDataFrame(pdf)`): the shuffle is cheap and only sets
+    // the number of output files.
+    let src = ch.model.ty_of(step.recv);
+    if src.facts.local || src.bounded().is_some_and(|b| b != u64::MAX) {
+        return;
+    }
+    // A Python UDF after the repartition: it spreads the UDF work over more tasks.
+    if steps[..pos].iter().any(|s| calls_udf(ch, s.call)) {
+        return;
+    }
     let c = step.call;
     let n = c.arguments.args.first().and_then(int_literal);
     if n.is_some_and(|n| n >= 100) {
@@ -138,6 +149,26 @@ pub fn repartition_before_write(ch: &mut Checker, _call: &ast::ExprCall, expr: &
         d = d.with_fix(f);
     }
     ch.report(d);
+}
+
+/// Whether an argument of `c` calls a user-defined function.
+fn calls_udf(ch: &Checker, c: &ast::ExprCall) -> bool {
+    let mut hit = false;
+    for a in c
+        .arguments
+        .args
+        .iter()
+        .chain(c.arguments.keywords.iter().map(|k| &k.value))
+    {
+        walk_exprs(a, &mut |x| {
+            if let Expr::Call(xc) = x
+                && ch.model.ty_of(&xc.func).ty == Ty::Udf
+            {
+                hit = true;
+            }
+        });
+    }
+    hit
 }
 
 // ------------------------------------------------------------------ IOD003
@@ -177,7 +208,7 @@ pub fn coalesce_one_before_write(ch: &mut Checker, _call: &ast::ExprCall, expr: 
     }
     let Some(step) = hit else { return };
     let src = ch.model.ty_of(step.recv);
-    let small = src.bounded().is_some() || src.facts.reduced;
+    let small = src.bounded().is_some() || src.facts.reduced || src.facts.local;
     let delta = w.v2 || w.format() == Some("delta");
     let mut d = Diagnostic::new(
         "IOD003",
