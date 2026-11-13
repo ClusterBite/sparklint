@@ -193,12 +193,12 @@ repos:
         name: sparklint
         entry: sparklint check
         language: python
-        additional_dependencies: ["sparklint==0.1.0"]
+        additional_dependencies: ["sparklint==0.2.0"]
         types_or: [python, jupyter]
 ```
 
 This repository also has a `.pre-commit-hooks.yaml`, so
-`repo: https://github.com/clusterbite/sparklint` with `rev: v0.1.0` and `id: sparklint`
+`repo: https://github.com/clusterbite/sparklint` with `rev: v0.2.0` and `id: sparklint`
 works as well, but pre-commit then builds sparklint from source, which needs a Rust
 toolchain and takes a few minutes the first time.
 

@@ -919,7 +919,7 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 
 [[package]]
 name = "sparklint"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "sparklint_linter"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "globset",
  "rayon",
@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "sparklint_semantic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ruff_python_ast",
  "ruff_python_parser",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "sparklint_source"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ruff_diagnostics",
  "ruff_notebook",

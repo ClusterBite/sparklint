@@ -7,6 +7,8 @@ output).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-13
+
 - PRF003 now also reports `df.join(other, on=None)` and `df.join(other, None, ..)`: a `None`
   condition is the same as no condition.
 - STY003 no longer offers to remove the `drop(..)` when the following `select` names a dropped
@@ -16,7 +18,6 @@ output).
   key held in a variable; turned back off later in the file, it is reported at info.
 - DBX016 now also reports a `for` loop over the full table listing whose name test is an
   `elif` branch.
-
 - DBX003 now also finds `input_file_name()` in a query passed as `sqlQuery=` or through a
   variable holding the text (`spark.sql(q)`, `df.filter(cond)`, `F.expr(cond)`), and no
   longer reports it inside an `EXPLAIN` query.
