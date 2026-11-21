@@ -118,6 +118,9 @@ pub struct Diagnostic {
     /// Further overlap sites in the same file (a finding about a loop covers every
     /// write in it). Never printed.
     pub also_sites: Vec<TextRange>,
+    /// The rule's message variant this finding was reported through
+    /// ([`crate::rules::msg::Msg::id`]). Never printed.
+    pub variant: Option<&'static str>,
 }
 
 impl Diagnostic {
@@ -135,6 +138,7 @@ impl Diagnostic {
             help: None,
             site: None,
             also_sites: Vec::new(),
+            variant: None,
         }
     }
 

@@ -1,5 +1,8 @@
 //! The `Checker`: one AST walk per file that dispatches nodes to rules (ruff's model).
 
+use std::cell::OnceCell;
+
+use ruff_python_ast::token::Tokens;
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{Expr, ModModule, Stmt, StmtFunctionDef};
 use ruff_text_size::{Ranged, TextRange, TextSize};
@@ -39,6 +42,10 @@ pub struct Checker<'a> {
     pub(crate) state: rules::State,
     /// Hooks of the enabled rules (from the rule table).
     pub(crate) hooks: rules::Hooks,
+    /// The file's tokens (fix text), from the parse when the caller has it.
+    tokens: Option<&'a Tokens>,
+    /// Tokens lexed on first use when the caller gave none (tests, design extraction).
+    own_tokens: OnceCell<Tokens>,
 }
 
 impl<'a> Checker<'a> {
@@ -70,10 +77,35 @@ impl<'a> Checker<'a> {
             diagnostics: Vec::new(),
             state: rules::State::default(),
             hooks: rules::Hooks::default(),
+            tokens: None,
+            own_tokens: OnceCell::new(),
         };
         ch.hooks = rules::Hooks::for_checker(&ch);
         rules::init(&mut ch);
         ch
+    }
+
+    /// Use the tokens of the parse `module` came from (otherwise they are lexed again
+    /// when a fix first asks).
+    pub fn with_tokens(mut self, tokens: &'a Tokens) -> Self {
+        self.tokens = Some(tokens);
+        self
+    }
+
+    /// Fix-text questions (parentheses, operator tokens, operand text) for this file.
+    pub fn fix_text(&self) -> crate::fix_text::FixText<'_> {
+        let tokens = match self.tokens {
+            Some(t) => t,
+            None => self.own_tokens.get_or_init(|| {
+                ruff_python_parser::parse_unchecked_source(
+                    &self.source.text,
+                    self.source.py_source_type(),
+                )
+                .tokens()
+                .clone()
+            }),
+        };
+        crate::fix_text::FixText::new(&self.source.text, tokens)
     }
 
     pub fn run(mut self) -> Vec<Diagnostic> {
@@ -164,6 +196,27 @@ impl<'a> Checker<'a> {
             .exec
             .get_or_init(|| rules::exec_context::ExecIndex::build(self.module, self.model))
             .run_at(site)
+    }
+
+    /// Is an error raised at `site` handled by an enclosing `try:` that is bare or
+    /// catches one of `names` (see [`rules::exec_context::ExecIndex::caught_at`])?
+    pub fn caught_at(&self, site: TextRange, names: &[&str]) -> bool {
+        self.state
+            .exec
+            .get_or_init(|| rules::exec_context::ExecIndex::build(self.module, self.model))
+            .caught_at(site, names)
+    }
+
+    /// How Python uses the value of `e` (the current node or one of its ancestors)
+    /// as a truth value: a branch test, a `bool()` conversion, or neither (see
+    /// [`rules::truth_use`]).
+    pub fn truth_use(&self, e: &Expr) -> Option<rules::truth_use::TruthUse> {
+        let r = e.range();
+        let i = self
+            .parents
+            .iter()
+            .rposition(|n| matches!(n, Node::Expr(x) if x.range() == r))?;
+        rules::truth_use::truth_use(r, self.parents[..i].iter().rev().copied())
     }
 
     /// The statement enclosing the current statement (for sibling lookups).

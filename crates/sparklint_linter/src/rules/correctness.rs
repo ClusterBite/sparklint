@@ -1,22 +1,109 @@
 //! COR — correctness: COR001 column-eq-none, COR002 python-bool-op-on-column.
 
+use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::{self as ast, BoolOp, CmpOp, Expr, UnaryOp};
-use ruff_text_size::Ranged;
+use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use super::Rule;
 use super::helpers::*;
-use crate::checker::Checker;
-use crate::diagnostic::{Diagnostic, Edit, Fix};
+use super::msg::Msg;
+use crate::checker::{Checker, Node};
+use crate::diagnostic::{Edit, Fix};
+use crate::msg;
 
 /// COR001/002 (see [`super::Rule`]).
 pub const RULES: &[Rule] = &[
-    Rule::new("COR001").expr(cor001_expr),
-    Rule::new("COR002").expr(cor002_expr),
+    Rule::new("COR001").expr(cor001_expr).msgs(&[
+        COR001_EQ,
+        COR001_NE,
+        COR001_IS,
+        COR001_IS_NOT,
+        COR001_SQL_EQ,
+        COR001_SQL_NE,
+    ]),
+    Rule::new("COR002")
+        .expr(cor002_expr)
+        .msgs(&[COR002_BOOL_OP, COR002_BOOL_TEST, COR002_NOT]),
 ];
 
+const COR001_EQ: Msg = Msg::new(
+    "COR001",
+    "eq-none",
+    "Column == None is always NULL (a filter drops every row) — use .isNull().",
+);
+const COR001_NE: Msg = Msg::new(
+    "COR001",
+    "ne-none",
+    "Column != None is always NULL (a filter drops every row) — use .isNotNull().",
+);
+const COR001_IS: Msg = Msg::new(
+    "COR001",
+    "is-none",
+    "`Column is None` is always False in Python — use .isNull().",
+);
+const COR001_IS_NOT: Msg = Msg::new(
+    "COR001",
+    "is-not-none",
+    "`Column is not None` is always True in Python — use .isNotNull().",
+);
+const COR001_SQL_EQ: Msg = Msg::new(
+    "COR001",
+    "sql-eq-null",
+    "`{op} NULL` in SQL text is always NULL (a filter drops every row) — use IS NULL.",
+);
+const COR001_SQL_NE: Msg = Msg::new(
+    "COR001",
+    "sql-ne-null",
+    "`{op} NULL` in SQL text is always NULL (a filter drops every row) — use IS NOT NULL.",
+);
+const COR002_BOOL_OP: Msg = Msg::new(
+    "COR002",
+    "and-or",
+    "'{keyword}' on Columns — use {operator} (with parentheses); Python cannot convert a Column to bool.",
+)
+.help("Combine Column conditions with & (and), | (or) and ~ (not), each comparison in parentheses.");
+const COR002_BOOL_TEST: Msg = Msg::new(
+    "COR002",
+    "bool-test",
+    "This test gets a Column from '{keyword}' (its last operand) — Python cannot convert a Column to bool.",
+)
+.help("Test Python values here; build Column conditions with & / | and pass them to filter() or when().");
+const COR002_NOT: Msg = Msg::new(
+    "COR002",
+    "not",
+    "'not' on a Column — use ~ (with parentheses); Python cannot convert a Column to bool.",
+)
+.help(
+    "Combine Column conditions with & (and), | (or) and ~ (not), each comparison in parentheses.",
+);
+
 fn cor001_expr(ch: &mut Checker, expr: &Expr) {
-    if let Expr::Compare(c) = expr {
-        column_eq_none(ch, c, expr);
+    match expr {
+        Expr::Compare(c) => column_eq_none(ch, c, expr),
+        Expr::Call(_) => sql_eq_null(ch, expr),
+        _ => {}
+    }
+}
+
+/// `= NULL` / `!= NULL` / `<> NULL` comparisons in SQL text: `spark.sql(..)`,
+/// `df.filter("..")` / `where`, `F.expr(..)`, `selectExpr(..)`. One finding per
+/// variant and site (no fix: the text may be built from several pieces).
+fn sql_eq_null(ch: &mut Checker, expr: &Expr) {
+    let mut found: Vec<(ruff_text_size::TextRange, bool)> = Vec::new();
+    for site in ch.model.sql_sites(expr) {
+        let Some(text) = &site.text else { continue };
+        for n in text.null_comparisons() {
+            if found.contains(&(site.range, n.negated)) {
+                continue;
+            }
+            found.push((site.range, n.negated));
+            let m = if n.negated {
+                &COR001_SQL_NE
+            } else {
+                &COR001_SQL_EQ
+            };
+            ch.report(msg!(m, site.range, op = n.op));
+        }
     }
 }
 
@@ -54,72 +141,98 @@ pub fn column_eq_none(ch: &mut Checker, c: &ast::ExprCompare, expr: &Expr) {
     let null = matches!(op, CmpOp::Eq | CmpOp::Is);
     let method = if null { "isNull" } else { "isNotNull" };
     let replacement = format!("{}.{method}()", paren_src(ch, col));
-    let (msg, fix) = match op {
+    let (m, fix) = match op {
         CmpOp::Eq | CmpOp::NotEq => (
-            format!(
-                "Column {} None is always NULL (a filter drops every row) — use .{method}().",
-                if null { "==" } else { "!=" }
-            ),
+            if null { &COR001_EQ } else { &COR001_NE },
             Fix::safe(
                 format!("Replace with `.{method}()`"),
                 vec![Edit::replace(expr.range(), replacement)],
             ),
         ),
         _ => (
-            format!(
-                "`Column {} None` is always {} in Python — use .{method}().",
-                if null { "is" } else { "is not" },
-                if null { "False" } else { "True" }
-            ),
+            if null { &COR001_IS } else { &COR001_IS_NOT },
             Fix::unsafe_(
                 format!("Replace with `.{method}()`"),
                 vec![Edit::replace(expr.range(), replacement)],
             ),
         ),
     };
-    ch.report(Diagnostic::new("COR001", msg, expr.range()).with_fix(fix));
+    ch.report(msg!(m, expr.range()).with_fix(fix));
 }
 
+/// `a and b` / `a or b` where Python converts a Column to bool (which raises):
+/// a Column in any position but the last. A chain whose only Column is its last
+/// operand (`msg or default_col`, `opt and F.col("x") == opt`) is the ordinary
+/// short-circuit idiom and runs fine; it is reported only when the chain itself is
+/// a boolean test (`if x is not None and c == 1:`), without a fix.
 pub fn bool_op_on_column(ch: &mut Checker, b: &ast::ExprBoolOp, expr: &Expr) {
-    if !b.values.iter().any(|v| certain_column(ch, v)) {
+    let Some((last, init)) = b.values.split_last() else {
         return;
-    }
+    };
     let (kw, sym) = match b.op {
         BoolOp::And => ("and", "&"),
         BoolOp::Or => ("or", "|"),
     };
-    let parts: Vec<String> = b
-        .values
-        .iter()
-        .map(|v| {
-            let s = ch.slice(v.range());
-            if matches!(
-                v,
-                Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_) | Expr::Subscript(_)
-            ) {
-                s.to_string()
-            } else {
-                format!("({s})")
-            }
-        })
-        .collect();
-    let text = parts.join(&format!(" {sym} "));
-    let fix = Fix::safe(
-        format!("Replace `{kw}` with `{sym}`"),
-        vec![Edit::replace(expr.range(), text)],
-    );
-    ch.report(
-        Diagnostic::new(
-            "COR002",
-            format!("'{kw}' on Columns — use {sym} (with parentheses); Python cannot convert a Column to bool."),
-            expr.range(),
-        )
-        .with_fix(fix),
-    );
+    if !init.iter().any(|v| may_be_column(ch, v)) {
+        if may_be_column(ch, last) && in_bool_test(ch, expr) {
+            ch.report(msg!(COR002_BOOL_TEST, expr.range(), keyword = kw));
+        }
+        return;
+    }
+    let ft = ch.fix_text();
+    let kind = match b.op {
+        BoolOp::And => TokenKind::And,
+        BoolOp::Or => TokenKind::Or,
+    };
+    let mut edits = Vec::new();
+    let mut prev: Option<TextSize> = None;
+    for v in &b.values {
+        if let Some(end) = prev {
+            let Some(e) = ft.replace_operator(TextRange::new(end, v.start()), kind, sym) else {
+                return;
+            };
+            edits.push(e);
+        }
+        edits.extend(ft.wrap(v, b));
+        prev = Some(v.end());
+    }
+    let title = format!("Replace `{kw}` with `{sym}`");
+    // A Python value next to Columns becomes a literal under `&` / `|` (a string is
+    // not read as SQL): only a chain of nothing but Columns keeps its meaning.
+    let fix = if b.values.iter().all(|v| all_columns(ch, v)) {
+        Fix::safe(title, edits)
+    } else {
+        Fix::unsafe_(title, edits)
+    };
+    ch.report(msg!(COR002_BOOL_OP, expr.range(), keyword = kw, operator = sym).with_fix(fix));
+}
+
+/// A Column, or an `and` / `or` chain of nothing but Columns.
+fn all_columns(ch: &Checker, e: &Expr) -> bool {
+    match e {
+        Expr::BoolOp(b) => b.values.iter().all(|v| all_columns(ch, v)),
+        _ => certain_column(ch, e),
+    }
+}
+
+/// A Column, or an `and` / `or` chain that can evaluate to one.
+fn may_be_column(ch: &Checker, e: &Expr) -> bool {
+    match e {
+        Expr::BoolOp(b) => b.values.iter().any(|v| may_be_column(ch, v)),
+        _ => certain_column(ch, e),
+    }
+}
+
+/// Whether Python converts the value of the current chain `expr` to bool (a test
+/// or a `bool()` conversion, see [`Checker::truth_use`]). A chain directly inside
+/// another `and` / `or` is the enclosing chain's finding.
+fn in_bool_test(ch: &Checker, expr: &Expr) -> bool {
+    !matches!(ch.parent(), Some(Node::Expr(Expr::BoolOp(_)))) && ch.truth_use(expr).is_some()
 }
 
 pub fn not_on_column(ch: &mut Checker, u: &ast::ExprUnaryOp, expr: &Expr) {
-    if u.op != UnaryOp::Not || !certain_column(ch, &u.operand) {
+    // `not (a and b)`: the chain's own finding says what converts to bool.
+    if u.op != UnaryOp::Not || u.operand.is_bool_op_expr() || !certain_column(ch, &u.operand) {
         return;
     }
     let text = format!("~{}", paren_src(ch, &u.operand));
@@ -127,14 +240,7 @@ pub fn not_on_column(ch: &mut Checker, u: &ast::ExprUnaryOp, expr: &Expr) {
         "Replace `not` with `~`",
         vec![Edit::replace(expr.range(), text)],
     );
-    ch.report(
-        Diagnostic::new(
-            "COR002",
-            "'not' on a Column — use ~ (with parentheses); Python cannot convert a Column to bool.",
-            expr.range(),
-        )
-        .with_fix(fix),
-    );
+    ch.report(msg!(COR002_NOT, expr.range()).with_fix(fix));
 }
 
 /// Expressions that can never evaluate to Python `None` when they are Columns

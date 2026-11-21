@@ -37,6 +37,9 @@ pub enum Ty {
     DataFrameWriter,
     DataFrameWriterV2,
     MergeIntoWriter,
+    /// A `whenMatched(..)` / `whenNotMatched(..)` / `whenNotMatchedBySource(..)` clause
+    /// of a `MergeIntoWriter`; its `update` / `insert` / `delete` calls return the writer.
+    MergeIntoClause,
     DataStreamReader,
     DataStreamWriter,
     StreamingQuery,
@@ -124,6 +127,7 @@ impl Ty {
                 | Ty::DataFrameWriter
                 | Ty::DataFrameWriterV2
                 | Ty::MergeIntoWriter
+                | Ty::MergeIntoClause
                 | Ty::DataStreamReader
                 | Ty::DataStreamWriter
                 | Ty::StreamingQuery
@@ -175,6 +179,7 @@ impl Ty {
             Ty::DataFrameWriter => "DataFrameWriter",
             Ty::DataFrameWriterV2 => "DataFrameWriterV2",
             Ty::MergeIntoWriter => "MergeIntoWriter",
+            Ty::MergeIntoClause => "MergeIntoWriter clause",
             Ty::DataStreamReader => "DataStreamReader",
             Ty::DataStreamWriter => "DataStreamWriter",
             Ty::StreamingQuery => "StreamingQuery",
@@ -302,6 +307,7 @@ impl Ty {
             Ty::DataFrameWriter => "DataFrameWriter",
             Ty::DataFrameWriterV2 => "DataFrameWriterV2",
             Ty::MergeIntoWriter => "MergeIntoWriter",
+            Ty::MergeIntoClause => "MergeIntoClause",
             Ty::DataStreamReader => "DataStreamReader",
             Ty::DataStreamWriter => "DataStreamWriter",
             Ty::StreamingQuery => "StreamingQuery",
@@ -413,10 +419,15 @@ impl TypeInfo {
         self.facts.bounded
     }
 
-    /// Known to fit in driver memory: a known row bound, or driver-built / catalog
-    /// metadata data ([`crate::facts::Local`]).
+    /// How big the value is: ask its named questions ([`crate::Size::fits_driver`],
+    /// [`crate::Size::cheap_action`], ...) rather than combining raw facts.
+    pub fn size(&self) -> crate::Size {
+        crate::Size::of(&self.facts)
+    }
+
+    /// Known to fit in driver memory: `self.size().fits_driver()`.
     pub fn driver_sized(&self) -> bool {
-        self.facts.bounded.is_some() || self.facts.local
+        self.size().fits_driver()
     }
 
     /// Join of two branch types (if/else, loop back edges, multiple returns).

@@ -76,6 +76,7 @@ SparkType = SparkSession | SparkContext | SQLContext
           | DataFrame{streaming: bool} | Column | GroupedData | PandasGroupedOps
           | Window (class) | WindowSpec | RDD | Row | StructType/DataType
           | DataFrameReader | DataFrameWriter | DataFrameWriterV2 | MergeIntoWriter
+          | MergeIntoClause (whenMatched/whenNotMatched/whenNotMatchedBySource)
           | DataStreamReader | DataStreamWriter | StreamingQuery
           | DataFrameNaFunctions | DataFrameStatFunctions | Catalog | RuntimeConfig
           | FunctionsModule (pyspark.sql.functions) | TypesModule | UdfFunction
@@ -156,10 +157,26 @@ probing the receiver. Confidence stays visible: rules that need proof check
 values (pandas frames from `toPandas`, collected lists) or purely syntactic builder
 chains still use `rules::helpers::method_call`.
 
+Constants have ONE reader, `sparklint_semantic::constant`: `model.constant(expr)` ->
+`Const::{Str, Int, Num, Bool, None}` for literals, integer arithmetic (`10 * 1024`,
+`2 ** 30`, `1 << 4`, `n // 2`, unary minus) and names, following every binding that
+reaches a name (branches agree or the answer is unknown; an int and a float of the same
+number agree), bounded by `CONST_DEPTH`. Callers pick the reading: `as_str`, `as_int`,
+`as_num`, `as_bool` (Python `True`/`False`), `as_flag` (a Spark option: `True` or
+`"true"`), `option_text` (`True` -> `"true"`, `8` -> `"8"`). An argument `None` on every
+path is "not given", as in pyspark: `model.given(e)`, `model.given_arg(call, i, kw)`,
+`sc.given(model, i, kw)`. `constant::literal` reads only what is written (shape questions:
+a subscript key, a comparison operand), never an argument's value.
+
 Reader/writer settings live in ONE place, `rules::io_settings::IoSettings`: given a
 read/write terminal call (`load`, `csv`, `jdbc`, `save`, `saveAsTable`, `start`,
 `toTable` …) it answers `format()`, `option(key)` / `has` / `text` / `flag`,
-`has_schema()`, `target()`, `mode()`, `partition_by()` and `complete()`. It walks the
+`has_schema()`, `target()`, `write_mode()`, `layout()` and `complete()`. `write_mode()`
+is the one answer to "how does this write land?" (`SaveMode` Append / Overwrite /
+ErrorIfExists / Ignore / Unknown: the terminal's mode argument, `.mode()`, the
+`insertInto` overwrite flag by Python truthiness when given, the `writeTo(..)` terminal);
+`layout()` holds the `partitionBy` / `partitionedBy` columns and the layout calls
+(`bucketBy`, `sortBy`, `clusterBy`). The builder call list is private. It walks the
 builder chain (through stored builders), reads `options(**{..})` and single-use dict
 literals, the terminal's keyword and positional arguments (`load(path, format,
 schema)`, jdbc arguments and its `properties` dict) with Spark's precedence (terminal
@@ -200,12 +217,29 @@ pyspark.
   analyses (count variables, cache candidates, frame flow) are built in `rules::init` for
   the rules that read them. Rules stay file-pure; per-file helper state lives in
   `rules::State`.
-- **Adding a rule**: (1) catalog row in RULES_CATALOG.md + `python3 scripts/gen_rules.py >
-  spec/rules.json`; (2) hook function(s) in a rule module and one
-  `Rule::new("CODE").call(hook)` line in its `RULES` (a new module also needs `pub mod`
-  and a `TABLE` line); (3) `tests/fixtures/<CODE>/` with a positive and a pure-negative
-  file. Tests check that every table entry is in the catalog, appears once and has a
-  fixture dir; rule counts in tests are derived from `spec/rules.json`, not literals.
+- Rule text (`rules/msg.rs`): each rule declares every message it reports as a `Msg`
+  const (code, variant id, message template, help template; `format!`-style `{name}`
+  placeholders, `{{` for a brace) and lists them on its entry, `Rule::new("CODE")
+  .call(hook).msgs(&[A, B])`; hooks report with `msg!(A, range, call = ..)` (config-value
+  verdicts with `finding!(A, key)`). Those consts are the only copy of the wording:
+  `spec/rule_messages.json` is dumped from them by a test (`UPDATE_SPEC=1`) and
+  `scripts/gen_rules.py` puts them into spec/rules.json (`messages`), which
+  `sparklint rule CODE`, SARIF rule descriptors and the docs site show. The catalog keeps
+  the prose (why, detection, false positives, examples, and a `Wording` note on how the
+  placeholders are filled); gen_rules.py refuses a `Msg` / `Help` item on an implemented
+  rule. Tests fail when a declaration is malformed, the dump or spec/rules.json is stale,
+  a finding is not reported through a declared variant (the fixture harness matches
+  message and help against the templates), or a declared variant is reported by no
+  fixture.
+- **Adding a rule**: (1) catalog row and §5 prose in RULES_CATALOG.md; (2) hook
+  function(s) in a rule module, its `Msg` consts, and one
+  `Rule::new("CODE").call(hook).msgs(&[..])` line in its `RULES` (a new module also needs
+  `pub mod` and a `TABLE` line); (3) `UPDATE_SPEC=1 cargo test -p sparklint_linter --lib
+  spec_rule_messages` + `python3 scripts/gen_rules.py > spec/rules.json`; (4)
+  `tests/fixtures/<CODE>/` with a positive and a pure-negative file, and a positive for
+  every message variant. Tests check that every table entry is in the catalog, appears
+  once and has a fixture dir; rule counts in tests are derived from `spec/rules.json`,
+  not literals.
 - Rule overlap (one finding per site, under the most specific rule): rules never ask
   whether another rule is enabled. A finding may carry a `site` (the `.collect()` /
   `.toPandas()` call, the loop, the `.cache()` call; default: its range) and
@@ -230,7 +264,9 @@ pyspark.
   "3.5"` (gates version-specific fixes) and per-rule thresholds (DEVELOPMENT.md lists
   them all).
 - Output formats: text (ruff-style with code frame), json, github annotations, sarif
-  (GitHub code scanning / Azure DevOps). Exit code: 0 clean, 1 findings, 2 error.
+  (GitHub code scanning / Azure DevOps), one renderer each in `crates/sparklint/src/output.rs`;
+  a caller adds to every format through one `output::Hook` (per-finding fields/lines and
+  trailing entries; `()` adds nothing). Exit code: 0 clean, 1 findings, 2 error.
 - Fixes: text edits; `--fix` applies Safe ones, `--unsafe-fixes` the rest; idempotent,
   re-parse after applying, abort a file's fixes on parse error.
 
@@ -280,7 +316,8 @@ hook on the same `Rule` (CFG008's JDBC reader option, IOD019's writer option).
 
 - Rule metadata for every catalog rule is generated into `spec/rules.json`
   (`scripts/gen_rules.py`) and compiled in. SYN001 is reported for files that do not
-  parse (no rules run on them).
+  parse (no rules run on them; in a notebook only the broken cell is skipped). Its
+  metadata is `spec/syntax_error.json`, read by the registry and the docs generator.
 - Every cylint rule (CY001-CY038) has its mapped rule running.
 - Dataflow for the def-use rules: the semantic model records `if`/`match` arms
   (`branch_path`, `mutually_exclusive`, `max_path_weight`) so counts are per execution
@@ -291,7 +328,8 @@ hook on the same `Rule` (CFG008's JDBC reader option, IOD019's writer option).
   aggregate-only `select()` are `bounded(1)`; Py4J handles (`JavaObject` annotations,
   `x._j…` receivers) are never Spark values.
 - Fixture harness: `<name>.py.fixed` snapshots the safe fixes, `<name>.py.unsafe-fixed`
-  the safe + unsafe fixes.
+  the safe + unsafe fixes. `# expect: CODE[severity] ~"fragment"` also checks the
+  severity and message (`!~"…"` absent, `help~"…"` help text; docs/DEVELOPMENT.md).
 - Closures: a deferred nested function body resolves an enclosing-scope name to *every*
   binding of that name in the enclosing scope when no binding reaches the end of that
   scope (for example an import inside an `except` handler that returns).

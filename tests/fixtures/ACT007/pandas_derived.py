@@ -51,9 +51,12 @@ for chunk_df in np.array_split(pd_df, 4):
     chunk_df.count()
 
 # Spark frames next to them still fire.
-sdf = spark.createDataFrame(pd_df)
+sdf = spark.createDataFrame(pd_df).unionByName(spark.table("t"))
 sdf.head()  # expect: ACT007
 back_df = spark.table("t").toPandas()
-spark.createDataFrame(back_df).count()  # expect: ACT007
+spark.createDataFrame(back_df).join(spark.table("u"), "a").count()  # expect: ACT007
+# A frame built from driver data alone fits on the driver: cheap to count.
+spark.createDataFrame(pd_df).head()
+spark.createDataFrame(back_df).count()
 out_df = load_events()
 out_df.count()  # expect: ACT007

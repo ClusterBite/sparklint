@@ -200,6 +200,14 @@ impl ApiModel {
         self.set("Row", "asDict", Ty::Dict, false);
         self.set("UDFRegistration", "register", Ty::Udf, false);
         self.set("UDFRegistration", "registerJavaFunction", Ty::NoneTy, false);
+        // MergeIntoWriter (Spark 4): the spec types the `when*` clauses as `other`, which
+        // lost the writer before `.merge()`. A clause's actions return the writer again.
+        for m in ["whenMatched", "whenNotMatched", "whenNotMatchedBySource"] {
+            self.set("MergeIntoWriter", m, Ty::MergeIntoClause, false);
+        }
+        for m in ["update", "updateAll", "delete", "insert", "insertAll"] {
+            self.set("MergeIntoClause", m, Ty::MergeIntoWriter, false);
+        }
         // DeltaTable (delta-spark), modelled by hand.
         for (m, t) in [
             ("toDF", Ty::DataFrame),
@@ -250,79 +258,6 @@ impl ApiModel {
 
     pub fn class_names(&self) -> impl Iterator<Item = &str> {
         self.classes.keys().map(String::as_str)
-    }
-}
-
-/// Kind of eager work triggered by an action (RULES_CATALOG ACT001).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ActionKind {
-    Job,
-    DriverCollect,
-    Write,
-    StreamStart,
-    Display,
-    Checkpoint,
-}
-
-impl ActionKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ActionKind::Job => "job",
-            ActionKind::DriverCollect => "driver-collect",
-            ActionKind::Write => "write",
-            ActionKind::StreamStart => "stream-start",
-            ActionKind::Display => "display",
-            ActionKind::Checkpoint => "checkpoint",
-        }
-    }
-}
-
-/// Whether `receiver.method(...)` is a Spark action, and of which kind.
-pub fn action_kind(receiver: Ty, method: &str) -> Option<ActionKind> {
-    use ActionKind::*;
-    match receiver {
-        Ty::DataFrame => match method {
-            "count" | "first" | "isEmpty" | "foreach" | "foreachPartition" => Some(Job),
-            "collect" | "toPandas" | "take" | "head" | "tail" | "toLocalIterator" | "toArrow" => {
-                Some(DriverCollect)
-            }
-            "show" | "display" => Some(Display),
-            "checkpoint" => Some(Checkpoint),
-            _ => None,
-        },
-        Ty::Rdd => match method {
-            "count" | "first" | "isEmpty" | "foreach" | "foreachPartition" | "reduce" | "fold"
-            | "aggregate" | "sum" | "max" | "min" | "mean" | "stats" | "countByKey"
-            | "countByValue" | "treeReduce" | "treeAggregate" => Some(Job),
-            "collect" | "take" | "top" | "takeOrdered" | "takeSample" | "collectAsMap"
-            | "toLocalIterator" => Some(DriverCollect),
-            "saveAsTextFile"
-            | "saveAsPickleFile"
-            | "saveAsHadoopFile"
-            | "saveAsSequenceFile"
-            | "saveAsNewAPIHadoopFile" => Some(Write),
-            _ => None,
-        },
-        Ty::DataFrameWriter => match method {
-            "save" | "saveAsTable" | "insertInto" | "parquet" | "csv" | "json" | "orc" | "text"
-            | "jdbc" | "xml" => Some(Write),
-            _ => None,
-        },
-        Ty::DataFrameWriterV2 => match method {
-            "create"
-            | "replace"
-            | "createOrReplace"
-            | "append"
-            | "overwrite"
-            | "overwritePartitions" => Some(Write),
-            _ => None,
-        },
-        Ty::MergeIntoWriter => (method == "merge").then_some(Write),
-        Ty::DataStreamWriter => matches!(method, "start" | "toTable").then_some(StreamStart),
-        Ty::PandasOnSparkFrame => {
-            matches!(method, "to_pandas" | "to_numpy").then_some(DriverCollect)
-        }
-        _ => None,
     }
 }
 
@@ -524,6 +459,29 @@ mod tests {
     }
 
     #[test]
+    fn merge_into_clauses_return_the_writer() {
+        let a = api();
+        for m in ["whenMatched", "whenNotMatched", "whenNotMatchedBySource"] {
+            assert_eq!(
+                a.method_of(Ty::MergeIntoWriter, m).unwrap().returns,
+                Ty::MergeIntoClause
+            );
+        }
+        for m in ["update", "updateAll", "delete", "insert", "insertAll"] {
+            assert_eq!(
+                a.method_of(Ty::MergeIntoClause, m).unwrap().returns,
+                Ty::MergeIntoWriter
+            );
+        }
+        assert_eq!(
+            a.method_of(Ty::MergeIntoWriter, "withSchemaEvolution")
+                .unwrap()
+                .returns,
+            Ty::MergeIntoWriter
+        );
+    }
+
+    #[test]
     fn canonical_names() {
         assert_eq!(
             canonical_qualified("pyspark.sql.window.Window"),
@@ -537,19 +495,5 @@ mod tests {
             canonical_qualified("pyspark.sql.functionsx"),
             "pyspark.sql.functionsx"
         );
-    }
-
-    #[test]
-    fn actions() {
-        assert_eq!(
-            action_kind(Ty::DataFrame, "collect"),
-            Some(ActionKind::DriverCollect)
-        );
-        assert_eq!(
-            action_kind(Ty::DataFrameWriter, "saveAsTable"),
-            Some(ActionKind::Write)
-        );
-        assert_eq!(action_kind(Ty::DataFrame, "select"), None);
-        assert_eq!(action_kind(Ty::List(Elem::Unknown), "count"), None);
     }
 }

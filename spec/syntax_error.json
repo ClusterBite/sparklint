@@ -1,0 +1,13 @@
+{
+  "code": "SYN001",
+  "name": "syntax-error",
+  "family": "Syntax",
+  "severity": "error",
+  "default_on": true,
+  "cylint_compat_on": true,
+  "type_info": "T0",
+  "fix": "none",
+  "tags": ["correctness"],
+  "message": "Syntax error: <what the parser reports>",
+  "docs": "syntax · error · on · T0 · none\n- **Msg:** `Syntax error: <what the parser reports>`, for example `Syntax error: unexpected EOF while parsing`.\n- **Why:** Rules need a syntax tree. A file the Python parser cannot read gets no other findings, so one syntax error can hide everything else in it.\n- **Detect:** The Python 3 parser reports an error (Python 2 code such as `print \"x\"` is one). One finding per source line: the first error on it, since one broken line often makes the parser report several. A plain `.py` file with an error is not linted at all. In notebooks (Databricks source notebooks and `.ipynb`) only the broken cell is skipped: the other cells are still linted, and `--fix` still fixes them; any other file with a syntax error is never rewritten by `--fix`.\n- **Not reported:** notebook magics (`%pip`, `!cmd`, `x = !cmd`) in notebooks; in a plain `.py` file that uses them, set `notebook = \"on\"`. Cells in another language (`%sql`, `%scala`, `%r`, `%sh`, `%md`, `%fs`) are not parsed as Python.\n- **Fix:** none: fix the syntax error, then run `sparklint` again to see the file's other findings.\n- **Config:** `noqa` and `sparklint: ignore` / `file-ignore` comments do not suppress it, because they sit in a file that could not be parsed. To skip a path, use `per-file-ignores` or `ignore = [\"SYN001\"]`; the file then reports nothing at all, as its other rules still do not run."
+}

@@ -25,6 +25,7 @@ pub mod conf;
 pub mod config_stream;
 pub mod correctness;
 pub mod correctness2;
+pub mod describe;
 pub mod driver;
 pub mod exec_context;
 pub mod flow;
@@ -32,15 +33,19 @@ pub mod helpers;
 pub mod io;
 pub mod io_settings;
 pub mod lineage;
+pub mod msg;
 pub mod pandas_on_spark;
 pub mod perf;
 pub mod pipelines;
 pub mod plan;
+pub mod plan_facts;
 pub mod platform;
 pub mod style;
 pub mod style2;
+pub mod truth_use;
 pub mod udf;
 pub mod udf_init;
+pub mod udf_target;
 pub mod udf_types;
 pub mod writes;
 
@@ -66,6 +71,8 @@ pub struct Rule {
     pub finish: Option<FileHook>,
     /// A config-value rule row: [`conf`] matches, records and reports it.
     pub conf: Option<&'static conf::Conf>,
+    /// Every message the rule reports ([`msg::Msg`]): the only copy of its wording.
+    pub msgs: &'static [msg::Msg],
 }
 
 impl Rule {
@@ -78,6 +85,7 @@ impl Rule {
             expr: None,
             finish: None,
             conf: None,
+            msgs: &[],
         }
     }
     pub const fn init(mut self, f: FileHook) -> Self {
@@ -103,6 +111,11 @@ impl Rule {
     /// A config-value rule (see [`conf::Conf`]).
     pub const fn conf(mut self, c: &'static conf::Conf) -> Self {
         self.conf = Some(c);
+        self
+    }
+    /// The rule's message variants (see [`msg`]).
+    pub const fn msgs(mut self, m: &'static [msg::Msg]) -> Self {
+        self.msgs = m;
         self
     }
 }
@@ -152,6 +165,19 @@ pub fn is_implemented(code: &str) -> bool {
     implemented_codes().any(|c| c == code)
 }
 
+/// Every declared message variant ([`msg::Msg`]).
+// Some builds chain more variants after the `let`.
+#[allow(clippy::let_and_return)]
+pub fn messages() -> impl Iterator<Item = &'static msg::Msg> {
+    let m = table().flat_map(|r| r.msgs.iter());
+    m
+}
+
+/// The message variants of one rule.
+pub fn messages_of(code: &str) -> impl Iterator<Item = &'static msg::Msg> + '_ {
+    messages().filter(move |m| m.code == code)
+}
+
 /// The hooks of the enabled rules for one file (the enabled check happens once here).
 #[derive(Default)]
 pub(crate) struct Hooks {
@@ -183,7 +209,10 @@ impl Hooks {
 #[derive(Debug, Clone)]
 pub struct CountVar {
     pub call_range: TextRange,
+    /// The receiver as a message shows it (`orders`).
     pub recv: String,
+    /// The count call as a message shows it (`orders.count()`).
+    pub call: String,
     pub uses: u32,
     pub emptiness_uses: u32,
     pub logging_uses: u32,
@@ -206,7 +235,6 @@ pub struct State {
     /// PRF022: `SELECT *` results assigned to a binding, decided at the end.
     pub select_star: Vec<(BindingId, TextRange)>,
     /// Lower-cased names registered with `spark.udf.register` (UDF002).
-    pub registered_udfs: Vec<String>,
     /// UDF011/UDF012 call sites already reported (a function can reach several sinks).
     pub udf_init_seen: FxHashSet<(TextRange, &'static str)>,
     /// Config-value rows (`conf::Conf`): config writes of watched keys, reported at
@@ -313,6 +341,61 @@ mod tests {
                 r.code
             );
         }
+    }
+
+    #[test]
+    fn message_variants_are_declared_on_their_rule() {
+        for r in table() {
+            assert!(!r.msgs.is_empty(), "{} declares no message variant", r.code);
+            check_variants(r.code, r.msgs);
+        }
+    }
+
+    fn check_variants(code: &str, msgs: &[msg::Msg]) {
+        let mut ids = FxHashSet::default();
+        for m in msgs {
+            assert_eq!(m.code, code, "{}/{} listed on {code}", m.code, m.id);
+            assert!(ids.insert(m.id), "{code}: variant id `{}` twice", m.id);
+            assert!(
+                !m.id.is_empty()
+                    && m.id
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "{code}: variant id `{}` is not kebab-case",
+                m.id
+            );
+            msg::parse(m.text).unwrap_or_else(|e| panic!("{code}/{}: {e}", m.id));
+            assert!(!m.text.trim().is_empty(), "{code}/{}: empty message", m.id);
+            if let Some(h) = m.help {
+                msg::parse(h).unwrap_or_else(|e| panic!("{code}/{} help: {e}", m.id));
+                assert!(!h.trim().is_empty(), "{code}/{}: empty help", m.id);
+            }
+        }
+    }
+
+    /// `spec/rule_messages.json` is the rule table's wording, read by
+    /// `scripts/gen_rules.py`. `UPDATE_SPEC=1` rewrites it.
+    #[test]
+    fn spec_rule_messages_match_the_table() {
+        let spec = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec");
+        check_spec(
+            &spec.join("rule_messages.json"),
+            &msg::dump(table().flat_map(|r| r.msgs.iter())),
+        );
+    }
+
+    fn check_spec(path: &Path, want: &str) {
+        if std::env::var_os("UPDATE_SPEC").is_some() {
+            std::fs::write(path, want).unwrap();
+            return;
+        }
+        let got = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            got == want,
+            "{} is stale: run `UPDATE_SPEC=1 cargo test -p sparklint_linter --lib spec_rule_messages` \
+             then `python3 scripts/gen_rules.py > spec/rules.json`",
+            path.display()
+        );
     }
 
     #[test]

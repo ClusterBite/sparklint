@@ -51,7 +51,26 @@ pub fn explain(code: &str) -> anyhow::Result<u8> {
     if !cy.is_empty() {
         writeln!(out, "cylint:        {}", cy.join(", "))?;
     }
-    writeln!(out, "\n## Message\n\n{}\n", r.message)?;
+    match r.messages.as_slice() {
+        [] => writeln!(out, "\n## Message\n\n{}\n", r.message)?,
+        [m] => {
+            writeln!(out, "\n## Message\n\n{}", m.message)?;
+            if let Some(h) = &m.help {
+                writeln!(out, "help: {h}")?;
+            }
+            writeln!(out)?;
+        }
+        ms => {
+            writeln!(out, "\n## Messages\n")?;
+            for m in ms {
+                writeln!(out, "- {}: {}", m.id, m.message)?;
+                if let Some(h) = &m.help {
+                    writeln!(out, "  help: {h}")?;
+                }
+            }
+            writeln!(out)?;
+        }
+    }
     if !r.docs.is_empty() {
         writeln!(out, "## Details\n\n{}", r.docs.trim_end())?;
     }

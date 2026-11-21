@@ -20,7 +20,14 @@ or for a whole file, anywhere in it:
 
 - `# noqa` and `# sparklint: ignore` without codes silence every rule on the line;
   `# sparklint: file-ignore` without codes silences the file.
-- Codes can be prefixes: `# noqa: ACT` silences every ACT rule on the line.
+- A list names rules the same way as the configuration's
+  [selectors](configuration.md#selecting-rules): codes, prefixes (`# noqa: ACT`
+  silences every ACT rule on the line), rule names (`# noqa: collect-unbounded`), tags
+  (`# sparklint: ignore[tag:cost]`), presets, `ALL` and cylint codes (`# noqa: CY001`).
+- A name in the list that matches no rule silences nothing, and `sparklint check`
+  prints a warning with its file and line (`# noqa: collect-without-limit` is a
+  typo, not a blanket `# noqa`). Other linters' codes in a `# noqa` list (`E501`,
+  `F401`) are skipped without a warning.
 - A finding that spans several lines is silenced by a comment on its first or its last
   line.
 - Keywords are case-insensitive.

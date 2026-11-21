@@ -29,6 +29,15 @@ def insert_into(df: DataFrame, parts):
         df.filter(F.col("p") == p).write.insertInto(TABLE)  # expect: IOD006
 
 
+APPEND_ONLY = False
+
+
+def insert_into_flags(df: DataFrame, parts):
+    for p in parts:
+        df.filter(F.col("p") == p).write.insertInto(TABLE, APPEND_ONLY)  # expect: IOD006
+        df.filter(F.col("p") == p).write.mode(saveMode="append").saveAsTable(TABLE)  # expect: IOD006
+
+
 def v2_append(df: DataFrame, parts):
     for p in parts:
         df.where(F.col("p") == p).writeTo(TABLE).append()  # expect: IOD006

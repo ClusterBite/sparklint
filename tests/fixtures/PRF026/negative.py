@@ -47,9 +47,22 @@ q4 = spark.sql(
     """
 )
 
-# Unknown column lists are not counted.
-exprs = [F.countDistinct(c) for c in ["a", "b", "c"]]
-g = df.groupBy("k").agg(*exprs)
+# Unknown column lists are not counted: a non-literal iterable, an `if` filter, two
+# `for` clauses, a name rebound on a branch.
+g1 = df.groupBy("k").agg(*[F.countDistinct(c) for c in df.columns])
+g2 = df.groupBy("k").agg(*[F.countDistinct(c) for c in ["a", "b", "c"] if c != "k"])
+g3 = df.agg(*[F.countDistinct(c) for c in ["a", "b"] for _ in range(3)])
+if df.isStreaming:
+    exprs = [F.countDistinct(c) for c in ["a", "b", "c"]]
+else:
+    exprs = [F.count(c) for c in ["a", "b", "c"]]
+g4 = df.groupBy("k").agg(*exprs)
+
+# A comprehension whose distinct aggregate does not read the loop variable: one set.
+g5 = df.agg(*[F.countDistinct("a").alias(n) for n in ["x", "y", "z"]])
+
+# Literal values that repeat a column already counted: two sets.
+g6 = df.agg(F.countDistinct("a"), *[F.countDistinct(c) for c in ["a", "b", "b"]])
 
 # pandas and user objects with look-alike names.
 pdf = pd.DataFrame({"a": [1]})

@@ -1,5 +1,9 @@
 //! Output formats: text (ruff-style with code frame), json, github, sarif, and
 //! `--statistics`.
+//!
+//! One renderer per format ([`text`], [`json`], [`github`], [`sarif`]) takes the findings
+//! in output order and a [`Hook`]: the caller's additions to each finding and after the
+//! last one. Plain `check` passes `()`, the hook that adds nothing.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -32,6 +36,56 @@ pub struct Summary {
     pub started: Instant,
 }
 
+/// Findings in output order: `(report index, diagnostic index)`.
+pub type Order = [(usize, usize)];
+
+/// Every finding, in file order.
+pub fn file_order(reports: &[FileReport]) -> Vec<(usize, usize)> {
+    reports
+        .iter()
+        .enumerate()
+        .flat_map(|(ri, r)| (0..r.diagnostics.len()).map(move |di| (ri, di)))
+        .collect()
+}
+
+/// What a caller adds to the output of every format; `at` is the finding's
+/// `(report index, diagnostic index)`. Every method adds nothing by default, so `()` is
+/// the hook of plain `check`.
+pub trait Hook {
+    /// Text: lines between a finding's code frame and its `= help:` / `= fix:` notes.
+    fn text_after_frame(&self, _out: &mut impl Write, _at: (usize, usize)) -> io::Result<()> {
+        Ok(())
+    }
+    /// Text: lines after a finding's notes.
+    fn text_after_notes(&self, _out: &mut impl Write, _at: (usize, usize)) -> io::Result<()> {
+        Ok(())
+    }
+    /// Text: lines after the last finding.
+    fn text_end(&self, _out: &mut impl Write) -> io::Result<()> {
+        Ok(())
+    }
+    /// JSON: fields of a finding's object.
+    fn json_finding(&self, _v: &mut Value, _at: (usize, usize)) {}
+    /// JSON: objects after the findings.
+    fn json_end(&self, _all: &mut Vec<Value>) {}
+    /// GitHub: text appended to a finding's annotation message.
+    fn github_message(&self, _message: &mut String, _at: (usize, usize)) {}
+    /// GitHub: workflow commands after the findings' annotations.
+    fn github_end(&self, _out: &mut impl Write) -> io::Result<()> {
+        Ok(())
+    }
+    /// SARIF: rule descriptors after the findings' rules.
+    fn sarif_rules(&self, _rules: &mut Vec<Value>) {}
+    /// SARIF: fields of a finding's result.
+    fn sarif_result(&self, _res: &mut Value, _at: (usize, usize)) {}
+    /// SARIF: results after the findings' (`n_rules`: how many rules the findings have,
+    /// so the first rule [`Hook::sarif_rules`] added has that index).
+    fn sarif_end(&self, _results: &mut Vec<Value>, _n_rules: usize) {}
+}
+
+/// Adds nothing.
+impl Hook for () {}
+
 /// Start/end positions of a diagnostic.
 pub struct Span {
     pub line: u32,
@@ -42,7 +96,7 @@ pub struct Span {
     pub cell_line: Option<u32>,
 }
 
-pub fn span(source: &SourceFile, d: &Diagnostic) -> Span {
+fn span(source: &SourceFile, d: &Diagnostic) -> Span {
     let s = source.location(d.range.start());
     let e = source.location(d.range.end());
     Span {
@@ -56,7 +110,7 @@ pub fn span(source: &SourceFile, d: &Diagnostic) -> Span {
 }
 
 /// `path:line:col` (Jupyter: `path:cell N:line:col` with cell-relative lines).
-pub fn location_prefix(r: &FileReport, sp: &Span) -> String {
+fn location_prefix(r: &FileReport, sp: &Span) -> String {
     match (r.source.kind, sp.cell, sp.cell_line) {
         (SourceKind::Jupyter, Some(c), Some(l)) => {
             format!("{}:cell {c}:{l}:{}", r.display, sp.column)
@@ -73,7 +127,7 @@ fn fix_marker(d: &Diagnostic) -> &'static str {
 }
 
 /// The `path:line:col: CODE message` line of a finding and its code frame.
-pub fn text_finding(out: &mut impl Write, r: &FileReport, d: &Diagnostic) -> io::Result<()> {
+fn text_finding(out: &mut impl Write, r: &FileReport, d: &Diagnostic) -> io::Result<()> {
     let sp = span(&r.source, d);
     let cell = match (r.source.kind, sp.cell) {
         (SourceKind::DatabricksNotebook, Some(c)) => format!(" (cell {c})"),
@@ -91,7 +145,7 @@ pub fn text_finding(out: &mut impl Write, r: &FileReport, d: &Diagnostic) -> io:
 }
 
 /// The `= help:` and `= fix:` lines of a finding.
-pub fn text_notes(out: &mut impl Write, d: &Diagnostic) -> io::Result<()> {
+fn text_notes(out: &mut impl Write, d: &Diagnostic) -> io::Result<()> {
     if let Some(h) = &d.help {
         writeln!(out, "  = help: {h}")?;
     }
@@ -105,23 +159,25 @@ pub fn text_notes(out: &mut impl Write, d: &Diagnostic) -> io::Result<()> {
     Ok(())
 }
 
-pub fn text(out: &mut impl Write, reports: &[FileReport]) -> io::Result<()> {
-    for r in reports {
-        for d in &r.diagnostics {
-            text_finding(out, r, d)?;
-            text_notes(out, d)?;
-            writeln!(out)?;
-        }
+pub fn text(
+    out: &mut impl Write,
+    reports: &[FileReport],
+    order: &Order,
+    hook: &impl Hook,
+) -> io::Result<()> {
+    for &(ri, di) in order {
+        let r = &reports[ri];
+        let d = &r.diagnostics[di];
+        text_finding(out, r, d)?;
+        hook.text_after_frame(out, (ri, di))?;
+        text_notes(out, d)?;
+        hook.text_after_notes(out, (ri, di))?;
+        writeln!(out)?;
     }
-    Ok(())
+    hook.text_end(out)
 }
 
-pub fn code_frame(
-    out: &mut impl Write,
-    r: &FileReport,
-    d: &Diagnostic,
-    sp: &Span,
-) -> io::Result<()> {
+fn code_frame(out: &mut impl Write, r: &FileReport, d: &Diagnostic, sp: &Span) -> io::Result<()> {
     let src = &r.source;
     let jupyter = src.kind == SourceKind::Jupyter && sp.cell_line.is_some();
     // Displayed number for a text line.
@@ -239,7 +295,7 @@ pub fn plural(n: usize) -> &'static str {
 }
 
 /// One finding as a JSON object.
-pub fn finding_json(r: &FileReport, d: &Diagnostic) -> Value {
+fn finding_json(r: &FileReport, d: &Diagnostic) -> Value {
     let sp = span(&r.source, d);
     let fix = d.fix.as_ref().map(|f| {
         json!({
@@ -277,11 +333,22 @@ pub fn write_json(out: &mut impl Write, v: &impl serde::Serialize) -> io::Result
     writeln!(out)
 }
 
-pub fn json(out: &mut impl Write, reports: &[FileReport]) -> io::Result<()> {
-    let all: Vec<Value> = reports
+pub fn json(
+    out: &mut impl Write,
+    reports: &[FileReport],
+    order: &Order,
+    hook: &impl Hook,
+) -> io::Result<()> {
+    let mut all: Vec<Value> = order
         .iter()
-        .flat_map(|r| r.diagnostics.iter().map(move |d| finding_json(r, d)))
+        .map(|&(ri, di)| {
+            let r = &reports[ri];
+            let mut v = finding_json(r, &r.diagnostics[di]);
+            hook.json_finding(&mut v, (ri, di));
+            v
+        })
         .collect();
+    hook.json_end(&mut all);
     write_json(out, &all)
 }
 
@@ -308,13 +375,13 @@ pub fn github_level(s: Severity) -> &'static str {
 }
 
 /// The text of a finding's GitHub annotation: `path:line:col: CODE message`.
-pub fn github_message(r: &FileReport, d: &Diagnostic) -> String {
+fn github_message(r: &FileReport, d: &Diagnostic) -> String {
     let sp = span(&r.source, d);
     format!("{}: {} {}", location_prefix(r, &sp), d.code, d.message)
 }
 
 /// One `::level title=…,file=…,line=…::message` workflow command for a finding.
-pub fn github_annotation(
+fn github_annotation(
     out: &mut impl Write,
     r: &FileReport,
     d: &Diagnostic,
@@ -335,13 +402,20 @@ pub fn github_annotation(
     )
 }
 
-pub fn github(out: &mut impl Write, reports: &[FileReport]) -> io::Result<()> {
-    for r in reports {
-        for d in &r.diagnostics {
-            github_annotation(out, r, d, &github_message(r, d))?;
-        }
+pub fn github(
+    out: &mut impl Write,
+    reports: &[FileReport],
+    order: &Order,
+    hook: &impl Hook,
+) -> io::Result<()> {
+    for &(ri, di) in order {
+        let r = &reports[ri];
+        let d = &r.diagnostics[di];
+        let mut message = github_message(r, d);
+        hook.github_message(&mut message, (ri, di));
+        github_annotation(out, r, d, &message)?;
     }
-    Ok(())
+    hook.github_end(out)
 }
 
 pub fn sarif_level(s: Severity) -> &'static str {
@@ -354,7 +428,7 @@ pub fn sarif_level(s: Severity) -> &'static str {
 
 /// The codes with a finding (sorted; a result's `ruleIndex` points into it) and
 /// their SARIF rule descriptors.
-pub fn sarif_rules(reports: &[FileReport]) -> (Vec<&'static str>, Vec<Value>) {
+fn sarif_rules(reports: &[FileReport]) -> (Vec<&'static str>, Vec<Value>) {
     let mut used: Vec<&str> = reports
         .iter()
         .flat_map(|r| r.diagnostics.iter().map(|d| d.code))
@@ -380,7 +454,7 @@ pub fn sarif_rules(reports: &[FileReport]) -> (Vec<&'static str>, Vec<Value>) {
 }
 
 /// One finding as a SARIF result (`used`: the codes of [`sarif_rules`]).
-pub fn sarif_result(r: &FileReport, d: &Diagnostic, used: &[&str]) -> Value {
+fn sarif_result(r: &FileReport, d: &Diagnostic, used: &[&str]) -> Value {
     let sp = span(&r.source, d);
     json!({
         "ruleId": d.code,
@@ -402,7 +476,7 @@ pub fn sarif_result(r: &FileReport, d: &Diagnostic, used: &[&str]) -> Value {
 }
 
 /// The SARIF 2.1.0 log of one run.
-pub fn sarif_log(rules: Vec<Value>, results: Vec<Value>) -> Value {
+fn sarif_log(rules: Vec<Value>, results: Vec<Value>) -> Value {
     json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
@@ -418,12 +492,25 @@ pub fn sarif_log(rules: Vec<Value>, results: Vec<Value>) -> Value {
     })
 }
 
-pub fn sarif(out: &mut impl Write, reports: &[FileReport]) -> io::Result<()> {
-    let (used, rules) = sarif_rules(reports);
-    let results = reports
+pub fn sarif(
+    out: &mut impl Write,
+    reports: &[FileReport],
+    order: &Order,
+    hook: &impl Hook,
+) -> io::Result<()> {
+    let (used, mut rules) = sarif_rules(reports);
+    let n_rules = rules.len();
+    hook.sarif_rules(&mut rules);
+    let mut results: Vec<Value> = order
         .iter()
-        .flat_map(|r| r.diagnostics.iter().map(|d| sarif_result(r, d, &used)))
+        .map(|&(ri, di)| {
+            let r = &reports[ri];
+            let mut res = sarif_result(r, &r.diagnostics[di], &used);
+            hook.sarif_result(&mut res, (ri, di));
+            res
+        })
         .collect();
+    hook.sarif_end(&mut results, n_rules);
     write_json(out, &sarif_log(rules, results))
 }
 

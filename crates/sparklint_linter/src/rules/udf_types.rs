@@ -4,29 +4,62 @@
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{self as ast, Expr, Operator, Stmt};
 use ruff_text_size::{Ranged, TextRange};
-use sparklint_semantic::{SqlText, Ty, call_arg, str_literal};
+use sparklint_semantic::columns;
+use sparklint_semantic::udf_refs::{UdfCall, UdfRef, UdfRefs};
+use sparklint_semantic::{Hops, SqlSiteKind, SqlText, Ty, call_arg, str_literal};
 
 use super::Rule;
-use super::actions::method_range;
+use super::describe::short;
 use super::helpers::*;
-use super::plan::{Conj, conjuncts};
-use super::udf::is_udf_factory;
+use super::msg::Msg;
+use super::plan_facts::{Conj, conjuncts, small_side};
+use super::udf_target::{Factory, Shape, UdfFn, UdfTarget, decorated_udf, udf_target};
 use crate::checker::{Checker, Node};
-use crate::diagnostic::{Diagnostic, Severity};
+use crate::diagnostic::Severity;
+use crate::msg;
 
 /// UDF002/006/013/014 (see [`super::Rule`]).
 pub const RULES: &[Rule] = &[
-    Rule::new("UDF002")
-        .init(init_registered_udfs)
-        .call(udf_in_filter),
+    Rule::new("UDF002").call(udf_in_filter).msgs(&[UDF002]),
     Rule::new("UDF006")
         .stmt(udf006_stmt)
-        .call(udf_missing_return_type_call),
-    Rule::new("UDF013").call(udf_whole_row),
-    Rule::new("UDF014")
-        .init(init_registered_udfs)
-        .call(udf_in_join),
+        .call(udf_missing_return_type_call)
+        .msgs(&[UDF006_NON_STRING, UDF006_UNKNOWN]),
+    Rule::new("UDF013").call(udf_whole_row).msgs(&[UDF013]),
+    Rule::new("UDF014").call(udf_in_join).msgs(&[UDF014]),
 ];
+
+const UDF002: Msg = Msg::new(
+    "UDF002",
+    "filter-predicate",
+    "UDF {name}() used as a filter predicate — Spark cannot push it into the scan (no file or row-group skipping on it) and runs Python on every remaining row.",
+)
+.help("Rewrite the predicate with built-in functions. Splitting it does not help: Spark already applies the native conditions of a filter before the UDF.");
+const UDF014: Msg = Msg::new(
+    "UDF014",
+    "join-condition",
+    "UDF {name}() in {place} — Spark can't derive a join key from it, so it runs a nested-loop / cartesian join and calls Python once per row PAIR.",
+)
+.help("Join on a cheap equality key first (a blocking key, token or floor(x / bin)), then filter the candidate pairs with the UDF; or use built-ins (levenshtein, soundex) in the condition.");
+const UDF006_HELP: &str = "Pass returnType: F.udf(fn, \"long\") / @F.udf(\"double\") / spark.udf.register(\"n\", fn, \"int\").";
+const UDF006_NON_STRING: Msg = Msg::new(
+    "UDF006",
+    "non-string-return",
+    "udf() without returnType defaults to StringType — the function returns a non-string, so results become strings (or NULL).",
+)
+.help(UDF006_HELP);
+const UDF006_UNKNOWN: Msg = Msg::new(
+    "UDF006",
+    "unknown-return",
+    "udf() without returnType defaults to StringType — state the return type explicitly.",
+)
+.help(UDF006_HELP);
+const UDF013: Msg = Msg::new(
+    "UDF013",
+    "whole-row",
+    "{udf}() gets {how} — all columns are shipped to Python and back, and Spark can't prune the unread ones from the scan.",
+)
+.help("Pass only the columns the function reads: f(F.col(\"a\"), F.col(\"b\")). For whole-row hashes or JSON use built-ins: xxhash64(*cols), sha2(concat_ws(...), 256), to_json(struct(\"*\")).");
 
 fn udf006_stmt(ch: &mut Checker, stmt: &Stmt) {
     if let Stmt::FunctionDef(f) = stmt {
@@ -36,81 +69,31 @@ fn udf006_stmt(ch: &mut Checker, stmt: &Stmt) {
 
 // ------------------------------------------------------------------ UDF002
 
-/// Names registered with `spark.udf.register("name", ...)` in this file.
-pub fn init_registered_udfs(ch: &mut Checker) {
-    struct V<'c, 'a> {
-        ch: &'c Checker<'a>,
-        out: Vec<String>,
+/// How a UDF reference is named in a message: the called UDF as written, or the name
+/// SQL text calls it by.
+fn udf_name(ch: &Checker, r: &UdfRef) -> String {
+    match &r.call {
+        UdfCall::Python { call, .. } => short(ch, &call.func),
+        UdfCall::Registered { name } => name.clone(),
     }
-    impl<'b> Visitor<'b> for V<'_, '_> {
-        fn visit_expr(&mut self, e: &'b Expr) {
-            if let Some(sc) = self.ch.model.spark_call_named(e, &["register"])
-                && sc.class() == Ty::UdfRegistration
-                && let Some(n) = sc.args().first().and_then(str_literal)
-            {
-                self.out.push(n.to_ascii_lowercase());
-            }
-            visitor::walk_expr(self, e);
-        }
-    }
-    let mut v = V {
-        ch,
-        out: Vec::new(),
-    };
-    for s in &ch.module.body {
-        v.visit_stmt(s);
-    }
-    // Assigned, not extended: UDF002 and UDF014 both run this init.
-    ch.state.registered_udfs = v.out;
 }
 
-/// The first UDF registered in this file that SQL text `sql` calls.
-fn sql_calls_registered(ch: &Checker, sql: &str) -> Option<String> {
-    let q = SqlText::new(sql);
-    ch.state
-        .registered_udfs
-        .iter()
-        .find(|n| q.calls(n))
-        .cloned()
-}
-
-pub fn udf_in_filter(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
-    let Some(sc) = ch.model.spark_call_named(expr, &["filter", "where"]) else {
+pub fn udf_in_filter(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) {
+    let sites = ch.model.sql_sites(expr);
+    let Some(site) = sites.iter().find(|s| s.kind == SqlSiteKind::Condition) else {
         return;
     };
-    if !sc.is_dataframe() {
-        return;
-    }
-    let Some(pred) = call_arg(c, 0, "condition") else {
+    let Some(pred) = site.arg else {
         return;
     };
-    let mut hit: Option<String> = None;
-    if let Some(s) = str_literal(pred) {
-        hit = sql_calls_registered(ch, s);
-    } else {
-        walk_exprs(pred, &mut |x| {
-            if hit.is_some() {
-                return;
-            }
-            let Expr::Call(xc) = x else { return };
-            if ch.model.ty_of(&xc.func).ty == Ty::Udf {
-                hit = Some(short(ch, &xc.func));
-            } else if ch.model.is_spark_function(&xc.func, "expr")
-                && let Some(s) = xc.arguments.args.first().and_then(str_literal)
-            {
-                hit = sql_calls_registered(ch, s);
-            }
-        });
-    }
-    let Some(name) = hit else { return };
-    ch.report(
-        Diagnostic::new(
-            "UDF002",
-            format!("UDF {name}() used as a filter predicate — prevents predicate pushdown/data skipping and runs Python on every row."),
-            method_range(expr),
-        )
-        .with_help("Rewrite with built-in functions, or filter on native conjuncts first: df.filter(native).filter(udf(...))."),
-    );
+    let refs = match &site.text {
+        Some(q) => UdfRefs::of_sql(ch.model, q),
+        None => UdfRefs::of(ch.model, pred),
+    };
+    let Some(name) = refs.first().map(|r| udf_name(ch, r)) else {
+        return;
+    };
+    ch.report(msg!(UDF002, method_range(expr), name));
 }
 
 // ------------------------------------------------------------------ UDF014
@@ -123,76 +106,39 @@ enum Piece {
     Key(Conj),
 }
 
-/// DataFrame names referenced as `df.col` / `df["col"]` inside `e`.
-fn frames_in(ch: &Checker, e: &Expr, out: &mut Vec<String>) {
-    walk_exprs(e, &mut |x| {
-        let base = match x {
-            Expr::Attribute(a) => &*a.value,
-            Expr::Subscript(s) if str_literal(&s.slice).is_some() => &*s.value,
-            _ => return,
-        };
-        if let Expr::Name(n) = base
-            && ch.model.is_dataframe(base)
-            && !out.iter().any(|o| o == n.id.as_str())
-        {
-            out.push(n.id.to_string());
-        }
-    });
-}
-
 /// The first UDF called inside `e` (a Python/pandas UDF value, or SQL text calling a
 /// UDF registered in this file), with the frames its arguments reference.
 fn udf_inside(ch: &Checker, e: &Expr) -> Option<(String, Vec<String>)> {
-    if let Some(s) = str_literal(e) {
-        return sql_calls_registered(ch, s).map(|n| (n, Vec::new()));
-    }
-    let mut hit: Option<(String, Vec<String>)> = None;
-    walk_exprs(e, &mut |x| {
-        if hit.is_some() {
-            return;
-        }
-        let Expr::Call(xc) = x else { return };
-        if ch.model.ty_of(&xc.func).ty == Ty::Udf {
-            let mut frames = Vec::new();
-            for a in &xc.arguments.args {
-                frames_in(ch, a, &mut frames);
-            }
-            for k in &xc.arguments.keywords {
-                frames_in(ch, &k.value, &mut frames);
-            }
-            hit = Some((short(ch, &xc.func), frames));
-        } else if ch.model.is_spark_function(&xc.func, "expr")
-            && let Some(s) = xc.arguments.args.first().and_then(str_literal)
-            && let Some(n) = sql_calls_registered(ch, s)
-        {
-            hit = Some((n, Vec::new()));
-        }
-    });
-    hit
+    let refs = match str_literal(e) {
+        Some(s) => UdfRefs::of_sql(ch.model, &SqlText::new(s)),
+        None => UdfRefs::of(ch.model, e),
+    };
+    let r = refs.first()?;
+    let frames = match &r.call {
+        UdfCall::Python { frames, .. } => frames.clone(),
+        UdfCall::Registered { .. } => Vec::new(),
+    };
+    Some((udf_name(ch, r), frames))
 }
 
-fn pieces(ch: &Checker, e: &Expr, depth: u32, out: &mut Vec<Piece>) {
+fn pieces(ch: &Checker, e: &Expr, hops: Hops, out: &mut Vec<Piece>) {
     match e {
         Expr::List(ast::ExprList { elts, .. }) | Expr::Tuple(ast::ExprTuple { elts, .. }) => {
             for x in elts {
-                pieces(ch, x, depth, out);
+                pieces(ch, x, hops, out);
             }
         }
         Expr::BinOp(b) if b.op == Operator::BitAnd => {
-            pieces(ch, &b.left, depth, out);
-            pieces(ch, &b.right, depth, out);
+            pieces(ch, &b.left, hops, out);
+            pieces(ch, &b.right, hops, out);
         }
-        Expr::Name(n) if ch.model.ty_of(e).is_column() => match ch
-            .model
-            .single_binding(n)
-            .and_then(|b| ch.model.binding(b).value)
-        {
-            Some(v) if depth < 3 && v.range() != e.range() => pieces(ch, v, depth + 1, out),
-            _ => out.push(Piece::Key(Conj::Unknown)),
+        Expr::Name(_) if ch.model.ty_of(e).is_column() => match ch.model.hop_one(e, hops) {
+            Some((v, h)) => pieces(ch, v, h, out),
+            None => out.push(Piece::Key(Conj::Unknown)),
         },
         other => {
             let mut ks = Vec::new();
-            conjuncts(ch, other, 3, &mut ks);
+            conjuncts(ch, other, Hops::DEFAULT, &mut ks);
             // An equality is a usable key even when one side is a UDF of one frame.
             if ks.contains(&Conj::Equi) {
                 return out.push(Piece::Key(Conj::Equi));
@@ -203,14 +149,6 @@ fn pieces(ch: &Checker, e: &Expr, depth: u32, out: &mut Vec<Piece>) {
             }
         }
     }
-}
-
-fn is_small(ch: &Checker, recv: &Expr, other: Option<&Expr>) -> bool {
-    ch.model.ty_of(recv).bounded().is_some()
-        || other.is_some_and(|o| {
-            ch.model.ty_of(o).bounded().is_some()
-                || matches!(o, Expr::Call(oc) if ch.model.is_spark_function(&oc.func, "broadcast"))
-        })
 }
 
 /// The UDF to report: some conjunct calls a UDF (of both frames, when `both`), and no
@@ -240,14 +178,11 @@ pub fn udf_in_join(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
     }
     let mut ps = Vec::new();
     let (small, where_) = if sc.method == "join" {
-        let Some(on) = call_arg(c, 1, "on") else {
+        let Some(on) = sc.arg(1, "on") else {
             return;
         };
-        pieces(ch, on, 0, &mut ps);
-        (
-            is_small(ch, sc.receiver, call_arg(c, 0, "other")),
-            "a join condition",
-        )
+        pieces(ch, on, Hops::DEFAULT, &mut ps);
+        (small_side(ch, c, sc.receiver_ty), "a join condition")
     } else {
         // `a.crossJoin(b).where(udf(a.x, b.y))` / `a.join(b).filter(...)`: the filter
         // is evaluated per row pair when it reads both sides.
@@ -257,27 +192,22 @@ pub fn udf_in_join(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
         else {
             return;
         };
-        if !jc.is_dataframe() || (jc.method == "join" && call_arg(jc.call, 1, "on").is_some()) {
+        if !jc.is_dataframe() || (jc.method == "join" && jc.arg(1, "on").is_some()) {
             return;
         }
-        let Some(pred) = call_arg(c, 0, "condition") else {
+        let Some(pred) = sc.arg(0, "condition") else {
             return;
         };
-        pieces(ch, pred, 0, &mut ps);
+        pieces(ch, pred, Hops::DEFAULT, &mut ps);
         (
-            is_small(ch, jc.receiver, call_arg(jc.call, 0, "other")),
+            small_side(ch, jc.call, jc.receiver_ty),
             "a filter over a cross join",
         )
     };
     let Some(name) = udf_without_key(&ps, sc.method != "join").map(str::to_string) else {
         return;
     };
-    let mut d = Diagnostic::new(
-        "UDF014",
-        format!("UDF {name}() in {where_} — Spark can't derive a join key from it, so it runs a nested-loop / cartesian join and calls Python once per row PAIR."),
-        method_range(expr),
-    )
-    .with_help("Join on a cheap equality key first (a blocking key, token or floor(x / bin)), then filter the candidate pairs with the UDF; or use built-ins (levenshtein, soundex) in the condition.");
+    let mut d = msg!(UDF014, method_range(expr), name, place = where_);
     if small {
         d = d.with_severity(Severity::Info);
     }
@@ -418,6 +348,28 @@ fn classify(ch: &Checker, e: &Expr) -> Ret {
 }
 
 fn annotation_kind(ch: &Checker, ann: &Expr) -> Ret {
+    // `Optional[X]`, `Union[X, None]` and `X | None`: the non-None members decide.
+    match ann {
+        Expr::NoneLiteral(_) => return Ret::NoneOnly,
+        Expr::BinOp(b) if b.op == Operator::BitOr => {
+            return join(annotation_kind(ch, &b.left), annotation_kind(ch, &b.right));
+        }
+        Expr::Subscript(s) => match ch.model.qualified_name(&s.value).as_deref() {
+            Some("typing.Optional") => return join(Ret::NoneOnly, annotation_kind(ch, &s.slice)),
+            Some("typing.Union") => {
+                return match &*s.slice {
+                    Expr::Tuple(t) => t
+                        .elts
+                        .iter()
+                        .map(|e| annotation_kind(ch, e))
+                        .fold(Ret::NoneOnly, join),
+                    one => annotation_kind(ch, one),
+                };
+            }
+            _ => {}
+        },
+        _ => {}
+    }
     let q = ch.model.qualified_name(ann);
     match q.as_deref() {
         Some("builtins.str") => Ret::Str,
@@ -471,20 +423,27 @@ fn def_returns(ch: &Checker, f: &ast::StmtFunctionDef) -> Ret {
     v.acc.unwrap_or(Ret::NoneOnly)
 }
 
-fn target_kind(ch: &Checker, target: &Expr) -> Option<Ret> {
-    match target {
-        Expr::Lambda(l) => Some(classify(ch, &l.body)),
-        Expr::Name(n) => {
-            let b = ch.model.single_binding(n)?;
-            let b = ch.model.binding(b);
-            if b.ty.ty == Ty::Udf {
-                return None; // already a UDF (has its own type)
-            }
-            let def = ch.fn_defs.get(&b.range.start()).copied()?;
-            Some(def_returns(ch, def))
-        }
-        _ => None,
+/// What the wrapped function returns, joined over every binding of a name argument
+/// (`None` unless every binding is a plain lambda or def).
+fn target_kind(ch: &Checker, t: &UdfTarget) -> Option<Ret> {
+    if !t.resolved.complete() {
+        return None;
     }
+    let mut acc: Option<Ret> = None;
+    for w in &t.resolved.fns {
+        if w.binding
+            .is_some_and(|b| ch.model.binding(b).ty.ty == Ty::Udf)
+        {
+            return None; // already a UDF (has its own type)
+        }
+        let k = match w.func {
+            // `udf(lambda x: ..)`, `f = lambda x: x * 2; udf(f)`
+            UdfFn::Lambda(l) => classify(ch, &l.body),
+            UdfFn::Def(def) => def_returns(ch, def),
+        };
+        acc = Some(acc.map_or(k, |a| join(a, k)));
+    }
+    acc
 }
 
 fn is_return_type_arg(e: &Expr) -> bool {
@@ -494,28 +453,24 @@ fn is_return_type_arg(e: &Expr) -> bool {
 }
 
 fn report(ch: &mut Checker, kind: Ret, range: TextRange) {
-    let (sev, msg) = match kind {
-        Ret::NonStr => (
-            Severity::Warning,
-            "udf() without returnType defaults to StringType — the function returns a non-string, so results become strings (or NULL).",
-        ),
-        Ret::Unknown => (
-            Severity::Info,
-            "udf() without returnType defaults to StringType — state the return type explicitly.",
-        ),
+    let (sev, m) = match kind {
+        Ret::NonStr => (Severity::Warning, &UDF006_NON_STRING),
+        Ret::Unknown => (Severity::Info, &UDF006_UNKNOWN),
         _ => return,
     };
-    ch.report(
-        Diagnostic::new("UDF006", msg, range)
-            .with_severity(sev)
-            .with_help("Pass returnType: F.udf(fn, \"long\") / @F.udf(\"double\") / spark.udf.register(\"n\", fn, \"int\")."),
-    );
+    ch.report(msg!(m, range).with_severity(sev));
 }
 
 /// `F.udf(fn)`, `udf(lambda ...)`, `@udf()`-style factory calls and
 /// `spark.udf.register("n", fn)` without a return type.
 pub fn udf_missing_return_type_call(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
-    if is_udf_factory(ch, &c.func) {
+    let Some(t) = udf_target(ch, expr) else {
+        return;
+    };
+    if t.factory != Factory::Udf {
+        return;
+    }
+    if t.shape == Shape::Factory {
         if c.arguments
             .keywords
             .iter()
@@ -523,13 +478,13 @@ pub fn udf_missing_return_type_call(ch: &mut Checker, c: &ast::ExprCall, expr: &
         {
             return;
         }
-        let first = c.arguments.args.first();
-        match first {
+        // The function positionally or as `f=` (`F.udf(f=lambda x: ...)`).
+        match t.arg {
             Some(f) if !is_return_type_arg(f) => {
                 if c.arguments.args.len() >= 2 {
                     return;
                 }
-                if let Some(k) = target_kind(ch, f) {
+                if let Some(k) = target_kind(ch, &t) {
                     report(ch, k, expr.range());
                 }
             }
@@ -553,13 +508,13 @@ pub fn udf_missing_return_type_call(ch: &mut Checker, c: &ast::ExprCall, expr: &
         }
         return;
     }
-    if let Some(sc) = ch.model.spark_call_named(expr, &["register"])
-        && sc.class() == Ty::UdfRegistration
-        && c.arguments.args.len() == 2
+    // `register("n", f)` / `register("n", f=f)` without a return type
+    let positional = if t.keyword { 1 } else { 2 };
+    if t.shape == Shape::Register
+        && c.arguments.args.len() == positional
         && call_arg(c, 2, "returnType").is_none()
         && !c.arguments.keywords.iter().any(|k| k.arg.is_none())
-        && let Some(f) = c.arguments.args.get(1)
-        && let Some(k) = target_kind(ch, f)
+        && let Some(k) = target_kind(ch, &t)
     {
         report(ch, k, method_range(expr));
     }
@@ -567,10 +522,9 @@ pub fn udf_missing_return_type_call(ch: &mut Checker, c: &ast::ExprCall, expr: &
 
 /// Bare `@udf` on a def.
 pub fn udf_missing_return_type_decorator(ch: &mut Checker, f: &ast::StmtFunctionDef) {
-    let Some(dec) = f
-        .decorator_list
-        .iter()
-        .find(|d| !matches!(d.expression, Expr::Call(_)) && is_udf_factory(ch, &d.expression))
+    let Some(dec) = decorated_udf(ch, f, Factory::Udf)
+        .and_then(|t| t.decorator)
+        .filter(|d| !matches!(d.expression, Expr::Call(_)))
     else {
         return;
     };
@@ -580,33 +534,14 @@ pub fn udf_missing_return_type_decorator(ch: &mut Checker, f: &ast::StmtFunction
 
 // ------------------------------------------------------------------ UDF013
 
-/// `<frame>.columns` on a DataFrame.
-fn frame_columns(ch: &Checker, e: &Expr) -> bool {
-    matches!(e, Expr::Attribute(a) if a.attr.as_str() == "columns" && ch.model.is_dataframe(&a.value))
-}
-
 /// `<frame>.columns`, or an unfiltered comprehension over it (`[F.col(c) for c in df.columns]`).
 fn all_columns(ch: &Checker, e: &Expr) -> bool {
-    let gens = match e {
-        Expr::ListComp(lc) => &lc.generators,
-        Expr::Generator(g) => &g.generators,
-        _ => return frame_columns(ch, e),
-    };
-    gens.len() == 1 && gens[0].ifs.is_empty() && frame_columns(ch, &gens[0].iter)
+    columns::all_columns(ch.model, e)
 }
 
 /// `"*"` / `F.col("*")` / `df["*"]`.
 fn star_column(ch: &Checker, e: &Expr) -> bool {
-    match e {
-        Expr::Call(c)
-            if ch.model.is_spark_function(&c.func, "col")
-                || ch.model.is_spark_function(&c.func, "column") =>
-        {
-            c.arguments.args.len() == 1 && str_literal(&c.arguments.args[0]) == Some("*")
-        }
-        Expr::Subscript(s) => str_literal(&s.slice) == Some("*") && ch.model.is_dataframe(&s.value),
-        _ => str_literal(e) == Some("*"),
-    }
+    columns::column_name(ch.model, e).as_deref() == Some("*")
 }
 
 /// How a UDF argument passes the whole row, if it does.
@@ -623,6 +558,14 @@ fn whole_row_arg(ch: &Checker, e: &Expr) -> Option<&'static str> {
             });
             whole.then_some("the whole row as a struct")
         }
+        // `row = F.struct("*"); f(row)`: a name bound once, one hop.
+        Expr::Name(_) => {
+            let (v, _) = ch.model.hop_one(e, Hops::DEFAULT)?;
+            if matches!(v, Expr::Name(_)) {
+                return None;
+            }
+            whole_row_arg(ch, v)
+        }
         _ => None,
     }
 }
@@ -631,9 +574,11 @@ fn whole_row_arg(ch: &Checker, e: &Expr) -> Option<&'static str> {
 /// function type is not SCALAR / SCALAR_ITER: grouped-map and grouped-agg UDFs take the whole
 /// frame by design.
 fn non_scalar_pandas_udf(ch: &Checker, func: &Expr) -> bool {
-    let Expr::Name(n) = func else { return false };
-    ch.model.reaching(n).iter().any(|&b| {
-        let Some(Expr::Call(v)) = ch.model.binding(b).value else {
+    let Some((reached, _)) = ch.model.hop(func, Hops::DEFAULT) else {
+        return false;
+    };
+    reached.iter().any(|r| {
+        let Some(Expr::Call(v)) = r.value else {
             return false;
         };
         call_arg(v, 2, "functionType").is_some_and(|ft| {
@@ -647,19 +592,18 @@ pub fn udf_whole_row(ch: &mut Checker, c: &ast::ExprCall, _expr: &Expr) {
     if ch.model.ty_of(&c.func).ty != Ty::Udf || non_scalar_pandas_udf(ch, &c.func) {
         return;
     }
-    let Some(how) = c.arguments.args.iter().find_map(|a| whole_row_arg(ch, a)) else {
+    let Some(how) = c
+        .arguments
+        .args
+        .iter()
+        .chain(c.arguments.keywords.iter().map(|k| &k.value))
+        .find_map(|a| whole_row_arg(ch, a))
+    else {
         return;
     };
-    let name = match &*c.func {
+    let udf = match &*c.func {
         Expr::Call(_) => "UDF".to_string(),
         f => format!("UDF {}", short(ch, f)),
     };
-    ch.report(
-        Diagnostic::new(
-            "UDF013",
-            format!("{name}() gets {how} — all columns are shipped to Python and back, and Spark can't prune the unread ones from the scan."),
-            c.range(),
-        )
-        .with_help("Pass only the columns the function reads: f(F.col(\"a\"), F.col(\"b\")). For whole-row hashes or JSON use built-ins: xxhash64(*cols), sha2(concat_ws(...), 256), to_json(struct(\"*\")).")
-    );
+    ch.report(msg!(UDF013, c.range(), udf, how));
 }

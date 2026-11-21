@@ -1,15 +1,19 @@
 //! The type oracle: `ty_of(expr)` and `qualified_name(expr)`.
 
+use crate::constant::int_literal;
 use ruff_python_ast::{self as ast, Expr, Number, Operator, UnaryOp};
 use ruff_text_size::Ranged;
 
 use crate::api::{self, canonical_qualified};
 use crate::evidence::{self, Use};
-use crate::facts::{Facts, Local, Step};
+use crate::facts::Columns;
+use crate::facts::{Facts, FileText, Local, Step};
 use crate::library;
 use crate::model::{BindingId, BindingKind, SemanticModel};
 use crate::sql::SqlText;
+use crate::transform::{self, Cols, Combine, Rows};
 use crate::types::{Confidence, Elem, Ty, TypeInfo};
+use crate::values::Hops;
 
 /// Bound under which `spark.range(n)` counts as a small, bounded DataFrame.
 const SMALL_RANGE: i64 = 10_000;
@@ -119,53 +123,10 @@ pub(crate) const BUILTINS: &[&str] = &[
     "exit",
 ];
 
-/// Integer literal value of an expression (`10`, `-1`).
-pub fn int_literal(e: &Expr) -> Option<i64> {
-    match e {
-        Expr::NumberLiteral(n) => match &n.value {
-            Number::Int(i) => i.as_i64(),
-            _ => None,
-        },
-        Expr::UnaryOp(u) if u.op == UnaryOp::USub => int_literal(&u.operand).map(|v| -v),
-        _ => None,
-    }
-}
-
-/// String literal value (not f-strings).
-pub fn str_literal(e: &Expr) -> Option<&str> {
-    match e {
-        Expr::StringLiteral(s) => Some(s.value.to_str()),
-        _ => None,
-    }
-}
-
-/// Static text of a string literal or f-string (interpolations become `{}`).
+/// Static text of a string literal or f-string (interpolations become `{}`), see
+/// [`crate::literal::static_text`].
 pub fn static_text(e: &Expr) -> Option<String> {
-    match e {
-        Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
-        Expr::FString(f) => {
-            let mut out = String::new();
-            for part in f.value.iter() {
-                match part {
-                    ast::FStringPartRef::Literal(l) => out.push_str(&l.value),
-                    ast::FStringPartRef::FString(fs) => {
-                        for el in &fs.elements {
-                            match el {
-                                ast::InterpolatedStringElement::Literal(l) => {
-                                    out.push_str(&l.value)
-                                }
-                                ast::InterpolatedStringElement::Interpolation(_) => {
-                                    out.push_str("{}")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Some(out)
-        }
-        _ => None,
-    }
+    crate::literal::static_text(e)
 }
 
 /// Positional argument `i` or keyword `kw` of a call.
@@ -226,6 +187,9 @@ impl<'a> SemanticModel<'a> {
                     }
                     if self.star_functions && api::api().function(name).is_some() {
                         return Some(format!("pyspark.sql.functions.{name}"));
+                    }
+                    if self.star_delta && name == "DeltaTable" {
+                        return Some("delta.tables.DeltaTable".to_string());
                     }
                     return None;
                 }
@@ -550,7 +514,14 @@ impl<'a> SemanticModel<'a> {
         let v = self.ty_of(&s.value);
         match v.ty {
             Ty::DataFrame => match &*s.slice {
-                Expr::List(_) | Expr::Tuple(_) => v,
+                // `df[["a", "b"]]`: the frame's facts, but other columns.
+                Expr::List(_) | Expr::Tuple(_) => TypeInfo {
+                    facts: Facts {
+                        columns: Columns::Unknown,
+                        ..v.facts
+                    },
+                    ..v
+                },
                 Expr::Slice(_) => TypeInfo::UNKNOWN,
                 _ => TypeInfo::certain(Ty::Column).with_confidence(v.confidence),
             },
@@ -723,6 +694,7 @@ impl<'a> SemanticModel<'a> {
                 if let Some(i) = inner {
                     t.facts.from_spark = i.facts.from_spark;
                     t.facts.bounded = i.facts.bounded;
+                    t.facts.row_limited = i.facts.row_limited;
                 }
                 return Some(t);
             }
@@ -883,6 +855,8 @@ impl<'a> SemanticModel<'a> {
                         && keyless_grouping(&c.func);
                     t.facts = Facts {
                         bounded: if one_row { Some(1) } else { recv.facts.bounded },
+                        // An aggregate keeps the read side's limit (and adds none).
+                        row_limited: recv.facts.row_limited,
                         reduced: mi.returns == Ty::DataFrame,
                         streaming: recv.facts.streaming,
                         ..Facts::default()
@@ -929,29 +903,173 @@ impl<'a> SemanticModel<'a> {
                     _ => TypeInfo::UNKNOWN,
                 }
             }
-            t if t.is_spark() => match api::api().method_of(t, m) {
-                Some(mi) => {
-                    let mut out = TypeInfo::certain(mi.returns).with_confidence(conf);
-                    if mi.returns == Ty::Rdd || mi.returns == Ty::DataFrame {
-                        out.facts.bounded = recv.facts.bounded;
-                    }
-                    if t == Ty::Rdd && matches!(mi.returns, Ty::List(_)) {
-                        out.facts.from_spark = true;
-                        out.facts.bounded = match m {
-                            "take" | "takeOrdered" | "top" | "takeSample" => c
-                                .arguments
-                                .args
-                                .first()
-                                .and_then(int_literal)
-                                .map(|n| n.max(0) as u64),
-                            _ => recv.facts.bounded,
-                        };
-                    }
-                    out
-                }
-                None => TypeInfo::UNKNOWN,
-            },
+            Ty::SparkContext => self.context_method(recv, m, c),
+            Ty::Rdd => self.rdd_method(recv, m, c),
+            t if t.is_spark() => self.api_method(recv, m, c),
             _ => TypeInfo::UNKNOWN,
+        }
+    }
+
+    /// `recv.m(..)` on a Spark object the oracle has no special case for: the API
+    /// model's return type; a DataFrame / RDD result keeps the receiver's row bound.
+    fn api_method(&self, recv: TypeInfo, m: &str, c: &ast::ExprCall) -> TypeInfo {
+        let t = recv.ty;
+        match api::api().method_of(t, m) {
+            Some(mi) => {
+                let mut out = TypeInfo::certain(mi.returns).with_confidence(recv.confidence);
+                if mi.returns == Ty::Rdd || mi.returns == Ty::DataFrame {
+                    out.facts.bounded = recv.facts.bounded;
+                    out.facts.row_limited = recv.facts.row_limited;
+                }
+                if t == Ty::Rdd && matches!(mi.returns, Ty::List(_)) {
+                    out.facts.from_spark = true;
+                    out.facts.bounded = match m {
+                        "take" | "takeOrdered" | "top" | "takeSample" => c
+                            .arguments
+                            .args
+                            .first()
+                            .and_then(int_literal)
+                            .map(|n| n.max(0) as u64),
+                        _ => recv.facts.bounded,
+                    };
+                }
+                out
+            }
+            None => TypeInfo::UNKNOWN,
+        }
+    }
+
+    /// `sc.m(..)` / `spark.sparkContext.m(..)`: RDD origins. `parallelize(<literal>)`
+    /// is driver-built data, `textFile` / `wholeTextFiles` read files as text.
+    fn context_method(&self, recv: TypeInfo, m: &str, c: &ast::ExprCall) -> TypeInfo {
+        let mut out = self.api_method(recv, m, c);
+        match m {
+            // Driver-built rows, as many as the literal holds.
+            "parallelize" => {
+                if let Some(n) =
+                    call_arg(c, 0, "c").and_then(|a| self.literal_rows(a, Hops::DEFAULT))
+                {
+                    out.facts.bounded = Some(n);
+                    out.facts.row_limited = true;
+                    out.facts.local = true;
+                }
+            }
+            "textFile" => out.facts.file_text = FileText::Text,
+            "wholeTextFiles" => out.facts.file_text = FileText::PathAndText,
+            _ => {}
+        }
+        out
+    }
+
+    /// How many items a literal list / tuple `e` holds (the largest, when a name holds
+    /// one on every path and is never filled later). `None` for anything else, a
+    /// starred item, or a container mutated after its literal (`rows.append(..)`).
+    fn literal_rows(&self, e: &Expr, h: Hops) -> Option<u64> {
+        let elts = match e {
+            Expr::List(l) => &l.elts,
+            Expr::Tuple(t) => &t.elts,
+            Expr::Name(_) => {
+                let (reached, h) = self.hop(e, h)?;
+                return reached
+                    .iter()
+                    .map(|r| {
+                        if self.mutated(r.binding) {
+                            return None;
+                        }
+                        self.literal_rows(r.value?, h)
+                    })
+                    .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .max();
+            }
+            _ => return None,
+        };
+        (!elts.iter().any(Expr::is_starred_expr)).then_some(elts.len() as u64)
+    }
+
+    /// `rdd.m(..)`: the API model's result. An RDD result takes the step's facts (row
+    /// bound, driver-built data, raw file text); `collect()` / `take(n)` rows and a
+    /// `toDF()` frame keep the receiver's driver-built fact.
+    fn rdd_method(&self, recv: TypeInfo, m: &str, c: &ast::ExprCall) -> TypeInfo {
+        let mut out = self.api_method(recv, m, c);
+        match out.ty {
+            Ty::Rdd => out.facts = recv.facts.after(&self.rdd_step(m, c)),
+            Ty::List(_) | Ty::DataFrame => out.facts.local = recv.facts.local,
+            _ => {}
+        }
+        out
+    }
+
+    /// Which [`Step`] `rdd.m(..)` is.
+    fn rdd_step(&self, m: &str, c: &ast::ExprCall) -> Step {
+        let other = || c.arguments.args.first().map(|a| self.ty_of(a).facts);
+        match m {
+            "values" if c.arguments.is_empty() => Step::Values,
+            "map" if call_arg(c, 0, "f").is_some_and(|f| self.second_item(f)) => Step::Values,
+            "filter" | "distinct" | "sample" | "sampleByKey" | "subtract" | "subtractByKey"
+            | "intersection" => Step::Reduce,
+            "cache"
+            | "persist"
+            | "unpersist"
+            | "localCheckpoint"
+            | "coalesce"
+            | "repartition"
+            | "partitionBy"
+            | "repartitionAndSortWithinPartitions"
+            | "sortBy"
+            | "sortByKey"
+            | "setName"
+            | "withResources" => Step::Keep,
+            "union" => Step::Combine {
+                union: true,
+                other: other(),
+                keeps_columns: true,
+            },
+            "join" | "leftOuterJoin" | "rightOuterJoin" | "fullOuterJoin" | "cartesian" | "zip" => {
+                Step::Combine {
+                    union: false,
+                    other: other(),
+                    keeps_columns: false,
+                }
+            }
+            _ => Step::Other,
+        }
+    }
+
+    /// `f` picks the second item of a pair: `lambda kv: kv[1]` (any parameter name,
+    /// `kv[-1]`), a name bound to such a lambda on every path, `operator.itemgetter(1)`.
+    fn second_item(&self, f: &Expr) -> bool {
+        let second = |i: &Expr| matches!(int_literal(i), Some(1 | -1));
+        match f {
+            Expr::Lambda(l) => {
+                let Some(p) = l.parameters.as_deref() else {
+                    return false;
+                };
+                let ([p], true, None, None) = (
+                    &*p.args,
+                    p.posonlyargs.is_empty() && p.kwonlyargs.is_empty(),
+                    &p.vararg,
+                    &p.kwarg,
+                ) else {
+                    return false;
+                };
+                let Expr::Subscript(s) = &*l.body else {
+                    return false;
+                };
+                matches!(&*s.value, Expr::Name(n) if n.id == p.parameter.name.id)
+                    && second(&s.slice)
+            }
+            Expr::Call(c) => {
+                matches!(
+                    self.qualified_name(&c.func).as_deref(),
+                    Some("operator.itemgetter")
+                ) && c.arguments.keywords.is_empty()
+                    && matches!(&*c.arguments.args, [i] if second(i))
+            }
+            Expr::Name(_) => self.values_of(f, Hops::DEFAULT).is_some_and(|vs| {
+                !vs.is_empty() && vs.iter().all(|v| !v.is_name_expr() && self.second_item(v))
+            }),
+            _ => false,
         }
     }
 
@@ -966,6 +1084,7 @@ impl<'a> SemanticModel<'a> {
                         Expr::Tuple(l) => t.facts.bounded = Some(l.elts.len() as u64),
                         _ => {}
                     }
+                    t.facts.row_limited = t.facts.bounded.is_some();
                     let d = self.ty_of(data).ty;
                     t.facts.local = Local::of_data(d);
                 }
@@ -986,6 +1105,7 @@ impl<'a> SemanticModel<'a> {
                     && (0..=SMALL_RANGE).contains(&n)
                 {
                     t.facts.bounded = Some(n as u64);
+                    t.facts.row_limited = true;
                 }
                 t
             }
@@ -995,10 +1115,13 @@ impl<'a> SemanticModel<'a> {
                     // An EXPLAIN is one row of plan text whatever LIMIT its query has.
                     if q.explain() {
                         t.facts.bounded = Some(1);
+                        t.facts.row_limited = true;
                     } else if let Some(n) = q.trailing_limit() {
                         t.facts.bounded = Some(n);
+                        t.facts.row_limited = !q.aggregates_table();
                     } else if q.single_row() {
                         t.facts.bounded = Some(1);
+                        t.facts.row_limited = !q.aggregates_table();
                     } else if q.catalog_metadata() {
                         t.facts.local = true;
                     }
@@ -1010,6 +1133,12 @@ impl<'a> SemanticModel<'a> {
                 None => TypeInfo::UNKNOWN,
             },
         }
+    }
+
+    /// A row count argument (`take(n)`, `limit(n)`) as a constant, negative as 0.
+    fn row_count(&self, a: &Expr) -> Option<u64> {
+        let n = self.constant(a)?.as_int()?;
+        Some(u64::try_from(n.max(0)).unwrap_or(u64::MAX))
     }
 
     fn dataframe_method(&self, recv: TypeInfo, m: &str, c: &ast::ExprCall) -> TypeInfo {
@@ -1026,7 +1155,7 @@ impl<'a> SemanticModel<'a> {
         match m {
             "collect" | "toLocalIterator" => return rows(Ty::List(Elem::Row), recv.facts.bounded),
             "take" | "tail" => {
-                let n = args.first().and_then(int_literal).map(|n| n.max(0) as u64);
+                let n = args.first().and_then(|a| self.row_count(a));
                 return rows(Ty::List(Elem::Row), n.or(recv.facts.bounded));
             }
             "head" => {
@@ -1034,9 +1163,7 @@ impl<'a> SemanticModel<'a> {
                     None => rows(Ty::Row, Some(1)),
                     Some(a) => rows(
                         Ty::List(Elem::Row),
-                        int_literal(a)
-                            .map(|n| n.max(0) as u64)
-                            .or(recv.facts.bounded),
+                        self.row_count(a).or(recv.facts.bounded),
                     ),
                 };
             }
@@ -1073,10 +1200,12 @@ impl<'a> SemanticModel<'a> {
                     | Ty::DataStreamWriter
             ) {
                 t.facts.bounded = recv.facts.bounded;
+                t.facts.row_limited = recv.facts.row_limited;
                 t.facts.streaming = recv.facts.streaming;
             }
             if let Ty::List(Elem::DataFrame) = mi.returns {
                 t.facts.bounded = recv.facts.bounded;
+                t.facts.row_limited = recv.facts.row_limited;
             }
             // `df.writeTo(t)`: a fresh builder.
             if mi.returns.is_io_builder() {
@@ -1084,23 +1213,20 @@ impl<'a> SemanticModel<'a> {
             }
             return t;
         }
-        let step = match m {
-            "limit" => Step::Limit(
-                args.first()
-                    .or_else(|| call_arg(c, 0, "num"))
-                    .map(|a| int_literal(a).map_or(u64::MAX, |n| n.max(0) as u64))
-                    .unwrap_or(u64::MAX),
-            ),
-            "agg" => Step::Aggregate,
-            "select" => {
+        // Which step this is comes from the transformation table; `limit(n)`'s bound and
+        // aggregate-only `select` / `selectExpr` lists are read from the arguments.
+        let step = match (m, transform::frame_row(m)) {
+            ("select", _) => {
                 let items = select_items(args);
                 if !items.is_empty() && items.iter().all(|a| self.is_aggregate_expr(a)) {
                     Step::Aggregate
+                } else if let Some(cols) = self.select_columns(c) {
+                    Step::Project(cols)
                 } else {
                     Step::Other
                 }
             }
-            "selectExpr" => {
+            ("selectExpr", _) => {
                 let items = select_items(args);
                 let agg = |a: &Expr| {
                     self.resolve_text(a)
@@ -1112,29 +1238,33 @@ impl<'a> SemanticModel<'a> {
                     Step::Other
                 }
             }
-            "describe" | "summary" => Step::Describe,
-            "filter"
-            | "where"
-            | "distinct"
-            | "dropDuplicates"
-            | "drop_duplicates"
-            | "sample"
-            | "sampleBy"
-            | "dropna"
-            | "intersect"
-            | "intersectAll"
-            | "subtract"
-            | "exceptAll"
-            | "dropDuplicatesWithinWatermark" => Step::Reduce,
-            "cache" | "persist" | "checkpoint" | "localCheckpoint" => Step::Cache,
-            "join" | "crossJoin" | "union" | "unionAll" | "unionByName" | "lateralJoin" => {
-                Step::Combine {
-                    union: m.starts_with("union"),
+            (_, None) => Step::Other,
+            (_, Some(r)) if r.cache.is_some() => Step::Cache,
+            (_, Some(r)) => match (r.combine, r.rows) {
+                (Some(k @ (Combine::Join | Combine::Union)), _) => Step::Combine {
+                    union: k == Combine::Union,
                     other: args.first().map(|a| self.ty_of(a).facts),
-                }
-            }
-            _ => Step::Other,
+                    keeps_columns: r.keeps_columns(self, c),
+                },
+                (_, Rows::Limit) => Step::Limit(
+                    args.first()
+                        .or_else(|| call_arg(c, 0, "num"))
+                        .map(|a| self.row_count(a).unwrap_or(u64::MAX))
+                        .unwrap_or(u64::MAX),
+                ),
+                (_, Rows::Aggregate) => Step::Aggregate,
+                (_, Rows::Describe) => Step::Describe,
+                (_, Rows::Reduce) => Step::Reduce,
+                (_, Rows::Other) if r.cols == Cols::Keep => Step::Keep,
+                (_, Rows::Other) => Step::Other,
+            },
         };
+        // The receiver's columns by their origin, so a step that keeps them keeps it.
+        let mut recv = recv;
+        if let Expr::Attribute(a) = &*c.func {
+            recv.facts.columns = self.receiver_columns(&a.value, recv.facts.columns);
+        }
+
         let facts = recv.facts.after(&step);
         TypeInfo::certain(Ty::DataFrame)
             .with_confidence(conf)
@@ -1429,10 +1559,19 @@ enum Bound {
 }
 
 /// A window frame bound: `Window.unboundedPreceding/Following`, `±sys.maxsize`
-/// (pyspark maps |n| ≥ sys.maxsize to unbounded) and huge int literals are unbounded;
-/// `Window.currentRow` and other int literals are finite. Anything else is unknown.
+/// (pyspark maps |n| ≥ sys.maxsize to unbounded) and constant ints reaching
+/// [`crate::sql::RUNNING_FRAME_OFFSET`] rows or more (`-10**9`, `-(2**63)`: the
+/// partition start in practice) are unbounded; `Window.currentRow` and other constant
+/// ints are finite. Anything else is unknown.
 fn frame_bound(e: &Expr) -> Option<Bound> {
-    const HUGE: u64 = 9_223_372_036_854_775_807; // sys.maxsize on 64-bit
+    const HUGE: u64 = crate::sql::RUNNING_FRAME_OFFSET;
+    if let Some(v) = const_int(e) {
+        return Some(if v.unsigned_abs() >= u128::from(HUGE) {
+            Bound::Unbounded
+        } else {
+            Bound::Finite
+        });
+    }
     match e {
         Expr::Attribute(a) => match a.attr.as_str() {
             "unboundedPreceding" | "unboundedFollowing" | "maxsize" => Some(Bound::Unbounded),
@@ -1454,6 +1593,43 @@ fn frame_bound(e: &Expr) -> Option<Bound> {
             match (frame_bound(&b.left), frame_bound(&b.right)) {
                 (Some(Bound::Unbounded), Some(Bound::Finite)) => Some(Bound::Unbounded),
                 (Some(Bound::Finite), Some(Bound::Finite)) => Some(Bound::Finite),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A constant integer expression (literals, unary `-`/`+`, `+ - * **`), saturating at
+/// the i128 range; `None` for anything else.
+fn const_int(e: &Expr) -> Option<i128> {
+    match e {
+        Expr::NumberLiteral(n) => match &n.value {
+            Number::Int(i) => Some(i.as_u64().map_or(i128::MAX, i128::from)),
+            _ => None,
+        },
+        Expr::UnaryOp(u) => {
+            let v = const_int(&u.operand)?;
+            match u.op {
+                UnaryOp::USub => Some(v.saturating_neg()),
+                UnaryOp::UAdd => Some(v),
+                _ => None,
+            }
+        }
+        Expr::BinOp(b) => {
+            let (l, r) = (const_int(&b.left)?, const_int(&b.right)?);
+            match b.op {
+                Operator::Add => Some(l.saturating_add(r)),
+                Operator::Sub => Some(l.saturating_sub(r)),
+                Operator::Mult => Some(l.saturating_mul(r)),
+                Operator::Pow => {
+                    let r = u32::try_from(r).ok()?;
+                    Some(l.checked_pow(r).unwrap_or(if l < 0 && r % 2 == 1 {
+                        i128::MIN
+                    } else {
+                        i128::MAX
+                    }))
+                }
                 _ => None,
             }
         }
@@ -1493,5 +1669,230 @@ fn select_items(args: &[Expr]) -> &[Expr] {
         [Expr::List(l)] => &l.elts,
         [Expr::Tuple(t)] => &t.elts,
         _ => args,
+    }
+}
+
+#[cfg(test)]
+mod rdd_origins {
+    use ruff_python_ast::visitor::{self, Visitor};
+    use ruff_text_size::{Ranged, TextSize};
+
+    use super::*;
+    use crate::{NoSummaries, SemanticOptions, Size, build_model};
+
+    struct Last<'a> {
+        src: &'a str,
+        needle: &'a str,
+        found: Option<&'a Expr>,
+    }
+    impl<'a> Visitor<'a> for Last<'a> {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            let r = e.range();
+            if &self.src[usize::from(r.start())..usize::from(r.end())] == self.needle {
+                self.found = Some(e);
+            }
+            visitor::walk_expr(self, e);
+        }
+    }
+
+    /// The facts of the last `needle` expression in `body` (after a session preamble).
+    fn facts(body: &str, needle: &str) -> (Ty, Facts) {
+        let src = format!(
+            "import operator\nfrom pyspark.sql import SparkSession\n\
+             spark = SparkSession.builder.getOrCreate()\nsc = spark.sparkContext\n{body}\n"
+        );
+        let m = ruff_python_parser::parse_module(&src)
+            .expect("valid test source")
+            .into_syntax();
+        let model = build_model(
+            &m,
+            TextSize::of(src.as_str()),
+            SemanticOptions::default(),
+            &NoSummaries,
+        );
+        let mut f = Last {
+            src: &src,
+            needle,
+            found: None,
+        };
+        for s in &m.body {
+            f.visit_stmt(s);
+        }
+        let t = model.ty_of(f.found.expect("needle found"));
+        (t.ty, t.facts)
+    }
+
+    #[test]
+    fn parallelize_of_a_literal_is_driver_data() {
+        for (body, needle, rows) in [
+            (
+                "r = sc.parallelize(['a', 'b'])",
+                "sc.parallelize(['a', 'b'])",
+                Some(2),
+            ),
+            (
+                "r = spark.sparkContext.parallelize(('a',))",
+                "spark.sparkContext.parallelize(('a',))",
+                Some(1),
+            ),
+            (
+                "xs = ['a', 'b', 'c']\nr = sc.parallelize(xs)",
+                "sc.parallelize(xs)",
+                Some(3),
+            ),
+            (
+                "if c:\n    xs = ['a']\nelse:\n    xs = ['a', 'b']\nr = sc.parallelize(xs)",
+                "sc.parallelize(xs)",
+                Some(2),
+            ),
+            (
+                "r = sc.parallelize(c=['a'])",
+                "sc.parallelize(c=['a'])",
+                Some(1),
+            ),
+            // Kept through narrow steps, and by the frame of `toDF()`.
+            (
+                "r = sc.parallelize(['a']).map(str).filter(f)",
+                "sc.parallelize(['a']).map(str).filter(f)",
+                Some(1),
+            ),
+            // Not literal: unknown size.
+            (
+                "r = sc.parallelize(range(10))",
+                "sc.parallelize(range(10))",
+                None,
+            ),
+            ("r = sc.parallelize(rows)", "sc.parallelize(rows)", None),
+            (
+                "r = sc.parallelize([*rows])",
+                "sc.parallelize([*rows])",
+                None,
+            ),
+            (
+                "xs = []\nfor i in y:\n    xs.append(i)\nr = sc.parallelize(xs)",
+                "sc.parallelize(xs)",
+                None,
+            ),
+            (
+                "if c:\n    xs = ['a']\nelse:\n    xs = load()\nr = sc.parallelize(xs)",
+                "sc.parallelize(xs)",
+                None,
+            ),
+            ("r = sc.textFile('/x')", "sc.textFile('/x')", None),
+        ] {
+            let (ty, f) = facts(body, needle);
+            assert_eq!(ty, Ty::Rdd, "{body}");
+            assert_eq!(f.bounded, rows, "{body}");
+            assert_eq!(f.local, rows.is_some(), "{body}");
+            assert_eq!(Size::of(&f).fits_driver(), rows.is_some(), "{body}");
+        }
+    }
+
+    #[test]
+    fn driver_data_reaches_rows_and_frames() {
+        let (ty, f) = facts(
+            "r = spark.createDataFrame([(1,)]).rdd.map(f)",
+            "spark.createDataFrame([(1,)]).rdd.map(f)",
+        );
+        assert_eq!(ty, Ty::Rdd);
+        assert!(f.local);
+        let (ty, f) = facts(
+            "r = sc.parallelize([1, 2]).collect()",
+            "sc.parallelize([1, 2]).collect()",
+        );
+        assert!(matches!(ty, Ty::List(_)) && f.local && f.from_spark);
+        let (_, f) = facts(
+            "r = spark.table('t').rdd.map(f)",
+            "spark.table('t').rdd.map(f)",
+        );
+        assert!(!f.local && f.bounded.is_none());
+    }
+
+    #[test]
+    fn raw_file_text() {
+        for (body, needle, text) in [
+            ("r = sc.textFile('/x')", "sc.textFile('/x')", true),
+            (
+                "r = sc.textFile('/x').filter(f).coalesce(4)",
+                "sc.textFile('/x').filter(f).coalesce(4)",
+                true,
+            ),
+            (
+                "r = sc.textFile('/a').union(sc.textFile('/b'))",
+                "sc.textFile('/a').union(sc.textFile('/b'))",
+                true,
+            ),
+            (
+                "r = sc.wholeTextFiles('/x').values()",
+                "sc.wholeTextFiles('/x').values()",
+                true,
+            ),
+            (
+                "r = sc.wholeTextFiles('/x').map(lambda kv: kv[1])",
+                "sc.wholeTextFiles('/x').map(lambda kv: kv[1])",
+                true,
+            ),
+            (
+                "r = sc.wholeTextFiles('/x').map(lambda p: p[-1])",
+                "sc.wholeTextFiles('/x').map(lambda p: p[-1])",
+                true,
+            ),
+            (
+                "r = sc.wholeTextFiles('/x').map(operator.itemgetter(1))",
+                "sc.wholeTextFiles('/x').map(operator.itemgetter(1))",
+                true,
+            ),
+            (
+                "second = lambda kv: kv[1]\nr = sc.wholeTextFiles('/x').map(f=second)",
+                "sc.wholeTextFiles('/x').map(f=second)",
+                true,
+            ),
+            (
+                "w = sc.wholeTextFiles('/x').filter(f)\nr = w.values()",
+                "w.values()",
+                true,
+            ),
+            // The pairs themselves, other items, other steps: not file text.
+            (
+                "r = sc.wholeTextFiles('/x')",
+                "sc.wholeTextFiles('/x')",
+                false,
+            ),
+            (
+                "r = sc.wholeTextFiles('/x').keys()",
+                "sc.wholeTextFiles('/x').keys()",
+                false,
+            ),
+            (
+                "r = sc.wholeTextFiles('/x').map(lambda kv: kv[0])",
+                "sc.wholeTextFiles('/x').map(lambda kv: kv[0])",
+                false,
+            ),
+            (
+                "r = sc.wholeTextFiles('/x').map(lambda k, v: v)",
+                "sc.wholeTextFiles('/x').map(lambda k, v: v)",
+                false,
+            ),
+            (
+                "r = sc.textFile('/x').map(lambda l: l[1])",
+                "sc.textFile('/x').map(lambda l: l[1])",
+                false,
+            ),
+            (
+                "r = sc.textFile('/x').map(str.strip)",
+                "sc.textFile('/x').map(str.strip)",
+                false,
+            ),
+            (
+                "r = sc.textFile('/a').union(rdd)",
+                "sc.textFile('/a').union(rdd)",
+                false,
+            ),
+            ("r = sc.parallelize(['a'])", "sc.parallelize(['a'])", false),
+        ] {
+            let (ty, f) = facts(body, needle);
+            assert_eq!(ty, Ty::Rdd, "{body}");
+            assert_eq!(f.raw_file_text(), text, "{body}");
+        }
     }
 }

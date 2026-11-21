@@ -2,19 +2,33 @@
 
 use ruff_python_ast::{self as ast, Expr};
 use ruff_text_size::{Ranged, TextRange};
-use sparklint_semantic::str_literal;
+use sparklint_semantic::columns::ColumnRefs;
 
 use super::Rule;
-use super::actions::method_range;
 use super::helpers::*;
+use super::msg::Msg;
 use crate::checker::Checker;
-use crate::diagnostic::{Diagnostic, Edit, Fix};
+use crate::diagnostic::{Edit, Fix};
+use crate::msg;
 
 /// STY002/003 (see [`super::Rule`]).
 pub const RULES: &[Rule] = &[
-    Rule::new("STY002").call(join_missing_how),
-    Rule::new("STY003").call(redundant_drop_before_select),
+    Rule::new("STY002").call(join_missing_how).msgs(&[STY002]),
+    Rule::new("STY003")
+        .call(redundant_drop_before_select)
+        .msgs(&[STY003]),
 ];
+
+const STY002: Msg = Msg::new(
+    "STY002",
+    "missing-how",
+    "join() without an explicit how= — state the join type (defaults to inner).",
+);
+const STY003: Msg = Msg::new(
+    "STY003",
+    "drop-before-select",
+    "drop() before select() of explicit columns is redundant — select() already picks the columns.",
+);
 
 pub fn join_missing_how(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
     let Some(sc) = ch.model.spark_call_named(expr, &["join"]) else {
@@ -36,11 +50,7 @@ pub fn join_missing_how(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
     if args.args.is_empty() && args.keywords.is_empty() {
         return;
     }
-    let mut d = Diagnostic::new(
-        "STY002",
-        "join() without an explicit how= — state the join type (defaults to inner).",
-        method_range(expr),
-    );
+    let mut d = msg!(STY002, method_range(expr));
     let last_end = args
         .args
         .iter()
@@ -57,42 +67,15 @@ pub fn join_missing_how(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
     ch.report(d);
 }
 
-fn is_star_or_dynamic(ch: &Checker, e: &Expr) -> bool {
+/// A select argument whose columns are not spelled out (`*cols`, a list or `.columns`,
+/// a variable that is not a Column).
+fn is_dynamic(ch: &Checker, e: &Expr) -> bool {
     match e {
         Expr::Starred(_) => true,
-        Expr::StringLiteral(s) => s.value.to_str() == "*" || s.value.to_str().ends_with(".*"),
         Expr::Attribute(a) => a.attr.as_str() == "columns",
         Expr::List(_) | Expr::ListComp(_) | Expr::Name(_) => !ch.model.is_column(e),
-        Expr::Call(c) => {
-            ch.model.is_spark_function(&c.func, "col")
-                && c.arguments
-                    .args
-                    .first()
-                    .and_then(str_literal)
-                    .is_some_and(|s| s == "*" || s.ends_with(".*"))
-        }
         _ => false,
     }
-}
-
-fn mentioned_names(e: &Expr) -> Vec<String> {
-    let mut out = Vec::new();
-    walk_exprs(e, &mut |x| {
-        if let Some(s) = str_literal(x) {
-            out.push(s.to_string());
-            // SQL expression strings (`F.expr("id + 1")`, `"t.id"`) name columns as
-            // identifier tokens.
-            out.extend(
-                s.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
-                    .filter(|t| !t.is_empty() && t != &s)
-                    .map(str::to_string),
-            );
-        }
-        if let Expr::Attribute(a) = x {
-            out.push(a.attr.as_str().to_string());
-        }
-    });
-    out
 }
 
 pub fn redundant_drop_before_select(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
@@ -109,17 +92,31 @@ pub fn redundant_drop_before_select(ch: &mut Checker, c: &ast::ExprCall, expr: &
         return;
     }
     let (dc, drecv) = (drop.call, drop.receiver);
-    if c.arguments.args.iter().any(|a| is_star_or_dynamic(ch, a)) {
+    if c.arguments.args.iter().any(|a| is_dynamic(ch, a)) {
         return;
     }
-    let mut d = Diagnostic::new(
-        "STY003",
-        "drop() before select() of explicit columns is redundant — select() already picks the columns.",
-        method_range(recv),
-    );
-    let dropped: Vec<String> = dc.arguments.args.iter().flat_map(mentioned_names).collect();
-    let selected: Vec<String> = c.arguments.args.iter().flat_map(mentioned_names).collect();
-    let refers_dropped = dropped.iter().any(|x| selected.contains(x));
+    let selected: Vec<ColumnRefs> = c
+        .arguments
+        .args
+        .iter()
+        .map(|a| ColumnRefs::of(ch.model, a))
+        .collect();
+    if selected.iter().any(|r| r.star) {
+        return; // `"*"` / `"t.*"` selects the remaining columns
+    }
+    let mut d = msg!(STY003, method_range(recv));
+    let dropped: Vec<ColumnRefs> = dc
+        .arguments
+        .args
+        .iter()
+        .map(|a| ColumnRefs::of(ch.model, a))
+        .collect();
+    // The fix is safe only when no selected column can be a dropped one.
+    let refers_dropped = dropped.iter().chain(&selected).any(|r| r.unknown)
+        || dropped
+            .iter()
+            .flat_map(|r| &r.names)
+            .any(|x| selected.iter().any(|s| s.contains(x)));
     if !refers_dropped {
         d = d.with_fix(Fix::safe(
             "Remove the .drop()",

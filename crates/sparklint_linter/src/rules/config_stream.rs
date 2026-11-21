@@ -5,27 +5,110 @@
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{self as ast, Expr};
 use ruff_text_size::{Ranged, TextRange, TextSize};
-use sparklint_semantic::Ty;
+use sparklint_semantic::{SqlText, Ty};
 
 use super::Rule;
-use super::actions::method_range;
 use super::conf::{Conf, Finding, Setting, Via};
+use super::helpers::method_range;
 use super::io_settings::IoSettings;
+use super::msg::Msg;
 use crate::checker::Checker;
-use crate::diagnostic::{Diagnostic, Edit, Fix, Severity};
+use crate::diagnostic::{Edit, Fix, Severity};
+use crate::{finding, msg};
 
 /// IOD002, CFG003, STM001/002/010/011 (see [`super::Rule`]).
 pub const RULES: &[Rule] = &[
-    Rule::new("IOD002").call(jdbc_read_unpartitioned),
-    Rule::new("CFG003").call(static_conf_at_runtime),
-    Rule::new("STM001").call(stream_missing_checkpoint),
-    Rule::new("STM002").call(trigger_once_deprecated),
-    Rule::new("STM010").call(kafka_stream_uncapped_batch),
-    Rule::new("STM011").conf(&Conf::new(
-        &["spark.sql.streaming.stateStore.providerClass"],
-        heap_state_store_explicit,
-    )),
+    Rule::new("IOD002")
+        .call(jdbc_read_unpartitioned)
+        .msgs(&[IOD002, IOD002_QUERY]),
+    Rule::new("CFG003").call(static_conf_at_runtime).msgs(&[
+        CFG003_RUNTIME,
+        CFG003_BUILDER,
+        CFG003_SPARK_CONF,
+    ]),
+    Rule::new("STM001")
+        .call(stream_missing_checkpoint)
+        .msgs(&[STM001]),
+    Rule::new("STM002")
+        .call(trigger_once_deprecated)
+        .msgs(&[STM002]),
+    Rule::new("STM010")
+        .call(kafka_stream_uncapped_batch)
+        .msgs(&[STM010_EARLIEST, STM010_TIMESTAMP, STM010_LATEST]),
+    Rule::new("STM011")
+        .conf(&Conf::new(
+            &["spark.sql.streaming.stateStore.providerClass"],
+            heap_state_store_explicit,
+        ))
+        .msgs(&[STM011]),
 ];
+
+const STM011: Msg = Msg::new(
+    "STM011",
+    "heap-state-store",
+    "Streaming state store set to HDFSBackedStateStoreProvider: all state lives in the executor JVM heap, so as the number of keys grows micro-batches slow down in garbage collection and executors run out of memory. A query's provider cannot change for an existing checkpoint, so this choice is locked in.",
+)
+.help("Use the RocksDB provider (org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider; the Databricks default from DBR 17.3), or remove the line. Keep the heap store only for queries with small, bounded state.");
+const IOD002_TEXT: &str = "JDBC read without partitionColumn/lowerBound/upperBound/numPartitions (or predicates) runs on a single connection and task.";
+const IOD002: Msg = Msg::new("IOD002", "unpartitioned", IOD002_TEXT)
+    .help("Add column/lowerBound/upperBound/numPartitions (or predicates=[...]) so the read is split across executors.");
+const IOD002_QUERY: Msg = Msg::new("IOD002", "unpartitioned-query", IOD002_TEXT)
+    .help("Spark does not allow partitionColumn with the `query` option: pass the query as `dbtable` (\"(<query>) t\") and add partitionColumn/lowerBound/upperBound/numPartitions (or use predicates=[...]) so the read is split across executors.");
+pub(crate) const CFG008_JDBC: Msg = Msg::new(
+    "CFG008",
+    "jdbc-pushdown-disabled",
+    "JDBC read with pushDownPredicate=false: filters are not sent to the database, so the whole table is copied over the network and filtered in Spark.",
+)
+.help("Drop the option (the default pushes filters down), or put the filter into the `query`/`dbtable` subquery yourself.");
+const CFG003_HELP: &str = "Set it in the cluster / job compute Spark config instead.";
+const CFG003_RUNTIME: Msg = Msg::new(
+    "CFG003",
+    "runtime",
+    "{key} cannot be changed at runtime — this has no effect (and raises CANNOT_MODIFY_CONFIG on Spark Connect/serverless).",
+)
+.help(CFG003_HELP);
+const CFG003_BUILDER: Msg = Msg::new(
+    "CFG003",
+    "notebook-builder",
+    "{key} is a static setting: SparkSession.builder.config() on the already-running notebook session ignores it.",
+)
+.help(CFG003_HELP);
+const CFG003_SPARK_CONF: Msg = Msg::new(
+    "CFG003",
+    "notebook-spark-conf",
+    "{key} is a static setting: a SparkConf built in a notebook cannot change the already-running session, which ignores it.",
+)
+.help(CFG003_HELP);
+const STM001: Msg = Msg::new(
+    "STM001",
+    "no-checkpoint",
+    "writeStream.{method}() without checkpointLocation — no exactly-once, progress is lost on restart.",
+)
+.help(".option(\"checkpointLocation\", f\"{{CHECKPOINT_ROOT}}/<query>\") — one location per query.");
+const STM010_HELP: &str = "Add .option(\"maxOffsetsPerTrigger\", <records per batch>); trigger(availableNow=True) honours it and drains a backlog in several batches. Low-volume topics can ignore this.";
+const STM010_EARLIEST: Msg = Msg::new(
+    "STM010",
+    "earliest",
+    "Kafka stream from the earliest offsets without maxOffsetsPerTrigger: the first micro-batch reads the whole retained topic at once (long batch, executor OOM risk, cluster sized for the spike).",
+)
+.help(STM010_HELP);
+const STM010_TIMESTAMP: Msg = Msg::new(
+    "STM010",
+    "timestamp",
+    "Kafka stream from a start timestamp without maxOffsetsPerTrigger: the first micro-batch reads everything since that time at once (long batch, executor OOM risk, cluster sized for the spike).",
+)
+.help(STM010_HELP);
+const STM010_LATEST: Msg = Msg::new(
+    "STM010",
+    "latest",
+    "Kafka stream without maxOffsetsPerTrigger: after downtime or a lagging restart, one micro-batch reads the whole backlog at once.",
+)
+.help(STM010_HELP);
+const STM002: Msg = Msg::new(
+    "STM002",
+    "trigger-once",
+    "trigger(once=True) is deprecated — use trigger(availableNow=True) (respects rate limits, processes the backlog in batches).",
+);
 
 // ------------------------------------------------------------------ STM011
 
@@ -37,21 +120,10 @@ fn is_heap_provider(v: &str) -> bool {
 }
 
 fn heap_state_store_explicit(s: &Setting) -> Option<Finding> {
-    is_heap_provider(s.value).then(|| {
-        Finding::new(
-            "Streaming state store set to HDFSBackedStateStoreProvider: all state lives in the executor JVM heap, so as the number of keys grows micro-batches slow down in garbage collection and executors run out of memory. A query's provider cannot change for an existing checkpoint, so this choice is locked in.",
-            "Use the RocksDB provider (org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider; the Databricks default from DBR 17.3), or remove the line. Keep the heap store only for queries with small, bounded state.",
-        )
-        .info()
-    })
+    is_heap_provider(s.value).then(|| finding!(STM011).info())
 }
 
 // ------------------------------------------------------------------ IOD002
-
-fn small_query(text: &str) -> bool {
-    let t = text.to_ascii_lowercase();
-    t.contains(" where ") || t.contains(" limit ") || t.contains(" top ")
-}
 
 pub fn jdbc_read_unpartitioned(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) {
     let Some(sc) = ch.model.spark_call(expr) else {
@@ -72,16 +144,19 @@ pub fn jdbc_read_unpartitioned(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr
     if io.has("partitioncolumn") || io.has("predicates") {
         return;
     }
-    let small = io.has("query")
-        || ["dbtable", "query"]
-            .iter()
-            .any(|k| io.text(k).is_some_and(|t| small_query(&t)));
-    let mut d = Diagnostic::new(
-        "IOD002",
-        "JDBC read without partitionColumn/lowerBound/upperBound/numPartitions (or predicates) runs on a single connection and task.",
-        method_range(expr),
-    )
-    .with_help("Add column/lowerBound/upperBound/numPartitions (or predicates=[...]) so the read is split across executors.");
+    // A subquery that filters or limits its rows reads a deliberate (likely
+    // small) extract: info.
+    let small = ["dbtable", "query"].iter().any(|k| {
+        io.text(k)
+            .is_some_and(|t| SqlText::new(&t).restricts_rows())
+    });
+    // Spark rejects `partitionColumn` together with the `query` option.
+    let m = if io.has("query") && !io.has("dbtable") {
+        &IOD002_QUERY
+    } else {
+        &IOD002
+    };
+    let mut d = msg!(m, method_range(expr));
     if small {
         d = d.with_severity(Severity::Info);
     }
@@ -107,16 +182,7 @@ pub(crate) fn jdbc_pushdown_disabled(ch: &mut Checker, _c: &ast::ExprCall, expr:
             .text("pushdownpredicate")
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("false"));
     if disabled {
-        ch.report(
-            Diagnostic::new(
-                "CFG008",
-                "JDBC read with pushDownPredicate=false: filters are not sent to the database, so the whole table is copied over the network and filtered in Spark.",
-                method_range(expr),
-            )
-            .with_help(
-                "Drop the option (the default pushes filters down), or put the filter into the `query`/`dbtable` subquery yourself.",
-            ),
-        );
+        ch.report(msg!(CFG008_JDBC, method_range(expr)));
     }
 }
 
@@ -262,28 +328,16 @@ pub fn static_conf_at_runtime(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) 
             continue;
         }
         let d = match w.via {
-            v if v.is_runtime() => Diagnostic::new(
-                "CFG003",
-                format!(
-                    "{key} cannot be changed at runtime — this has no effect (and raises CANNOT_MODIFY_CONFIG on Spark Connect/serverless)."
-                ),
-                w.at,
-            ),
-            Via::Builder if ch.is_notebook() => Diagnostic::new(
-                "CFG003",
-                format!("{key} is a static setting: SparkSession.builder.config() on the already-running notebook session ignores it."),
-                w.at,
-            )
-            .with_severity(Severity::Warning),
-            Via::SparkConf if ch.is_notebook() => Diagnostic::new(
-                "CFG003",
-                format!("{key} is a static setting: a SparkConf built in a notebook cannot change the already-running session, which ignores it."),
-                w.at,
-            )
-            .with_severity(Severity::Warning),
+            v if v.is_runtime() => msg!(CFG003_RUNTIME, w.at, key),
+            Via::Builder if ch.is_notebook() => {
+                msg!(CFG003_BUILDER, w.at, key).with_severity(Severity::Warning)
+            }
+            Via::SparkConf if ch.is_notebook() => {
+                msg!(CFG003_SPARK_CONF, w.at, key).with_severity(Severity::Warning)
+            }
             _ => continue,
         };
-        ch.report(d.with_help("Set it in the cluster / job compute Spark config instead."));
+        ch.report(d);
     }
 }
 
@@ -309,20 +363,36 @@ pub fn stream_missing_checkpoint(ch: &mut Checker, _c: &ast::ExprCall, expr: &Ex
     if matches!(io.format(), Some("console" | "memory" | "noop")) {
         return; // debug sinks (ACT010)
     }
-    ch.report(
-        Diagnostic::new(
-            "STM001",
-            format!("writeStream.{m}() without checkpointLocation — no exactly-once, progress is lost on restart."),
-            method_range(expr),
-        )
-        .with_help(".option(\"checkpointLocation\", f\"{CHECKPOINT_ROOT}/<query>\") — one location per query."),
-    );
+    ch.report(msg!(STM001, method_range(expr), method = m));
 }
 
 // ------------------------------------------------------------------ STM010
 
 /// Options that cap how much a Kafka micro-batch reads.
 const KAFKA_CAPS: &[&str] = &["maxoffsetspertrigger", "maxbytespertrigger"];
+
+/// Where a new Kafka query starts reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KafkaStart {
+    /// `startingOffsets` "earliest" or a per-partition JSON offsets map.
+    Earliest,
+    /// `startingTimestamp` / `startingOffsetsByTimestamp` (they win over `startingOffsets`).
+    Timestamp,
+    /// The default `latest` (or an unknown value).
+    Latest,
+}
+
+fn kafka_start(starting_offsets: Option<&str>, by_timestamp: bool) -> KafkaStart {
+    if by_timestamp {
+        return KafkaStart::Timestamp;
+    }
+    let v = starting_offsets.map(|v| v.trim().to_ascii_lowercase());
+    if v.is_some_and(|v| v == "earliest" || v.starts_with('{')) {
+        KafkaStart::Earliest
+    } else {
+        KafkaStart::Latest
+    }
+}
 
 pub fn kafka_stream_uncapped_batch(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) {
     let Some(sc) = ch.model.spark_call_named(expr, &["load"]) else {
@@ -340,22 +410,17 @@ pub fn kafka_stream_uncapped_batch(ch: &mut Checker, _c: &ast::ExprCall, expr: &
     if KAFKA_CAPS.iter().any(|k| io.has(k)) {
         return;
     }
-    let backlog = io
-        .text("startingoffsets")
-        .map(|v| v.trim().to_ascii_lowercase())
-        .is_some_and(|v| v == "earliest" || v.starts_with('{'));
-    let mut d = Diagnostic::new(
-        "STM010",
-        if backlog {
-            "Kafka stream from the earliest offsets without maxOffsetsPerTrigger: the first micro-batch reads the whole retained topic at once (long batch, executor OOM risk, cluster sized for the spike)."
-        } else {
-            "Kafka stream without maxOffsetsPerTrigger: after downtime or a lagging restart, one micro-batch reads the whole backlog at once."
-        },
-        method_range(expr),
-    )
-    .with_help(
-        "Add .option(\"maxOffsetsPerTrigger\", <records per batch>); trigger(availableNow=True) honours it and drains a backlog in several batches. Low-volume topics can ignore this.",
+    let start = kafka_start(
+        io.text("startingoffsets").as_deref(),
+        io.has("startingtimestamp") || io.has("startingoffsetsbytimestamp"),
     );
+    let backlog = start != KafkaStart::Latest;
+    let m = match start {
+        KafkaStart::Earliest => &STM010_EARLIEST,
+        KafkaStart::Timestamp => &STM010_TIMESTAMP,
+        KafkaStart::Latest => &STM010_LATEST,
+    };
+    let mut d = msg!(m, method_range(expr));
     if !backlog {
         d = d.with_severity(Severity::Info);
     }
@@ -377,12 +442,15 @@ pub fn trigger_once_deprecated(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr)
     }) else {
         return;
     };
-    let mut d = Diagnostic::new(
-        "STM002",
-        "trigger(once=True) is deprecated — use trigger(availableNow=True) (respects rate limits, processes the backlog in batches).",
-        kw.range,
-    );
-    if ch.settings.spark_version >= (3, 3) {
+    let mut d = msg!(STM002, kw.range);
+    // Only one trigger may be set: with another trigger keyword the call already raises
+    // ("Multiple triggers not allowed"), and swapping the keyword would not fix that.
+    let other_trigger = c.arguments.keywords.iter().any(|k| {
+        k.arg
+            .as_ref()
+            .is_some_and(|a| matches!(a.as_str(), "processingTime" | "continuous" | "availableNow"))
+    }) || !c.arguments.args.is_empty();
+    if ch.settings.spark_version >= (3, 3) && !other_trigger {
         d = d.with_fix(Fix::safe(
             "Replace with `availableNow=True`",
             vec![Edit::replace(kw.range, "availableNow=True")],
@@ -393,7 +461,22 @@ pub fn trigger_once_deprecated(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr)
 
 #[cfg(test)]
 mod tests {
-    use super::is_heap_provider;
+    use super::{KafkaStart, is_heap_provider, kafka_start};
+
+    #[test]
+    fn kafka_start_table() {
+        for (offsets, by_ts, want) in [
+            (None, false, KafkaStart::Latest),
+            (Some("latest"), false, KafkaStart::Latest),
+            (Some(" Earliest "), false, KafkaStart::Earliest),
+            (Some("{\"t\": {\"0\": 5}}"), false, KafkaStart::Earliest),
+            (None, true, KafkaStart::Timestamp),
+            (Some("latest"), true, KafkaStart::Timestamp),
+            (Some("earliest"), true, KafkaStart::Timestamp),
+        ] {
+            assert_eq!(kafka_start(offsets, by_ts), want, "{offsets:?} {by_ts}");
+        }
+    }
 
     #[test]
     fn heap_provider_names() {

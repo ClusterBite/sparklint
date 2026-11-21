@@ -19,9 +19,11 @@ use crate::diagnostic::Diagnostic;
 /// `(higher, lower)`: a `lower` finding is dropped when a `higher` finding has the
 /// same site.
 pub const PRECEDENCE: &[(&str, &str)] = &[
-    // collect-for-driver-compute > collect-unbounded / driver-row-iteration
+    // collect-for-driver-compute > collect-unbounded / driver-row-iteration /
+    // topandas-unbounded (site: the pull call)
     ("ACT009", "ACT002"),
     ("ACT009", "ACT004"),
+    ("ACT009", "ACT003"),
     // driver-row-iteration > collect-unbounded / topandas-unbounded
     ("ACT004", "ACT002"),
     ("ACT004", "ACT003"),

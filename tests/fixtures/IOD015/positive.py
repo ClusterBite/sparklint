@@ -12,7 +12,7 @@ f = spark.read.csv(f"/raw/{day}/*.csv.gz")  # expect: IOD015
 g = spark.read.csv(["/raw/a.csv", "/raw/b.csv.gz"])  # expect: IOD015
 
 PATH = "/landing/dump.json.gz"
-h = spark.read.option("multiLine", "true").json(PATH)  # expect: IOD015
+h = spark.read.option("mode", "PERMISSIVE").json(PATH)  # expect: IOD015
 
 reader = spark.read.format("text")
 i = reader.load("/logs/*.gz")  # expect: IOD015
@@ -23,3 +23,8 @@ al = (
     .option("cloudFiles.format", "csv")
     .load("/mnt/landing/*.csv.gz")  # expect: IOD015
 )
+
+# The streaming text reader's keyword is `path` (the batch one's is `paths`).
+st = spark.readStream.text(path="/stream/logs/*.gz")  # expect: IOD015
+# A path given as an option.
+path_option = spark.read.format("csv").option("path", "/raw/opt.csv.gz").load()  # expect: IOD015

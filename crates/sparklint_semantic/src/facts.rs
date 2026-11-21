@@ -5,12 +5,16 @@
 //!   value whose origin sets nothing),
 //! - how it merges where control-flow paths meet ([`Fact::merge`]: if/else, loop
 //!   back edges, several `return`s),
-//! - what one DataFrame or WindowSpec step does to it ([`Fact::step`]),
+//! - what one DataFrame, RDD or WindowSpec step does to it ([`Fact::step`]),
 //! - and (in its doc comment) where it starts.
 //!
 //! The [`facts!`] table below turns the rows into the [`Facts`] struct, its
 //! [`Facts::meet`], [`Facts::NONE`] and [`Facts::after`]. A new fact is one row
 //! type + one table line; `infer.rs` only says *which* [`Step`] a call is.
+
+use std::hash::{Hash, Hasher};
+
+use ruff_text_size::TextRange;
 
 use crate::types::Ty;
 
@@ -21,12 +25,15 @@ pub trait Fact {
     const UNKNOWN: Self::Value;
     /// The fact where two control-flow paths meet.
     fn merge(a: Self::Value, b: Self::Value) -> Self::Value;
-    /// The fact after one DataFrame / WindowSpec step.
+    /// The fact after one DataFrame / RDD / WindowSpec step.
     fn step(v: Self::Value, s: &Step) -> Self::Value;
 }
 
-/// A step from one DataFrame to the next, or from one WindowSpec to the next, as far
-/// as the facts are concerned. `infer.rs` classifies the call; the rows decide.
+/// A step from one DataFrame (or RDD) to the next, or from one WindowSpec to the next,
+/// as far as the facts are concerned. `infer.rs` classifies the call; the rows decide.
+/// RDD steps reuse the DataFrame variants (`filter` is [`Step::Reduce`], `coalesce`
+/// [`Step::Keep`], `union` [`Step::Combine`], `map` [`Step::Other`]) plus
+/// [`Step::Values`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     // ---- DataFrame -> DataFrame (and DataFrame property access)
@@ -40,10 +47,24 @@ pub enum Step {
     Reduce,
     /// `cache()` / `persist()` / `checkpoint()` / `localCheckpoint()`.
     Cache,
-    /// `join` / `crossJoin` / `union*` / `lateralJoin` with the first argument's facts.
-    Combine { union: bool, other: Option<Facts> },
+    /// `join` / `crossJoin` / `union*` / `lateralJoin` with the first argument's facts;
+    /// `keeps_columns`: the result has the receiver's columns (a union, a semi / anti
+    /// join).
+    Combine {
+        union: bool,
+        other: Option<Facts>,
+        keeps_columns: bool,
+    },
+    /// Another rows-only step: the receiver's columns, in order (`orderBy`,
+    /// `repartition`, `coalesce`, `alias`, `hint`, `withWatermark`, `unpersist`).
+    Keep,
+    /// A `select(..)` whose arguments say which columns it picks.
+    Project(Columns),
     /// Any other DataFrame -> DataFrame step (`withColumn`, `select`, a property, ...).
     Other,
+    // ---- RDD -> RDD
+    /// The second item of each pair: `rdd.values()`, `rdd.map(lambda kv: kv[1])`.
+    Values,
     // ---- WindowSpec -> WindowSpec
     /// `partitionBy(<at least one key>)`.
     PartitionBy,
@@ -60,11 +81,93 @@ impl Step {
     }
 }
 
+// ------------------------------------------------------------------- columns
+
+/// The identity of an ordered column list: the names of a literal list
+/// (`select("a", "b")`, `select(["a", "b"])`), or the variable holding the list
+/// (`select(cols)`: the name and the bindings that reach it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ColumnList(u64);
+
+impl ColumnList {
+    /// A literal list of column names, in order.
+    pub fn names<'s>(names: impl IntoIterator<Item = &'s str>) -> Self {
+        let mut h = std::hash::DefaultHasher::new();
+        0u8.hash(&mut h);
+        for n in names {
+            n.hash(&mut h);
+        }
+        Self(h.finish())
+    }
+
+    /// The list a name holds, identified by the name and the bindings reaching it.
+    pub fn variable(name: &str, bindings: &[TextRange]) -> Self {
+        let mut h = std::hash::DefaultHasher::new();
+        1u8.hash(&mut h);
+        name.hash(&mut h);
+        bindings.hash(&mut h);
+        Self(h.finish())
+    }
+}
+
+/// Where a frame whose columns are not spelled out came from: two frames with the
+/// same origin have the same columns in the same order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Origin {
+    /// The value of this expression (a read, a call, an aggregate, ...).
+    Expr(TextRange),
+    /// The value of a name reached by these bindings (a parameter, a loop variable, a
+    /// name bound on several paths), or of an attribute chain with no calls
+    /// (`self.df`, by its dotted text): a hash.
+    Name(u64),
+}
+
+impl Origin {
+    /// A name reached by `bindings` (their target ranges).
+    pub fn bindings(name: &str, bindings: &[TextRange]) -> Self {
+        let mut h = std::hash::DefaultHasher::new();
+        0u8.hash(&mut h);
+        name.hash(&mut h);
+        bindings.hash(&mut h);
+        Origin::Name(h.finish())
+    }
+
+    /// An attribute chain with no calls, by its dotted text (`self.df`).
+    pub fn path<'s>(parts: impl IntoIterator<Item = &'s str>) -> Self {
+        let mut h = std::hash::DefaultHasher::new();
+        1u8.hash(&mut h);
+        for p in parts {
+            p.hash(&mut h);
+        }
+        Origin::Name(h.finish())
+    }
+}
+
+/// Which columns, in which order, a DataFrame has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Columns {
+    /// Not known here. On a value the oracle typed, the model's
+    /// `frame_columns` answers [`Columns::SameAs`] its own origin instead.
+    #[default]
+    Unknown,
+    /// Exactly this column list, in order (a `select` of a readable list).
+    Known(ColumnList),
+    /// The same columns, in the same order, as the frame at this origin.
+    SameAs(Origin),
+}
+
+impl Columns {
+    /// Both sides have the same columns in the same order (neither unknown).
+    pub fn agrees(self, other: Columns) -> bool {
+        self != Columns::Unknown && self == other
+    }
+}
+
 // ------------------------------------------------------------------- the rows
 
 /// At most this many rows (`u64::MAX` = bounded by a non-literal `limit`).
-/// Origin: `createDataFrame(<literal list>)`, small `range(n)`, `spark.sql(".. LIMIT n")`,
-/// `take(n)`/`head(n)`/`first()` results. Merge: the larger bound if bounded on both
+/// Origin: `createDataFrame(<literal list>)`, `sc.parallelize(<literal list>)`, small
+/// `range(n)`, `spark.sql(".. LIMIT n")`, `take(n)`/`head(n)`/`first()` results. Merge: the larger bound if bounded on both
 /// paths. Step: `limit` lowers it, aggregates set 1, `describe` 10, join multiplies and
 /// union adds the two bounds.
 pub struct Bounded;
@@ -82,11 +185,34 @@ impl Fact for Bounded {
             Step::Limit(n) => Some(v.map_or(*n, |b| b.min(*n))),
             Step::Aggregate => Some(1),
             Step::Describe => Some(v.map_or(10, |b| b.min(10))),
-            Step::Combine { union, other } => match (v, other.and_then(|o| o.bounded)) {
+            Step::Combine { union, other, .. } => match (v, other.and_then(|o| o.bounded)) {
                 (Some(a), Some(b)) if *union => Some(a.saturating_add(b)),
                 (Some(a), Some(b)) => Some(a.saturating_mul(b)),
                 _ => None,
             },
+            _ => v,
+        }
+    }
+}
+
+/// The row bound comes from a limit-like step or a small origin, not only from an
+/// aggregate: a one-row `agg(..)`, `describe()` / `summary()` or aggregate-only SQL over
+/// an unbounded frame still reads every input row. Origin: `createDataFrame(<literal
+/// list>)`, small `range(n)`, `spark.sql(".. LIMIT n")` and `EXPLAIN` (not when the query
+/// aggregates the table it reads). Merge: on every path. Step: `limit` sets it,
+/// aggregates keep it (`df.limit(10).agg(..)` read ten rows), join/union keep it only
+/// when both sides have it.
+pub struct RowLimited;
+impl Fact for RowLimited {
+    type Value = bool;
+    const UNKNOWN: bool = false;
+    fn merge(a: bool, b: bool) -> bool {
+        a && b
+    }
+    fn step(v: bool, s: &Step) -> bool {
+        match s {
+            Step::Limit(_) => true,
+            Step::Combine { other, .. } => v && other.is_some_and(|o| o.row_limited),
             _ => v,
         }
     }
@@ -161,8 +287,9 @@ impl Fact for FromSpark {
 
 /// DataFrame built from driver-side data (or a catalog metadata command such as
 /// `spark.sql("SHOW TBLPROPERTIES t")`) and kept through row-wise steps: it fits in
-/// driver memory, so a shuffle or a collect of it is cheap. Origin: [`Local::of_data`]
-/// and `SqlText::catalog_metadata`. Merge: on every path. Step: kept; a join/union is
+/// driver memory, so a shuffle or a collect of it is cheap. Origin: [`Local::of_data`],
+/// `SqlText::catalog_metadata` and, for RDDs, `sc.parallelize(<literal list>)` (`df.rdd`
+/// keeps the frame's fact). Merge: on every path. Step: kept; a join/union is
 /// local only when both sides are.
 pub struct Local;
 impl Local {
@@ -282,6 +409,78 @@ impl Fact for FreshBuilder {
     }
 }
 
+/// Which columns, in which order, the frame has ([`Columns`]). Origin: none
+/// ([`Columns::Unknown`]: the model's `frame_columns` names the value's own origin).
+/// Merge: equal on both paths, else unknown. Step: rows-only steps (`limit`, filters,
+/// de-duplication, caches, sorts, repartitions, `alias`, `hint`, a union, a semi / anti
+/// join: [`Step::Keep`] and the column-keeping [`Step::Combine`]) keep it, a `select` of a
+/// readable list sets it ([`Step::Project`]), any other step forgets it.
+pub struct FrameColumns;
+impl Fact for FrameColumns {
+    type Value = Columns;
+    const UNKNOWN: Columns = Columns::Unknown;
+    fn merge(a: Columns, b: Columns) -> Columns {
+        if a == b { a } else { Columns::Unknown }
+    }
+    fn step(v: Columns, s: &Step) -> Columns {
+        match s {
+            Step::Limit(_) | Step::Reduce | Step::Cache | Step::Keep => v,
+            Step::Combine { keeps_columns, .. } => {
+                if *keeps_columns {
+                    v
+                } else {
+                    Columns::Unknown
+                }
+            }
+            Step::Project(c) => *c,
+            Step::Aggregate | Step::Describe | Step::Other | Step::Values => Columns::Unknown,
+            Step::PartitionBy | Step::OrderBy | Step::Frame { .. } => v,
+        }
+    }
+}
+
+/// What an RDD holds when it was read from files as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FileText {
+    /// Not read from text files, or not known on every path.
+    #[default]
+    Unknown,
+    /// `(path, contents)` pairs of whole files: `sc.wholeTextFiles(p)`.
+    PathAndText,
+    /// The raw text of files: the lines of `sc.textFile(p)`, the contents of
+    /// `sc.wholeTextFiles(p).values()`. `spark.read.json(p)` / `spark.read.text(p)`
+    /// could read the same files directly.
+    Text,
+}
+
+/// RDD of raw file text ([`FileText`]). Origin: `sc.textFile(p)` ([`FileText::Text`]),
+/// `sc.wholeTextFiles(p)` ([`FileText::PathAndText`]). Merge: equal on both paths, else
+/// unknown. Step: [`Step::Values`] turns `(path, contents)` pairs into the contents;
+/// rows-only steps (`filter`, `distinct`, `sample`, `coalesce`, `repartition`, `cache`:
+/// [`Step::Reduce`], [`Step::Keep`], [`Step::Cache`], [`Step::Limit`]) keep it, a union
+/// keeps it when both sides hold the same text; every other step (`map`, `flatMap`, a
+/// join) changes the values and forgets it.
+pub struct RawText;
+impl Fact for RawText {
+    type Value = FileText;
+    const UNKNOWN: FileText = FileText::Unknown;
+    fn merge(a: FileText, b: FileText) -> FileText {
+        if a == b { a } else { FileText::Unknown }
+    }
+    fn step(v: FileText, s: &Step) -> FileText {
+        match s {
+            Step::Values if v == FileText::PathAndText => FileText::Text,
+            Step::Reduce | Step::Keep | Step::Cache | Step::Limit(_) => v,
+            Step::Combine {
+                union: true,
+                other: Some(o),
+                ..
+            } if o.file_text == v => v,
+            _ => FileText::Unknown,
+        }
+    }
+}
+
 // ------------------------------------------------------------------- the table
 
 macro_rules! facts {
@@ -302,7 +501,7 @@ macro_rules! facts {
                 Facts { $( $field: <$row as Fact>::merge(self.$field, other.$field), )* }
             }
 
-            /// The facts after one DataFrame / WindowSpec step.
+            /// The facts after one DataFrame / RDD / WindowSpec step.
             pub fn after(self, s: &Step) -> Facts {
                 Facts { $( $field: <$row as Fact>::step(self.$field, s), )* }
             }
@@ -313,6 +512,8 @@ macro_rules! facts {
 facts! {
     /// See [`Bounded`].
     bounded: Bounded,
+    /// See [`RowLimited`].
+    row_limited: RowLimited,
     /// See [`Reduced`].
     reduced: Reduced,
     /// See [`Cached`].
@@ -333,6 +534,10 @@ facts! {
     win_frame_growing: WinFrameGrowing,
     /// See [`FreshBuilder`].
     fresh_builder: FreshBuilder,
+    /// See [`FrameColumns`].
+    columns: FrameColumns,
+    /// See [`RawText`].
+    file_text: RawText,
 }
 
 impl Default for Facts {
@@ -353,6 +558,11 @@ impl Facts {
         fresh_builder: true,
         ..Facts::NONE
     };
+
+    /// An RDD of raw file text ([`FileText::Text`]) on every path.
+    pub fn raw_file_text(&self) -> bool {
+        self.file_text == FileText::Text
+    }
 }
 
 #[cfg(test)]
@@ -379,8 +589,12 @@ mod tests {
         Step::Combine {
             union: false,
             other: None,
+            keeps_columns: false,
         },
+        Step::Keep,
+        Step::Project(Columns::Unknown),
         Step::Other,
+        Step::Values,
     ];
     const WIN_STEPS: &[Step] = &[
         Step::PartitionBy,
@@ -402,6 +616,7 @@ mod tests {
                 bounded: o,
                 ..Facts::NONE
             }),
+            keeps_columns: false,
         };
         for (v, step, want) in [
             (None, Step::Limit(5), Some(5)),
@@ -420,6 +635,7 @@ mod tests {
                 Step::Combine {
                     union: true,
                     other: None,
+                    keeps_columns: false,
                 },
                 None,
             ),
@@ -433,6 +649,45 @@ mod tests {
     }
 
     #[test]
+    fn row_limited() {
+        merges::<RowLimited>(true);
+        let combine = |o: bool| Step::Combine {
+            union: true,
+            other: Some(Facts {
+                row_limited: o,
+                ..Facts::NONE
+            }),
+            keeps_columns: false,
+        };
+        for (v, step, want) in [
+            (F, Step::Limit(5), T),
+            (F, Step::Limit(u64::MAX), T),
+            // A one-row aggregate of an unbounded frame still reads all of it.
+            (F, Step::Aggregate, F),
+            (F, Step::Describe, F),
+            (T, Step::Aggregate, T),
+            (T, Step::Describe, T),
+            (T, combine(true), T),
+            (T, combine(false), F),
+            (
+                T,
+                Step::Combine {
+                    union: false,
+                    other: None,
+                    keeps_columns: false,
+                },
+                F,
+            ),
+            (T, Step::Reduce, T),
+            (T, Step::Cache, T),
+            (T, Step::Other, T),
+            (F, Step::Other, F),
+        ] {
+            assert_eq!(RowLimited::step(v, &step), want, "{v} after {step:?}");
+        }
+    }
+
+    #[test]
     fn reduced() {
         merges::<Reduced>(true);
         for (v, step, want) in [
@@ -442,6 +697,7 @@ mod tests {
                 Step::Combine {
                     union: true,
                     other: None,
+                    keeps_columns: false,
                 },
                 F,
             ),
@@ -494,6 +750,7 @@ mod tests {
                 local: l,
                 ..Facts::NONE
             }),
+            keeps_columns: false,
         };
         assert!(Local::step(T, &with(T)));
         assert!(!Local::step(T, &with(F)) && !Local::step(F, &with(T)));
@@ -501,7 +758,8 @@ mod tests {
             T,
             &Step::Combine {
                 union: true,
-                other: None
+                other: None,
+                keeps_columns: false
             }
         ));
         for s in [
@@ -585,5 +843,110 @@ mod tests {
         let b = a.after(&Step::Limit(1));
         assert_eq!(b.bounded, Some(1));
         assert!(!b.cached && b.streaming);
+    }
+
+    #[test]
+    fn raw_text() {
+        use FileText::{PathAndText, Text, Unknown};
+        let union = |o| Step::Combine {
+            union: true,
+            other: Some(Facts {
+                file_text: o,
+                ..Facts::NONE
+            }),
+            keeps_columns: true,
+        };
+        for (a, b, want) in [
+            (Text, Text, Text),
+            (PathAndText, PathAndText, PathAndText),
+            (Text, PathAndText, Unknown),
+            (Text, Unknown, Unknown),
+            (Unknown, Unknown, Unknown),
+        ] {
+            assert_eq!(RawText::merge(a, b), want);
+            assert_eq!(RawText::merge(b, a), want);
+        }
+        for (v, step, want) in [
+            (PathAndText, Step::Values, Text),
+            (Text, Step::Values, Unknown),
+            (Unknown, Step::Values, Unknown),
+            (Text, Step::Other, Unknown),
+            (PathAndText, Step::Other, Unknown),
+            (Text, Step::Reduce, Text),
+            (Text, Step::Keep, Text),
+            (Text, Step::Cache, Text),
+            (PathAndText, Step::Reduce, PathAndText),
+            (Text, union(Text), Text),
+            (Text, union(PathAndText), Unknown),
+            (Text, union(Unknown), Unknown),
+            (
+                Text,
+                Step::Combine {
+                    union: true,
+                    other: None,
+                    keeps_columns: true,
+                },
+                Unknown,
+            ),
+            (
+                Text,
+                Step::Combine {
+                    union: false,
+                    other: Some(Facts {
+                        file_text: Text,
+                        ..Facts::NONE
+                    }),
+                    keeps_columns: false,
+                },
+                Unknown,
+            ),
+            (Text, Step::Aggregate, Unknown),
+        ] {
+            assert_eq!(RawText::step(v, &step), want, "{v:?} after {step:?}");
+        }
+        let f = |file_text| Facts {
+            file_text,
+            ..Facts::NONE
+        };
+        assert!(f(Text).raw_file_text());
+        assert!(!f(PathAndText).raw_file_text() && !Facts::NONE.raw_file_text());
+    }
+
+    #[test]
+    fn frame_columns() {
+        use Columns::{Known, SameAs, Unknown};
+        let x = SameAs(Origin::Expr(TextRange::default()));
+        let list = Known(ColumnList::names(["a", "b"]));
+        assert_eq!(FrameColumns::merge(x, x), x);
+        assert_eq!(FrameColumns::merge(list, list), list);
+        assert_eq!(FrameColumns::merge(x, list), Unknown);
+        assert_eq!(FrameColumns::merge(Unknown, x), Unknown);
+        let combine = |keeps_columns| Step::Combine {
+            union: true,
+            other: None,
+            keeps_columns,
+        };
+        for (step, want) in [
+            (Step::Limit(3), x),
+            (Step::Reduce, x),
+            (Step::Cache, x),
+            (Step::Keep, x),
+            (combine(true), x),
+            (combine(false), Unknown),
+            (Step::Project(list), list),
+            (Step::Aggregate, Unknown),
+            (Step::Describe, Unknown),
+            (Step::Other, Unknown),
+            (Step::PartitionBy, x),
+        ] {
+            assert_eq!(FrameColumns::step(x, &step), want, "{step:?}");
+        }
+        assert_eq!(ColumnList::names(["a", "b"]), ColumnList::names(["a", "b"]));
+        assert_ne!(ColumnList::names(["a", "b"]), ColumnList::names(["b", "a"]));
+        assert_ne!(ColumnList::names(["a"]), ColumnList::variable("a", &[]));
+        let r = [TextRange::default()];
+        assert_ne!(Origin::bindings("a", &r), Origin::path(["a"]));
+        assert!(list.agrees(list) && !Unknown.agrees(Unknown) && !x.agrees(list));
+        assert_eq!(Facts::NONE.columns, Unknown);
     }
 }

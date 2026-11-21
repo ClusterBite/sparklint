@@ -12,25 +12,56 @@
 use ruff_python_ast::{self as ast, Expr, ExprContext, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashSet;
-use sparklint_semantic::api::ActionKind;
+use sparklint_semantic::call_run::RunKind;
+use sparklint_semantic::transform;
+use sparklint_semantic::udf_refs::UdfRefs;
 use sparklint_semantic::{BindingId, BindingKind, MODULE_SCOPE, SemanticModel, Ty};
 
 use super::Rule;
-use super::actions::method_range;
 use super::exec_context::Run;
 use super::flow::Sink;
 use super::helpers::*;
+use super::msg::Msg;
 use crate::checker::{Checker, Node};
-use crate::diagnostic::{Diagnostic, Edit, Fix};
+use crate::diagnostic::{Edit, Fix};
+use crate::msg;
 
 /// PRF006/008/009 (see [`super::Rule`]).
 pub const RULES: &[Rule] = &[
-    Rule::new("PRF006").finish(finish_recomputed_lineage),
-    Rule::new("PRF008").finish(finish_cache),
+    Rule::new("PRF006")
+        .finish(finish_recomputed_lineage)
+        .msgs(&[PRF006]),
+    Rule::new("PRF008")
+        .finish(finish_cache)
+        .msgs(&[PRF008_ONCE, PRF008_NEVER]),
     Rule::new("PRF009")
         .call(note_clear_cache)
-        .finish(finish_cache_never_unpersisted),
+        .finish(finish_cache_never_unpersisted)
+        .msgs(&[PRF009]),
 ];
+
+const PRF006: Msg = Msg::new(
+    "PRF006",
+    "recomputed",
+    "`{name}` feeds {n} actions/writes without cache — its full lineage (joins/aggregations) is recomputed each time.",
+)
+.help("Persist it once (`x = x.persist()` … `x.unpersist()`), or restructure so one job produces all outputs.");
+const PRF008_ONCE: Msg = Msg::new(
+    "PRF008",
+    "consumed-once",
+    "`{name}` is cached but consumed only once — .{method}() costs a materialisation and memory with no reuse.",
+);
+const PRF008_NEVER: Msg = Msg::new(
+    "PRF008",
+    "never-consumed",
+    "`{name}` is cached but never consumed — .{method}() costs a materialisation and memory with no reuse.",
+);
+const PRF009: Msg = Msg::new(
+    "PRF009",
+    "never-unpersisted",
+    "`{name}` is .{method}()-ed but never unpersisted in this scope — the blocks hold executor memory until the session ends.",
+)
+.help("Call .unpersist() when done (try/finally), or let the job end release it.");
 
 // ------------------------------------------------------------------ counting policy
 
@@ -50,10 +81,10 @@ pub(crate) enum Consumer {
 }
 
 impl Consumer {
-    pub(crate) fn of_action(kind: ActionKind) -> Self {
+    pub(crate) fn of_action(kind: RunKind) -> Self {
         match kind {
-            ActionKind::Job | ActionKind::DriverCollect | ActionKind::Write => Consumer::Job,
-            ActionKind::Display => Consumer::Display,
+            RunKind::Job | RunKind::DriverPull | RunKind::Write | RunKind::DeltaOp => Consumer::Job,
+            RunKind::Display => Consumer::Display,
             _ => Consumer::Other,
         }
     }
@@ -100,34 +131,6 @@ impl CountPolicy {
 
 // ------------------------------------------------------------------ PRF006
 
-/// Methods that add a shuffle, a window or opaque Python work to a plan.
-const EXPENSIVE_METHODS: &[&str] = &[
-    "join",
-    "crossJoin",
-    "lateralJoin",
-    "groupBy",
-    "groupby",
-    "rollup",
-    "cube",
-    "agg",
-    "distinct",
-    "dropDuplicates",
-    "drop_duplicates",
-    "orderBy",
-    "sort",
-    "repartition",
-    "repartitionByRange",
-    "intersect",
-    "intersectAll",
-    "subtract",
-    "exceptAll",
-    "pivot",
-    "mapInPandas",
-    "mapInArrow",
-    "applyInPandas",
-    "applyInArrow",
-];
-
 /// Whether the plan behind `e` contains an expensive node (join, aggregation,
 /// window, sort, UDF, or a JDBC/CSV/JSON source).
 pub fn lineage_expensive(ch: &Checker, e: &Expr, depth: u32) -> bool {
@@ -138,7 +141,9 @@ pub fn lineage_expensive(ch: &Checker, e: &Expr, depth: u32) -> bool {
     loop {
         if let Some((c, recv, m)) = method_call(cur) {
             let rt = ch.model.ty_of(recv);
-            if EXPENSIVE_METHODS.contains(&m) && matches!(rt.ty, Ty::DataFrame | Ty::GroupedData) {
+            if matches!(rt.ty, Ty::DataFrame | Ty::GroupedData)
+                && transform::row(rt.ty, m).is_some_and(|r| r.expensive())
+            {
                 return true;
             }
             if rt.ty.is_session()
@@ -148,19 +153,18 @@ pub fn lineage_expensive(ch: &Checker, e: &Expr, depth: u32) -> bool {
                 return true;
             }
             if matches!(rt.ty, Ty::DataFrameReader)
-                && (matches!(m, "csv" | "json" | "jdbc" | "xml")
+                && (transform::COSTLY_FORMATS.contains(&m)
                     || (m == "format"
                         && c.arguments
                             .args
                             .first()
-                            .and_then(sparklint_semantic::str_literal)
-                            .is_some_and(|f| {
-                                matches!(
-                                    f.to_ascii_lowercase().as_str(),
-                                    "csv" | "json" | "jdbc" | "xml"
-                                )
-                            })))
+                            .and_then(|a| ch.model.const_str(a))
+                            .is_some_and(transform::costly_format)))
             {
+                return true;
+            }
+            // A Python UDF or a window (`.over(w)`) in the arguments.
+            if UdfRefs::of_call(ch.model, cur).any() {
                 return true;
             }
             let mut hit = false;
@@ -171,18 +175,8 @@ pub fn lineage_expensive(ch: &Checker, e: &Expr, depth: u32) -> bool {
                 .chain(c.arguments.keywords.iter().map(|k| &k.value))
             {
                 walk_exprs(a, &mut |x| {
-                    if hit {
-                        return;
-                    }
-                    if let Expr::Call(xc) = x {
-                        if ch.model.ty_of(&xc.func).ty == Ty::Udf {
-                            hit = true;
-                        }
-                        if let Some((_, _, xm)) = method_call(x)
-                            && xm == "over"
-                        {
-                            hit = true;
-                        }
+                    if let Some((_, _, "over")) = method_call(x) {
+                        hit = true;
                     }
                 });
             }
@@ -311,7 +305,7 @@ pub fn finish_recomputed_lineage(ch: &mut Checker) {
     let mut counter = Counter::new(ch, CountPolicy::RECOMPUTE);
     let mut cands: Vec<BindingId> = counter.ch.state.flow.tracked.iter().copied().collect();
     cands.sort_unstable();
-    let mut out: Vec<(TextRange, String)> = Vec::new();
+    let mut out: Vec<crate::Diagnostic> = Vec::new();
     for b in cands {
         let binding = counter.ch.model.binding(b);
         if !matches!(
@@ -321,7 +315,7 @@ pub fn finish_recomputed_lineage(ch: &mut Checker) {
             continue;
         }
         let t = binding.ty;
-        if t.facts.cached || t.facts.streaming || t.bounded().is_some() {
+        if t.facts.cached || t.facts.streaming || t.size().has_row_bound() {
             continue;
         }
         let Some(value) = binding.value else { continue };
@@ -351,17 +345,10 @@ pub fn finish_recomputed_lineage(ch: &mut Checker) {
             continue;
         }
         let name = binding.name.clone();
-        out.push((
-            binding.range,
-            format!(
-                "`{name}` feeds {n} actions/writes without cache — its full lineage (joins/aggregations) is recomputed each time."
-            ),
-        ));
+        out.push(msg!(PRF006, binding.range, name, n));
     }
-    for (range, msg) in out {
-        ch.report(Diagnostic::new("PRF006", msg, range).with_help(
-            "Persist it once (`x = x.persist()` … `x.unpersist()`), or restructure so one job produces all outputs.",
-        ));
+    for d in out {
+        ch.report(d);
     }
 }
 
@@ -408,14 +395,7 @@ pub fn finish_cache_never_unpersisted(ch: &mut Checker) {
     out.sort_by_key(|(r, _, _)| r.start());
     out.dedup_by_key(|(r, _, _)| *r);
     for (range, name, m) in out {
-        ch.report(
-            Diagnostic::new(
-                "PRF009",
-                format!("`{name}` is .{m}()-ed but never unpersisted in this scope — the blocks hold executor memory until the session ends."),
-                range,
-            )
-            .with_help("Call .unpersist() when done (try/finally), or let the job end release it."),
-        );
+        ch.report(msg!(PRF009, range, name, method = m));
     }
 }
 
@@ -622,19 +602,12 @@ pub fn finish_cache(ch: &mut Checker) {
         .collect();
     cands.sort_by_key(|c| c.report_range.start());
     for c in cands {
-        let how = if c.weight == 0 {
-            "never consumed"
+        let v = if c.weight == 0 {
+            &PRF008_NEVER
         } else {
-            "consumed only once"
+            &PRF008_ONCE
         };
-        let mut d = Diagnostic::new(
-            "PRF008",
-            format!(
-                "`{}` is cached but {how} — .{}() costs a materialisation and memory with no reuse.",
-                c.name, c.method
-            ),
-            c.report_range,
-        );
+        let mut d = msg!(v, c.report_range, name = c.name, method = c.method);
         if let Some(r) = c.delete_range {
             d = d.with_fix(Fix::unsafe_(
                 format!("Remove .{}()", c.method),

@@ -1,0 +1,31 @@
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+
+df = spark.read.parquet("/data")
+rows = [1, 2]
+flag = True
+
+# A count tested in a comprehension `if`, a match guard or through a walrus.
+picked = [r for r in rows if not df.isEmpty()]  # expect: ACT006
+match rows:
+    case [_, *_] if not df.isEmpty():  # expect: ACT006
+        pass
+# Through a walrus the count is also kept in a name: reported, no fix.
+if (n := df.count()):  # expect: ACT006
+    print(n)
+while not (m := df.count()):  # expect: ACT006
+    break
+
+# A held count read only as a truth value: in a comprehension `if`, as a non-last
+# `and` operand.
+total = df.count()  # expect: ACT006
+names = [c for c in df.columns if total]
+size = df.count()  # expect: ACT006
+ok = size and flag
+
+# Not a truth value: the count itself is used.
+k = df.count()
+both = flag and k
+if (j := df.count()) > 10:
+    print(j)

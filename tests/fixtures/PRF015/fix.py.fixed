@@ -6,3 +6,8 @@ spark = SparkSession.builder.getOrCreate()
 df = spark.table("t")
 a = df.groupBy("k").agg(F.collect_set("v").alias("vs"))  # expect: PRF015
 w = df.select(F.array_join(F.array_distinct(F.collect_list("v")), ","))  # expect: PRF015
+from pyspark.sql import Window
+
+wo = Window.partitionBy("k").orderBy("ts")
+o1 = df.withColumn("seen", F.array_distinct(F.collect_list("v").over(wo)))  # expect: PRF015
+o2 = df.withColumn("seen", F.collect_set("v").over(wo))  # expect: PRF015

@@ -6,10 +6,12 @@ pub mod checker;
 pub mod config;
 pub mod diagnostic;
 pub mod fix;
+pub mod fix_text;
 pub mod noqa;
 pub mod overlap;
 pub mod project;
 pub mod registry;
+pub mod rule_ref;
 pub mod rules;
 
 use ruff_python_ast::token::TokenKind;
@@ -163,7 +165,9 @@ fn lint_parsed(
         let module = p.parsed.syntax();
         let opts = semantic_options(source, settings, module_name);
         let model = build_model(module, TextSize::of(source.text.as_str()), opts, index);
-        diagnostics = Checker::new(source, &model, settings, module).run();
+        diagnostics = Checker::new(source, &model, settings, module)
+            .with_tokens(p.parsed.tokens())
+            .run();
         let suppressions = suppressions_of(source, &p.parsed);
         diagnostics.retain(|d| !is_suppressed(source, &suppressions, d));
     }
@@ -189,6 +193,25 @@ pub(crate) fn suppressions_of(
             )
         });
     Suppressions::from_comments(comments)
+}
+
+/// Tokens in the file's suppression comments that name no rule (`# noqa:
+/// collect-without-limit`, `ignore[bogus]`): `(1-based line, token)`, in file order.
+/// They suppress nothing; the CLI warns about them.
+pub fn unknown_rule_refs(source: &SourceFile) -> Vec<(u32, String)> {
+    // Most files carry no suppression comment: skip the parse for them.
+    let lower = source.text.to_ascii_lowercase();
+    if !["noqa", "sparklint:", "cy:ignore"]
+        .iter()
+        .any(|k| lower.contains(k))
+    {
+        return Vec::new();
+    }
+    let p = parse_source(source);
+    if !p.lintable {
+        return Vec::new();
+    }
+    suppressions_of(source, &p.parsed).unknown().to_vec()
 }
 
 pub(crate) fn is_suppressed(source: &SourceFile, s: &Suppressions, d: &Diagnostic) -> bool {
@@ -247,6 +270,16 @@ pub struct FixOutcome {
     pub fixes_applied: usize,
 }
 
+/// One fix round of [`lint_and_fix`].
+enum Round {
+    /// No fix applied.
+    Nothing,
+    /// The fixed text does not parse (or the edits do not fit the notebook).
+    Broken,
+    /// The fixed file, its parse and the number of fixes applied.
+    Fixed(Box<(SourceFile, ParsedSource, usize)>),
+}
+
 /// Cells (by number) that contain a syntax error.
 fn broken_cells(source: &SourceFile, parsed: &ParsedSource) -> Vec<u32> {
     let mut cells: Vec<u32> = parsed
@@ -259,7 +292,9 @@ fn broken_cells(source: &SourceFile, parsed: &ParsedSource) -> Vec<u32> {
 }
 
 /// Lint, apply fixes (safe only unless `unsafe_fixes`), re-lint until stable (max
-/// 10 rounds). A round whose result does not parse is discarded. In a notebook every
+/// 10 rounds). A round whose result does not parse is retried without the fixes that
+/// break parsing on their own (a rule bug: a debug assertion); if it still does not
+/// parse it is discarded. In a notebook every
 /// edit must stay inside one cell, and a cell with a syntax error is left as it is while
 /// the other cells are fixed; any other file with a syntax error is never rewritten.
 /// Edits are applied to [`SourceFile::raw_text`], so bare magics and language cells are
@@ -295,22 +330,50 @@ pub fn lint_and_fix(
                 None => false,
             }
         };
-        let (text, applied, markers) =
-            fix::apply_fixes_where(current.raw_text(), &diagnostics, unsafe_fixes, &allowed);
-        if applied == 0 {
-            break;
+        // The fixed file must parse as before: no new error, the same broken cells.
+        let round = |diagnostics: &[Diagnostic]| -> Round {
+            let (text, applied, markers) =
+                fix::apply_fixes_where(file.raw_text(), diagnostics, unsafe_fixes, &allowed);
+            if applied == 0 {
+                return Round::Nothing;
+            }
+            let Ok(candidate) = file.with_edits(&markers, text) else {
+                return Round::Broken;
+            };
+            let parsed = parse_source(&candidate);
+            if parsed.syntax_errors.len() != first.syntax_errors.len()
+                || !parsed.lintable
+                || broken_cells(&candidate, &parsed) != broken
+            {
+                return Round::Broken;
+            }
+            Round::Fixed(Box::new((candidate, parsed, applied)))
+        };
+        let mut outcome = round(&diagnostics);
+        if matches!(outcome, Round::Broken) {
+            // A fix whose own result does not parse is a rule bug (the fixture
+            // property test fails on it): drop it, keep the round's other fixes.
+            let (good, bad): (Vec<Diagnostic>, Vec<Diagnostic>) =
+                diagnostics.iter().cloned().partition(|d| {
+                    d.fix.is_none() || !matches!(round(std::slice::from_ref(d)), Round::Broken)
+                });
+            debug_assert!(
+                bad.is_empty(),
+                "fixes that do not parse: {:?}",
+                bad.iter()
+                    .map(|d| (d.code, d.fix.as_ref().map(|f| f.message.clone())))
+                    .collect::<Vec<_>>()
+            );
+            outcome = if bad.is_empty() {
+                Round::Broken
+            } else {
+                round(&good)
+            };
         }
-        let Ok(candidate) = current.with_edits(&markers, text) else {
+        let Round::Fixed(fixed) = outcome else {
             break;
         };
-        let parsed = parse_source(&candidate);
-        // The fixed file must parse as before: no new error, the same broken cells.
-        if parsed.syntax_errors.len() != first.syntax_errors.len()
-            || !parsed.lintable
-            || broken_cells(&candidate, &parsed) != broken
-        {
-            break;
-        }
+        let (candidate, parsed, applied) = *fixed;
         total += applied;
         diagnostics = lint_parsed(&candidate, &parsed, settings, index, module_name.clone());
         current = candidate;
@@ -323,6 +386,9 @@ pub fn lint_and_fix(
     }
 }
 
+/// Engine tests (parsing, notebooks, noqa, fixes). A rule's severity tiers and message
+/// wording are checked in its fixtures (`# expect: CODE[severity] ~"fragment"`, see
+/// `tests/fixtures.rs`), not here.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,32 +616,6 @@ mod tests {
         assert!(fixed.contains("F.col('a').isNull()"), "{fixed}");
         assert_eq!(out.fixes_applied, 2);
         assert!(out.diagnostics.is_empty());
-    }
-
-    #[test]
-    fn conf_rules_severity() {
-        use crate::diagnostic::Severity;
-        let sev = |src: &str, code: &str| -> Vec<Severity> {
-            lint(src, &[code]).iter().map(|d| d.severity).collect()
-        };
-        let src = "spark.conf.set('spark.sql.autoBroadcastJoinThreshold', '2g')\nspark.conf.set('spark.sql.autoBroadcastJoinThreshold', '8g')\n";
-        assert_eq!(sev(src, "CFG007"), vec![Severity::Warning, Severity::Error]);
-        // Set back later: the earlier write is a scoped workaround (info).
-        let src = "spark.conf.set('spark.sql.adaptive.enabled', 'false')\nx = 1\nspark.conf.set('spark.sql.adaptive.enabled', 'true')\n";
-        assert_eq!(sev(src, "CFG001"), vec![Severity::Info]);
-        let src = "spark.conf.set('spark.sql.autoBroadcastJoinThreshold', -1)\nspark.conf.unset('spark.sql.autoBroadcastJoinThreshold')\n";
-        assert_eq!(sev(src, "CFG002"), vec![Severity::Info]);
-        // A restore BEFORE the disable does not count.
-        let src = "spark.conf.set('spark.sql.adaptive.enabled', 'true')\nspark.conf.set('spark.sql.adaptive.enabled', 'false')\n";
-        assert_eq!(sev(src, "CFG001"), vec![Severity::Warning]);
-        // Threshold is configurable; 0 turns CFG007 off.
-        let mut s = LinterSettings::for_selectors(&["CFG007"]).unwrap();
-        s.broadcast_threshold_max = 0;
-        let f = SourceFile::from_text(
-            Path::new("t.py"),
-            "spark.conf.set('spark.sql.autoBroadcastJoinThreshold', '16g')\n".into(),
-        );
-        assert!(lint_source(&f, &s, &sparklint_semantic::NoSummaries, None).is_empty());
     }
 
     #[test]

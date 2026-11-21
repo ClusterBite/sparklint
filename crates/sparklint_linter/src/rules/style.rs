@@ -5,11 +5,19 @@ use ruff_text_size::TextRange;
 use sparklint_semantic::{BindingKind, MODULE_SCOPE};
 
 use super::Rule;
+use super::msg::Msg;
 use crate::checker::Checker;
-use crate::diagnostic::{Diagnostic, Edit, Fix};
+use crate::diagnostic::{Edit, Fix};
+use crate::msg;
 
 /// STY001 (see [`super::Rule`]).
-pub const RULES: &[Rule] = &[Rule::new("STY001").stmt(sty001_stmt)];
+pub const RULES: &[Rule] = &[Rule::new("STY001").stmt(sty001_stmt).msgs(&[STY001])];
+
+const STY001: Msg = Msg::new(
+    "STY001",
+    "alias",
+    "Import pyspark.sql.{module} as {allowed} (found `{found}`).",
+);
 
 fn sty001_stmt(ch: &mut Checker, stmt: &Stmt) {
     if matches!(stmt, Stmt::Import(_) | Stmt::ImportFrom(_)) {
@@ -84,13 +92,12 @@ pub fn functions_alias(ch: &mut Checker, stmt: &Stmt) {
             continue;
         };
         let shown = current.clone().unwrap_or_else(|| kind.to_string());
-        let mut d = Diagnostic::new(
-            "STY001",
-            format!(
-                "Import pyspark.sql.{kind} as {} (found `{shown}`).",
-                allowed.join(" or ")
-            ),
+        let mut d = msg!(
+            STY001,
             alias_range,
+            module = kind,
+            allowed = allowed.join(" or "),
+            found = shown
         );
         if let Some(fix) = rename_fix(ch, binding_range, name_range, current.is_some(), &preferred)
         {

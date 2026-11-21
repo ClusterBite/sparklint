@@ -3,14 +3,14 @@
 
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_text_size::Ranged;
-use sparklint_semantic::{Ty, call_arg, static_text};
+use sparklint_semantic::{Const, Ty, call_arg, static_text};
 
 use super::Rule;
-use super::actions::method_range;
 use super::conf::{Conf, Finding, Setting};
 use super::helpers::*;
+use super::msg::Msg;
 use crate::checker::Checker;
-use crate::diagnostic::Diagnostic;
+use crate::{finding, msg};
 
 /// PDS005/006 (see [`super::Rule`]).
 pub const RULES: &[Rule] = &[
@@ -19,9 +19,19 @@ pub const RULES: &[Rule] = &[
     Rule::new("PDS005")
         .conf(&Conf::new(&[OPS_ON_DIFF_CONF], ops_on_diff_conf))
         .stmt(pds005_stmt)
-        .call(ops_on_diff_frames_call),
-    Rule::new("PDS006").call(single_partition_op),
+        .call(ops_on_diff_frames_call)
+        .msgs(&[PDS005]),
+    Rule::new("PDS006")
+        .call(single_partition_op)
+        .msgs(&[PDS006]),
 ];
+
+const PDS006: Msg = Msg::new(
+    "PDS006",
+    "single-partition",
+    "{method}() on an un-grouped pandas-on-Spark frame runs over a window with no partition: all rows move to a single partition.",
+)
+.help("Group first (psdf.groupby(key).{method}()) or use a Spark Window.partitionBy(...); fine on small frames (# noqa: PDS006).");
 
 fn pds005_stmt(ch: &mut Checker, stmt: &Stmt) {
     if let Stmt::Assign(a) = stmt {
@@ -37,22 +47,26 @@ const OPS_ON_DIFF: &str = "compute.ops_on_diff_frames";
 const OPS_ON_DIFF_CONF: &str = "pandas_on_Spark.compute.ops_on_diff_frames";
 const OPS_ON_DIFF_ATTR: &str = "pyspark.pandas.options.compute.ops_on_diff_frames";
 
-const PDS005_MSG: &str = "compute.ops_on_diff_frames=True: every operation between two different pandas-on-Spark frames silently becomes a join (a shuffle per expression).";
-const PDS005_HELP: &str = "Keep the default (False) and combine the data explicitly once (merge/join, or ps.concat), so the cost is visible.";
+const PDS005: Msg = Msg::new(
+    "PDS005",
+    "ops-on-diff-frames",
+    "compute.ops_on_diff_frames=True: every operation between two different pandas-on-Spark frames silently becomes a join (a shuffle per expression).",
+)
+.help("Keep the default (False) and combine the data explicitly once (merge/join, or ps.concat), so the cost is visible.");
 
 fn pds005(ch: &mut Checker, range: ruff_text_size::TextRange) {
-    ch.report(Diagnostic::new("PDS005", PDS005_MSG, range).with_help(PDS005_HELP));
+    ch.report(msg!(PDS005, range));
 }
 
 /// `pandas_on_Spark.compute.ops_on_diff_frames` set to true through the Spark conf.
 fn ops_on_diff_conf(s: &Setting) -> Option<Finding> {
     s.value
         .eq_ignore_ascii_case("true")
-        .then(|| Finding::new(PDS005_MSG, PDS005_HELP))
+        .then(|| finding!(PDS005))
 }
 
-fn is_true(e: &Expr) -> bool {
-    bool_literal(e) == Some(true)
+fn is_true(ch: &Checker, e: &Expr) -> bool {
+    ch.model.constant(e).and_then(Const::as_flag) == Some(true)
 }
 
 /// `ps.set_option("compute.ops_on_diff_frames", True)` and
@@ -63,7 +77,7 @@ pub fn ops_on_diff_frames_call(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr)
     let hit = match q.as_deref() {
         Some("pyspark.pandas.set_option" | "pyspark.pandas.config.set_option") => {
             call_arg(c, 0, "key").and_then(static_text).as_deref() == Some(OPS_ON_DIFF)
-                && call_arg(c, 1, "value").is_some_and(is_true)
+                && call_arg(c, 1, "value").is_some_and(|v| is_true(ch, v))
         }
         Some("pyspark.pandas.option_context" | "pyspark.pandas.config.option_context") => {
             let args = &c.arguments.args;
@@ -71,7 +85,7 @@ pub fn ops_on_diff_frames_call(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr)
                 && args.chunks(2).any(|p| {
                     p.len() == 2
                         && static_text(&p[0]).as_deref() == Some(OPS_ON_DIFF)
-                        && is_true(&p[1])
+                        && is_true(ch, &p[1])
                 })
         }
         _ => false,
@@ -83,7 +97,7 @@ pub fn ops_on_diff_frames_call(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr)
 
 /// `ps.options.compute.ops_on_diff_frames = True`.
 pub fn ops_on_diff_frames_assign(ch: &mut Checker, a: &ast::StmtAssign) {
-    if !is_true(&a.value) {
+    if !is_true(ch, &a.value) {
         return;
     }
     for t in &a.targets {
@@ -125,16 +139,5 @@ pub fn single_partition_op(ch: &mut Checker, _call: &ast::ExprCall, expr: &Expr)
     {
         return;
     }
-    ch.report(
-        Diagnostic::new(
-            "PDS006",
-            format!(
-                "{m}() on an un-grouped pandas-on-Spark frame runs over a window with no partition: all rows move to a single partition."
-            ),
-            method_range(expr),
-        )
-        .with_help(format!(
-            "Group first (psdf.groupby(key).{m}()) or use a Spark Window.partitionBy(...); fine on small frames (# noqa: PDS006)."
-        )),
-    );
+    ch.report(msg!(PDS006, method_range(expr), method = m));
 }

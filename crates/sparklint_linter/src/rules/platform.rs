@@ -1,26 +1,82 @@
 //! DBX — platform compatibility: DBX001 spark-context-access, DBX002 rdd-access,
 //! DBX003 input-file-name, DBX016 list-tables-existence-check.
 
-use ruff_python_ast::{self as ast, Expr, ExprContext, Stmt};
+use ruff_python_ast::{self as ast, Expr, ExprContext, OperatorPrecedence, Stmt};
 use ruff_text_size::{Ranged, TextRange};
-use sparklint_semantic::{SqlText, Ty, call_arg, static_text, str_literal};
+use sparklint_semantic::call_run::{Returns, run_of_ty};
+use sparklint_semantic::{SqlText, Ty, str_literal};
 
 use super::Rule;
-use super::actions::{delete_stmt_fix, method_range};
+use super::describe;
+use super::exec_context::{Probe, Run};
 use super::helpers::*;
+use super::msg::Msg;
 use crate::checker::{Checker, Node};
 use crate::diagnostic::{Diagnostic, Edit, Fix, Severity};
+use crate::fix_text::{fresh_name, one_line};
+use crate::msg;
 
 /// DBX001/002/003/016 (see [`super::Rule`]).
 pub const RULES: &[Rule] = &[
-    Rule::new("DBX001").expr(dbx001_expr),
-    Rule::new("DBX002").expr(dbx002_expr),
-    Rule::new("DBX003").call(input_file_name),
+    Rule::new("DBX001")
+        .expr(dbx001_expr)
+        .msgs(&[DBX001, DBX001_GLOBAL]),
+    Rule::new("DBX002").expr(dbx002_expr).msgs(&[DBX002]),
+    Rule::new("DBX003")
+        .call(input_file_name)
+        .msgs(&[DBX003, DBX003_BLOCK]),
     Rule::new("DBX016")
         .expr(list_tables_existence_check)
         .stmt(list_tables_existence_loop)
-        .call(show_tables_filter),
+        .call(show_tables_filter)
+        .msgs(&[DBX016, DBX016_LOOP]),
 ];
+
+const DBX001_HELP: &str = "Use SparkSession APIs: spark.createDataFrame(rows) for parallelize, spark.conf.get(k) for getConf, F.broadcast(df) for broadcast joins.";
+const DBX001: Msg = Msg::new(
+    "DBX001",
+    "context",
+    "{what} is unavailable on Spark Connect and serverless; on standard access mode most of its functions (parallelize, textFile, getConf, …) are blocked on every runtime.",
+)
+.help(DBX001_HELP);
+const DBX001_GLOBAL: Msg = Msg::new(
+    "DBX001",
+    "context-global",
+    "The `{name}` global is unavailable on Spark Connect and serverless; on standard access mode most of its functions (parallelize, textFile, getConf, …) are blocked on every runtime.",
+)
+.help(DBX001_HELP);
+const DBX002: Msg = Msg::new(
+    "DBX002",
+    "rdd",
+    "{call} is not supported on Spark Connect, serverless or standard access mode.",
+)
+.help("Use DataFrame APIs: df.isEmpty(), df.collect(), mapInPandas/applyInPandas for row-wise Python.");
+const DBX003_HELP: &str = "Read the file-metadata column instead: F.col(\"_metadata.{field}\") on a file-source DataFrame, or _metadata.{field} in SQL over a file-based table.";
+const DBX003: Msg = Msg::new(
+    "DBX003",
+    "input-file-name",
+    "input_file_name() is not available on Unity Catalog, deprecated since Databricks Runtime 13.3 LTS and no longer supported from 17.3 LTS — use the _metadata.file_path column.",
+)
+.help(DBX003_HELP);
+const DBX003_BLOCK: Msg = Msg::new(
+    "DBX003",
+    "input-file-block",
+    "{func}() is not available on Unity Catalog and is deprecated since Databricks Runtime 13.3 LTS — use the _metadata.{field} column.",
+)
+.help(DBX003_HELP);
+const DBX016_HELP: &str = "Use {api} — one lookup. A pattern argument (listTables(db, pattern) / SHOW TABLES LIKE) also keeps the listing small.";
+const DBX016: Msg = Msg::new(
+    "DBX016",
+    "listing-lookup",
+    "Existence check for one {what} by listing every {what}: the driver fetches the whole listing (one metastore round trip per page on Unity Catalog) to test a single name.",
+)
+.help(DBX016_HELP);
+const DBX016_LOOP: Msg = Msg::new(
+    "DBX016",
+    "listing-lookup-in-loop",
+    "Existence check for one {what} by listing every {what}: the driver fetches the whole listing (one metastore round trip per page on Unity Catalog) to test a single name. Inside a loop, the full listing is fetched on every iteration.",
+)
+.help(DBX016_HELP);
 
 fn dbx001_expr(ch: &mut Checker, expr: &Expr) {
     if matches!(expr, Expr::Call(_) | Expr::Attribute(_) | Expr::Name(_)) {
@@ -36,12 +92,8 @@ fn dbx002_expr(ch: &mut Checker, expr: &Expr) {
 
 // ------------------------------------------------------------------ DBX001
 
-const CONNECT_MSG: &str = "is unavailable on Spark Connect and serverless (and blocked on standard access mode before DBR 14)";
-
-fn report_context(ch: &mut Checker, what: &str, range: TextRange, fix: Option<Fix>) {
-    let mut d = Diagnostic::new("DBX001", format!("{what} {CONNECT_MSG}."), range).with_help(
-        "Use SparkSession APIs: spark.createDataFrame(rows) for parallelize, spark.conf.get(k) for getConf, F.broadcast(df) for broadcast joins.",
-    );
+fn report_context(ch: &mut Checker, d: crate::Diagnostic, fix: Option<Fix>) {
+    let mut d = d;
     if let Some(f) = fix {
         d = d.with_fix(f);
     }
@@ -79,20 +131,51 @@ fn context_use_fix(ch: &Checker, session: Option<&str>) -> Option<Fix> {
     }
 }
 
+/// Exceptions an unavailable context raises: `PySparkNotImplementedError` on Spark
+/// Connect / serverless (a `NotImplementedError`, so a `RuntimeError`), a Py4J
+/// security error on standard access mode. A handler catching one of these (or a
+/// bare `except:`) is a deliberate fallback.
+const CONTEXT_ERRORS: &[&str] = &[
+    "Exception",
+    "BaseException",
+    "RuntimeError",
+    "NotImplementedError",
+    "PySparkException",
+    "PySparkNotImplementedError",
+    "PySparkRuntimeError",
+    "Py4JError",
+    "Py4JJavaError",
+];
+/// The notebook globals are simply undefined where they are unavailable.
+const GLOBAL_ERRORS: &[&str] = &[
+    "Exception",
+    "BaseException",
+    "NameError",
+    "RuntimeError",
+    "NotImplementedError",
+    "PySparkException",
+    "PySparkNotImplementedError",
+];
+
+/// The access is written to fail or to fall back: inside a `try:` whose handler
+/// catches the unavailable-context error, or in a block a test expects to raise.
+fn context_guarded(ch: &Checker, site: TextRange, errors: &[&str]) -> bool {
+    ch.caught_at(site, errors) || ch.run_at(site) == Run::Probe(Probe::Raises)
+}
+
 pub fn spark_context_access(ch: &mut Checker, expr: &Expr) {
     match expr {
         Expr::Attribute(a) if a.attr.as_str() == "sparkContext" => {
             if !ch.model.ty_of(&a.value).ty.is_session() {
                 return;
             }
+            if context_guarded(ch, a.range, CONTEXT_ERRORS) {
+                return;
+            }
             let session = paren_src(ch, &a.value);
             let fix = context_use_fix(ch, Some(&session));
-            report_context(
-                ch,
-                &format!("{}.sparkContext", short(ch, &a.value)),
-                a.range,
-                fix,
-            );
+            let what = describe::call(ch, expr);
+            report_context(ch, msg!(DBX001, a.range, what), fix);
         }
         Expr::Name(n) if n.ctx == ExprContext::Load => {
             let name = n.id.as_str();
@@ -106,12 +189,15 @@ pub fn spark_context_access(ch: &mut Checker, expr: &Expr) {
             if !matches!(t, Ty::SparkContext | Ty::SqlContext) {
                 return;
             }
+            if context_guarded(ch, n.range, GLOBAL_ERRORS) {
+                return;
+            }
             let fix = if name == "sc" && ch.is_notebook() {
                 context_use_fix(ch, Some("spark"))
             } else {
                 None
             };
-            report_context(ch, &format!("The `{name}` global"), n.range, fix);
+            report_context(ch, msg!(DBX001_GLOBAL, n.range, name), fix);
         }
         Expr::Call(c) => {
             let Some(q) = ch.model.qualified_name(&c.func) else {
@@ -123,7 +209,10 @@ pub fn spark_context_access(ch: &mut Checker, expr: &Expr) {
                 "pyspark.sql.HiveContext" => "HiveContext",
                 _ => return,
             };
-            report_context(ch, what, expr.range(), None);
+            if context_guarded(ch, expr.range(), CONTEXT_ERRORS) {
+                return;
+            }
+            report_context(ch, msg!(DBX001, expr.range(), what), None);
         }
         _ => {}
     }
@@ -149,7 +238,7 @@ pub fn rdd_access(ch: &mut Checker, a: &ast::ExprAttribute, expr: &Expr) {
                     vec![Edit::replace(pc.range(), text)],
                 ));
             }
-            "map" => {
+            "map" | "flatMap" => {
                 if let [Expr::Lambda(l)] = pc.arguments.args.as_slice()
                     && pc.arguments.keywords.is_empty()
                     && let Some(params) = &l.parameters
@@ -163,8 +252,18 @@ pub fn rdd_access(ch: &mut Checker, a: &ast::ExprAttribute, expr: &Expr) {
                 {
                     let body = ch.slice(l.body.range());
                     let pname = p.parameter.name.as_str();
-                    if !body.contains('\n') {
-                        let text = format!("[{body} for {pname} in {base}.collect()]");
+                    // `flatMap` flattens what the lambda returns: one more `for`.
+                    let text = if pa.attr.as_str() == "map" {
+                        Some(format!("[{body} for {pname} in {base}.collect()]"))
+                    } else {
+                        fresh_name(body, &[pname], FLAT_NAMES).map(|v| {
+                            let iter = ch.fix_text().at_least(&l.body, OperatorPrecedence::Or);
+                            format!("[{v} for {pname} in {base}.collect() for {v} in {iter}]")
+                        })
+                    };
+                    if one_line(&[body])
+                        && let Some(text) = text
+                    {
                         fix = Some(Fix::unsafe_(
                             format!("Replace with `{text}`"),
                             vec![Edit::replace(cc.range(), text)],
@@ -175,33 +274,44 @@ pub fn rdd_access(ch: &mut Checker, a: &ast::ExprAttribute, expr: &Expr) {
             _ => {}
         }
     }
-    let mut d = Diagnostic::new(
-        "DBX002",
-        format!(
-            "{}.rdd is not supported on Spark Connect, serverless or standard access mode.",
-            short(ch, &a.value)
-        ),
-        expr.range(),
-    )
-    .with_help("Use DataFrame APIs: df.isEmpty(), df.collect(), mapInPandas/applyInPandas for row-wise Python.");
+    let call = describe::call(ch, expr);
+    let mut d = msg!(DBX002, expr.range(), call);
     if let Some(f) = fix {
         d = d.with_fix(f);
     }
     ch.report(d);
 }
 
+/// Names for the flattened value of `flatMap(lambda <pname>: <body>)`'s list
+/// comprehension: the first one no word of the lambda uses.
+const FLAT_NAMES: &[&str] = &["v", "value", "item", "_v"];
+
 // ------------------------------------------------------------------ DBX003
 
-const IFN_MSG: &str = "input_file_name() is not supported on Unity Catalog standard/serverless compute (and is deprecated) — use the _metadata.file_path column.";
+/// The file-name functions Unity Catalog does not offer, with the `_metadata` field that
+/// replaces each.
+const FILE_FUNCS: [(&str, &str); 3] = [
+    ("input_file_name", "file_path"),
+    ("input_file_block_start", "file_block_start"),
+    ("input_file_block_length", "file_block_length"),
+];
+
+fn file_func_msg(func: &str, field: &str, range: TextRange) -> Diagnostic {
+    if func == "input_file_name" {
+        msg!(DBX003, range, field = field)
+    } else {
+        msg!(DBX003_BLOCK, range, func = func, field = field)
+    }
+}
 
 pub fn input_file_name(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
-    if ch.model.is_spark_function(&c.func, "input_file_name") {
-        let mut d = Diagnostic::new("DBX003", IFN_MSG, expr.range());
+    for (func, field) in FILE_FUNCS {
+        if !ch.model.is_spark_function(&c.func, func) {
+            continue;
+        }
+        let mut d = file_func_msg(func, field, expr.range());
         if let Expr::Attribute(fa) = &*c.func {
-            let text = format!(
-                "{}.col(\"_metadata.file_path\")",
-                ch.slice(fa.value.range())
-            );
+            let text = format!("{}.col(\"_metadata.{field}\")", ch.slice(fa.value.range()));
             d = d.with_fix(Fix::unsafe_(
                 format!("Replace with `{text}`"),
                 vec![Edit::replace(expr.range(), text)],
@@ -210,40 +320,29 @@ pub fn input_file_name(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
         ch.report(d);
         return;
     }
-    // SQL text: spark.sql(...) (the query it runs: `sqlQuery=`, a name bound once to
-    // the text; an EXPLAIN only plans), F.expr(...), selectExpr(...), filter("...").
-    if let Some(sc) = ch.model.spark_call_named(expr, &["sql"])
-        && sc.class().is_session()
-    {
-        if let Some(arg) = call_arg(c, 0, "sqlQuery")
-            && ch
-                .model
-                .sql_query(c)
-                .is_some_and(|q| q.calls("input_file_name"))
-        {
-            ch.report(Diagnostic::new("DBX003", IFN_MSG, arg.range()));
+    // F.call_function("input_file_name") (Spark 3.5+) calls the SQL function by name.
+    if ch.model.is_spark_function(&c.func, "call_function") {
+        let name = c
+            .arguments
+            .find_argument_value("funcName", 0)
+            .and_then(|a| ch.model.const_str(a));
+        if let Some((func, field)) = name.and_then(|n| {
+            FILE_FUNCS
+                .into_iter()
+                .find(|(f, _)| n.eq_ignore_ascii_case(f))
+        }) {
+            ch.report(file_func_msg(func, field, expr.range()));
         }
         return;
     }
-    let sql_args: Vec<&Expr> = if ch.model.is_spark_function(&c.func, "expr") {
-        c.arguments.args.iter().take(1).collect()
-    } else if let Some(sc) = ch.model.spark_call(expr) {
-        match sc.method {
-            "selectExpr" | "filter" | "where" if sc.class() == Ty::DataFrame => {
-                c.arguments.args.iter().collect()
+    // SQL text: spark.sql(...) (the query it runs; an EXPLAIN only plans), F.expr(...),
+    // selectExpr(...), filter("...").
+    for s in ch.model.sql_sites(expr) {
+        let Some(text) = &s.text else { continue };
+        for (func, field) in FILE_FUNCS {
+            if text.calls(func) {
+                ch.report(file_func_msg(func, field, s.range));
             }
-            _ => Vec::new(),
-        }
-    } else {
-        Vec::new()
-    };
-    for a in sql_args {
-        if ch
-            .model
-            .resolve_text(a)
-            .is_some_and(|t| SqlText::new(&t).calls("input_file_name"))
-        {
-            ch.report(Diagnostic::new("DBX003", IFN_MSG, a.range()));
         }
     }
 }
@@ -286,7 +385,7 @@ fn listing(ch: &Checker, e: &Expr) -> Option<(Listed, TextRange)> {
         } else {
             (Listed::Schemas, 0)
         };
-        if call_arg(sc.call, pat_pos, "pattern").is_some()
+        if sc.arg(pat_pos, "pattern").is_some()
             || sc.call.arguments.args.iter().any(|a| a.is_starred_expr())
             || sc.call.arguments.keywords.iter().any(|k| k.arg.is_none())
         {
@@ -294,10 +393,12 @@ fn listing(ch: &Checker, e: &Expr) -> Option<(Listed, TextRange)> {
         }
         return Some((kind, method_range(e)));
     }
-    if let Some(sc) = ch
-        .model
-        .spark_call_named(e, &["collect", "toLocalIterator"])
+    // A pull of every listed row (`collect()` / `toLocalIterator()`).
+    if let Some(sc) = ch.model.spark_call(e)
         && sc.is_dataframe()
+        && run_of_ty(sc.class(), sc.method).is_some_and(|r| {
+            r.unbounded_pull() && matches!(r.returns, Returns::Rows | Returns::RowIter)
+        })
     {
         return show_listing(ch, sc.receiver);
     }
@@ -394,24 +495,14 @@ fn report_listing_lookup(ch: &mut Checker, kind: Listed, range: TextRange) {
         Listed::Tables => "table",
         Listed::Schemas => "schema",
     };
-    let mut d = Diagnostic::new(
-        "DBX016",
-        format!(
-            "Existence check for one {what} by listing every {what}: the driver fetches the whole listing (one metastore round trip per page on Unity Catalog) to test a single name."
-        ),
-        range,
-    )
-    .with_help(format!(
-        "Use {} — one lookup. A pattern argument (listTables(db, pattern) / SHOW TABLES LIKE) also keeps the listing small.",
-        kind.exists_api()
-    ));
+    let api = kind.exists_api();
     // The listing call is a comprehension's iterable (evaluated once), so only
     // enclosing loops count.
-    if ch.model.in_loop(&range) {
-        d.message
-            .push_str(" Inside a loop, the full listing is fetched on every iteration.");
-        d = d.with_severity(Severity::Warning);
-    }
+    let d = if ch.model.in_repeating_loop(&range) {
+        msg!(DBX016_LOOP, range, what, api).with_severity(Severity::Warning)
+    } else {
+        msg!(DBX016, range, what, api)
+    };
     ch.report(d);
 }
 
@@ -519,11 +610,15 @@ pub fn show_tables_filter(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) {
     let Some((kind, _)) = show_listing(ch, sc.receiver) else {
         return;
     };
-    let Some(cond) = sc.args().first() else {
+    let sites = ch.model.sql_sites(expr);
+    let Some(site) = sites.first() else {
         return;
     };
-    let hit = if let Some(text) = static_text(cond) {
-        sql_name_equality(&text)
+    let Some(cond) = site.arg else {
+        return;
+    };
+    let hit = if let Some(text) = &site.text {
+        sql_name_equality(text.raw())
     } else {
         let mut found = false;
         walk_exprs(cond, &mut |x| {

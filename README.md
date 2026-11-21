@@ -81,6 +81,7 @@ etl.py:6:4: ACT006 [*] orders.count() used as an emptiness check scans every row
   |    ^^^^^^^^^^^^^^^^^^ ACT006
 7 |     orders.write.mode("overwrite").saveAsTable("analytics.big_orders")
   |
+  = help: isEmpty() (Spark 3.3+) runs a job that stops at the first row; on older versions use len(df.take(1)) == 0. Keep count() only when the number itself is needed.
   = fix: Replace with `not orders.isEmpty()`
 
 Found 2 findings in 1 file checked (0.00s).
@@ -128,11 +129,13 @@ spark-version = "3.5"        # fixes that need a newer Spark are not offered
 ```
 
 Test code usually calls actions on purpose: an assert like `df.count() > 0` or a
-`collect()` on a small fixture is fine there. Turn the action rules off for tests:
+`collect()` on a small fixture is fine there. Turn off the rules about pulling data to the
+driver and leftover debug output for tests (the compatibility and correctness rules stay on):
 
 ```toml
 [tool.sparklint.per-file-ignores]
-"tests/**" = ["ACT"]
+"tests/**" = ["ACT002", "ACT004", "ACT005", "ACT006", "ACT007", "ACT009", "ACT010", "PRF008", "PRF009"]
+"**/test_*.py" = ["ACT002", "ACT004", "ACT005", "ACT006", "ACT007", "ACT009", "ACT010", "PRF008", "PRF009"]
 ```
 
 All options are listed in the [configuration docs](https://clusterbite.github.io/sparklint/configuration/).

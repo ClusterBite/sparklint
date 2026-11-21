@@ -12,7 +12,8 @@
 use ruff_python_ast::{self as ast, Expr, ExprContext, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
-use sparklint_semantic::api::{ActionKind, action_kind};
+use sparklint_semantic::call_run::{RunKind, run_of_ty};
+use sparklint_semantic::transform;
 use sparklint_semantic::{BindingId, BindingKind, BranchStep, Ty};
 
 use super::exec_context::Run;
@@ -23,10 +24,15 @@ use crate::checker::{Checker, Node};
 pub enum Sink {
     /// A Spark action / write ends the chain.
     Action {
-        kind: ActionKind,
+        kind: RunKind,
         method: String,
         /// The chain passed through a projection/aggregation first (`select`, `agg`, …).
         projected: bool,
+        /// The action reads only a few rows: its receiver fits the driver (a row
+        /// bound such as `limit(n)`, `LIMIT n` SQL or an aggregate-only query,
+        /// driver-built data, catalog metadata) or the pull bounds itself (`take` /
+        /// `head` / `tail` / `first`).
+        few_rows: bool,
     },
     /// The chain result is assigned to another DataFrame binding.
     Derived(BindingId),
@@ -60,20 +66,6 @@ pub struct FlowState {
     pub tracked: FxHashSet<BindingId>,
     pub uses: FxHashMap<BindingId, Vec<UseRecord>>,
 }
-
-/// DataFrame methods whose DataFrame *arguments* flow into the result.
-const COMBINING: &[&str] = &[
-    "join",
-    "crossJoin",
-    "union",
-    "unionAll",
-    "unionByName",
-    "intersect",
-    "intersectAll",
-    "subtract",
-    "exceptAll",
-    "lateralJoin",
-];
 
 pub fn init(ch: &mut Checker) {
     let model = ch.model;
@@ -161,26 +153,28 @@ fn classify(ch: &Checker, start: TextRange) -> Sink {
                         m,
                         "select" | "selectExpr" | "agg" | "groupBy" | "groupby" | "count"
                     ) && matches!(rt.ty, Ty::DataFrame | Ty::GroupedData)
-                        && action_kind(rt.ty, m).is_none()
+                        && run_of_ty(rt.ty, m).is_none()
                     {
                         projected = true;
                     }
-                    match m {
-                        "unpersist" if rt.is_dataframe() => return Sink::Unpersist,
-                        "cache" | "persist" | "checkpoint" | "localCheckpoint"
-                            if rt.is_dataframe() =>
-                        {
+                    let row = transform::row(rt.ty, m);
+                    match row {
+                        Some(r) if r.effect == Some(transform::Effect::Unpersist) => {
+                            return Sink::Unpersist;
+                        }
+                        Some(r) if r.cache.is_some() => {
                             cached = true;
                         }
                         _ => {
-                            if let Some(kind) = action_kind(rt.ty, m) {
-                                if kind == ActionKind::Checkpoint {
+                            if let Some(run) = run_of_ty(rt.ty, m) {
+                                if run.kind == RunKind::Checkpoint {
                                     cached = true;
                                 } else {
                                     return Sink::Action {
-                                        kind,
+                                        kind: run.kind,
                                         method: m.to_string(),
                                         projected,
+                                        few_rows: rt.size().fits_driver() || run.self_bounded,
                                     };
                                 }
                             }
@@ -193,7 +187,7 @@ fn classify(ch: &Checker, start: TextRange) -> Sink {
             Node::Expr(Expr::Call(c)) if c.arguments.range.contains_range(cur) => {
                 // An argument: a combining DataFrame method keeps the flow going.
                 if let Expr::Attribute(a) = &*c.func
-                    && COMBINING.contains(&a.attr.as_str())
+                    && transform::frame_row(a.attr.as_str()).is_some_and(|r| r.combine.is_some())
                     && ch.model.is_dataframe(&a.value)
                     && c.arguments.args.iter().any(|x| x.range() == cur)
                 {
@@ -203,9 +197,10 @@ fn classify(ch: &Checker, start: TextRange) -> Sink {
                 }
                 if ch.model.qualified_name(&c.func).as_deref() == Some("databricks.display") {
                     return Sink::Action {
-                        kind: ActionKind::Display,
+                        kind: RunKind::Display,
                         method: "display".into(),
                         projected,
+                        few_rows: false,
                     };
                 }
                 if is_known_pure_call(ch, c) {
@@ -307,7 +302,7 @@ fn is_known_pure_call(ch: &Checker, c: &ast::ExprCall) -> bool {
 mod tests {
     use super::Sink;
     use crate::checker::testing::with_walked_checker;
-    use sparklint_semantic::api::ActionKind;
+    use sparklint_semantic::call_run::RunKind;
 
     const PRELUDE: &str = "from pyspark.sql import SparkSession\nspark = SparkSession.builder.getOrCreate()\nx = spark.table('t')\n";
 
@@ -331,14 +326,19 @@ mod tests {
                         kind,
                         method,
                         projected,
+                        few_rows,
                     } => {
                         let k = match kind {
-                            ActionKind::Write => "write",
-                            ActionKind::Display => "display",
-                            ActionKind::DriverCollect => "collect",
+                            RunKind::Write => "write",
+                            RunKind::Display => "display",
+                            RunKind::DriverPull => "collect",
                             _ => "job",
                         };
-                        format!("{k}:{method}{}", if *projected { "+proj" } else { "" })
+                        format!(
+                            "{k}:{method}{}{}",
+                            if *projected { "+proj" } else { "" },
+                            if *few_rows { "+rows" } else { "" }
+                        )
                     }
                     Sink::Derived(d) => format!("derived:{}", model.binding(*d).name),
                     Sink::Cache { derived } => format!(
@@ -362,6 +362,10 @@ mod tests {
                 &["write:saveAsTable"],
             ),
             ("x.select('a').collect()\n", &["collect:collect+proj"]),
+            (
+                "x.take(5)\nx.limit(5).collect()\n",
+                &["collect:take+rows", "collect:collect+rows"],
+            ),
             ("x.show()\n", &["display:show"]),
             ("display(x)\n", &["display:display"]),
             ("y = x.filter('a')\n", &["derived:y"]),

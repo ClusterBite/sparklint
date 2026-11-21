@@ -16,7 +16,7 @@
 //!   a dict literal used only there; the terminal's keyword arguments, `load(format=)`
 //!   / `start(format=)` / `save(format=)`, positional `schema` / `format` / jdbc
 //!   arguments, and the jdbc `properties` dict;
-//! - completeness: `**kwargs` we cannot see, `.options(d)`, a non-literal option key,
+//! - completeness: `**kwargs` we cannot see, `.options(d)`, a non-constant option key,
 //!   the stored builder configured by a separate statement (`r.option(..)` /
 //!   `r.schema(..)` on its own line: builders mutate in place), a loop-carried builder,
 //!   or a builder the oracle does not know to be rooted at `spark.read` /
@@ -28,11 +28,14 @@
 use ruff_python_ast::{self as ast, Expr};
 use ruff_text_size::Ranged;
 use rustc_hash::FxHashMap;
-use sparklint_semantic::api::{ActionKind, action_kind};
-use sparklint_semantic::{BindingId, SparkCall, Ty, call_arg, static_text, str_literal};
+use sparklint_semantic::call_run::{RunKind, run_of_ty};
+use sparklint_semantic::{
+    BindingId, Const, Hops, SemanticModel, SparkCall, Ty, call_arg, static_text,
+};
 
-use super::helpers::{bool_literal, method_call};
+use super::helpers::method_call;
 use crate::checker::Checker;
+use sparklint_semantic::columns::{column_args, column_name};
 
 /// Terminals named after their file format (`spark.read.csv(..)`, `df.write.parquet(..)`).
 const FORMAT_METHODS: &[&str] = &[
@@ -47,8 +50,8 @@ const CONFIG_METHODS: &[&str] = &["option", "options", "format", "schema"];
 const MAX_BINDINGS: usize = 32;
 
 /// The settings of one reader/writer terminal call.
-#[derive(Debug)]
 pub struct IoSettings<'e> {
+    model: &'e SemanticModel<'e>,
     /// The terminal's receiver class (`DataFrameReader`, `DataStreamWriter` …).
     pub class: Ty,
     /// The terminal method (`load`, `csv`, `saveAsTable` …).
@@ -57,7 +60,7 @@ pub struct IoSettings<'e> {
     pub call: &'e ast::ExprCall,
     /// Builder calls between the source and the terminal, closest to the terminal
     /// first (`option`, `mode`, `partitionBy` …).
-    pub calls: Vec<(&'e str, &'e ast::ExprCall)>,
+    calls: Vec<(&'e str, &'e ast::ExprCall)>,
     /// Writers: the DataFrame the writer came from (`df` in `df.write…` /
     /// `df.writeTo(..)` / `df.writeStream…`).
     pub df: Option<&'e Expr>,
@@ -72,6 +75,63 @@ pub struct IoSettings<'e> {
     complete: bool,
     /// `writeTo(table)` argument.
     write_to: Option<&'e Expr>,
+    /// [`Self::layout`], read once the chain is gathered.
+    layout: Layout,
+}
+
+/// How a batch write lands (Spark's `SaveMode`, plus what the linter cannot tell).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveMode {
+    Append,
+    Overwrite,
+    ErrorIfExists,
+    Ignore,
+    Unknown,
+}
+
+impl SaveMode {
+    /// A mode argument (`"append"`, `"error"`, any case, a name bound to one).
+    fn of(model: &SemanticModel, e: &Expr) -> SaveMode {
+        match model.const_str(e).map(str::to_ascii_lowercase).as_deref() {
+            Some("append") => SaveMode::Append,
+            Some("overwrite") => SaveMode::Overwrite,
+            Some("error" | "errorifexists" | "default") => SaveMode::ErrorIfExists,
+            Some("ignore") => SaveMode::Ignore,
+            _ => SaveMode::Unknown,
+        }
+    }
+}
+
+/// Writer calls that declare the output layout.
+const LAYOUT_CALLS: &[&str] = &[
+    "partitionBy",
+    "partitionedBy",
+    "bucketBy",
+    "sortBy",
+    "clusterBy",
+];
+
+/// A writer's declared layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Layout {
+    /// Column names given to `partitionBy` / `partitionedBy` (`"x"`, `F.col("x")`, a
+    /// list, tuple or starred list of them).
+    pub partition_by: Vec<String>,
+    /// The layout calls (`partitionBy`, `partitionedBy`, `bucketBy`, `sortBy`,
+    /// `clusterBy`), closest to the terminal first.
+    pub steps: Vec<&'static str>,
+}
+
+impl Layout {
+    /// The first of `methods` among the layout calls (closest to the terminal).
+    pub fn step(&self, methods: &[&str]) -> Option<&'static str> {
+        self.steps.iter().find(|s| methods.contains(s)).copied()
+    }
+
+    /// The writer declares a clustering or bucketing layout (`clusterBy`, `bucketBy`).
+    pub fn clustered(&self) -> bool {
+        self.step(&["clusterBy", "bucketBy"]).is_some()
+    }
 }
 
 fn is_reader(t: Ty) -> bool {
@@ -120,7 +180,8 @@ fn keyword(class: Ty, method: &str, param: &str) -> &'static str {
     match (param, method) {
         ("target", "saveAsTable") => "name",
         ("target", "insertInto" | "toTable" | "table") => "tableName",
-        ("path", "text") if is_reader(class) => "paths",
+        // `DataFrameReader.text(paths, ..)`; the streaming reader spells it `path`.
+        ("path", "text") if class == Ty::DataFrameReader => "paths",
         ("dbtable", _) => "table",
         ("partitioncolumn", _) => "column",
         ("lowerbound", _) => "lowerBound",
@@ -146,12 +207,13 @@ fn keyword(class: Ty, method: &str, param: &str) -> &'static str {
 fn splat_dict<'e>(ch: &Checker<'e>, e: &'e Expr) -> Option<&'e ast::ExprDict> {
     match e {
         Expr::Dict(d) => Some(d),
-        Expr::Name(n) => {
-            let b = ch.model.single_binding(n)?;
-            if ch.model.binding_uses(b).count() != 1 {
+        Expr::Name(_) => {
+            let (reached, _) = ch.model.hop(e, Hops::DEFAULT)?;
+            let [r] = reached[..] else { return None };
+            if ch.model.binding_uses(r.binding).count() != 1 {
                 return None;
             }
-            match ch.model.binding(b).value? {
+            match r.value? {
                 Expr::Dict(d) => Some(d),
                 _ => None,
             }
@@ -160,12 +222,13 @@ fn splat_dict<'e>(ch: &Checker<'e>, e: &'e Expr) -> Option<&'e ast::ExprDict> {
     }
 }
 
-/// Literal option value text; `False`/`True` as `"false"`/`"true"`.
-pub fn value_text(e: &Expr) -> Option<String> {
-    static_text(e).or_else(|| match e {
-        Expr::BooleanLiteral(b) => Some(b.value.to_string()),
-        _ => None,
-    })
+/// Constant option value text ([`Const::option_text`]: `True` → `"true"`, `8` → `"8"`,
+/// a name bound to one), else the static text of an f-string (`{}` for its holes).
+fn value_text(model: &SemanticModel, e: &Expr) -> Option<String> {
+    model
+        .constant(e)
+        .and_then(Const::option_text)
+        .or_else(|| static_text(e))
 }
 
 impl<'e> IoSettings<'e> {
@@ -177,6 +240,7 @@ impl<'e> IoSettings<'e> {
             return None;
         }
         let mut s = IoSettings {
+            model: ch.model,
             class,
             method: sc.method,
             call: sc.call,
@@ -189,6 +253,7 @@ impl<'e> IoSettings<'e> {
             schema: false,
             complete: true,
             write_to: None,
+            layout: Layout::default(),
         };
         s.terminal(ch);
         s.walk(ch, sc.receiver, &mut Vec::new());
@@ -197,6 +262,7 @@ impl<'e> IoSettings<'e> {
         if !ch.model.ty_of(sc.receiver).facts.fresh_builder {
             s.complete = false;
         }
+        s.layout = s.read_layout(ch);
         Some(s)
     }
 
@@ -205,7 +271,7 @@ impl<'e> IoSettings<'e> {
     pub fn write(ch: &Checker<'e>, expr: &'e Expr) -> Option<Self> {
         let sc = ch.model.spark_call(expr)?;
         let rt = sc.class();
-        if action_kind(rt, sc.method) != Some(ActionKind::Write)
+        if run_of_ty(rt, sc.method).map(|r| r.kind) != Some(RunKind::Write)
             || !matches!(rt, Ty::DataFrameWriter | Ty::DataFrameWriterV2)
         {
             return None;
@@ -229,14 +295,14 @@ impl<'e> IoSettings<'e> {
         self.options.get(key).copied().flatten()
     }
 
-    /// Literal text of option `key` (`True` → `"true"`).
+    /// Constant text of option `key` (`True` → `"true"`, a name bound to a constant).
     pub fn text(&self, key: &str) -> Option<String> {
-        self.option(key).and_then(value_text)
+        value_text(self.model, self.option(key)?)
     }
 
-    /// Boolean value of option `key` (`True` / `"true"`).
+    /// Boolean value of option `key` (`True` / `"true"`, a name bound to one).
     pub fn flag(&self, key: &str) -> Option<bool> {
-        self.option(key).and_then(bool_literal)
+        self.model.constant(self.option(key)?)?.as_flag()
     }
 
     /// An explicit schema is set (`.schema(..)`, `schema=`, a positional schema, a
@@ -245,7 +311,7 @@ impl<'e> IoSettings<'e> {
         self.schema || self.has("schema")
     }
 
-    /// Every setting is visible (no `**kwargs`, opaque option dicts, non-literal keys
+    /// Every setting is visible (no `**kwargs`, opaque option dicts, non-constant keys
     /// or separate configuring statements).
     pub fn complete(&self) -> bool {
         self.complete
@@ -262,17 +328,83 @@ impl<'e> IoSettings<'e> {
             "saveAsTable" => call_arg(c, 0, "name"),
             "insertInto" | "toTable" | "table" => call_arg(c, 0, "tableName"),
             "jdbc" => call_arg(c, 1, "table"),
-            "text" if is_reader(self.class) => call_arg(c, 0, "paths"),
+            "text" if self.class == Ty::DataFrameReader => call_arg(c, 0, "paths"),
             _ => call_arg(c, 0, "path"),
         };
         direct.or_else(|| self.option("path"))
     }
 
-    /// Write mode: the terminal's `mode` argument (`save(p, mode="append")`,
+    /// How the write lands ([`SaveMode`]): a `writeTo(..)` chain by its terminal
+    /// (`append` / `overwrite` / `overwritePartitions` / `createOrReplace` / `replace` /
+    /// `create`); `insertInto` by its `overwrite` flag when given (Python truthiness,
+    /// pyspark's `if overwrite is not None`), else overwrite only for an overwrite mode
+    /// (Spark appends for every other mode); other terminals by the mode ([`Self::mode`]),
+    /// Spark's default `ErrorIfExists` when no mode is set and the chain is complete.
+    /// `Unknown`: a mode or flag that is no constant, a mode set where the chain is not in
+    /// view, a streaming writer.
+    pub fn write_mode(&self) -> SaveMode {
+        match self.class {
+            Ty::DataFrameWriterV2 => {
+                return match self.method {
+                    "append" => SaveMode::Append,
+                    "overwrite" | "overwritePartitions" | "createOrReplace" | "replace" => {
+                        SaveMode::Overwrite
+                    }
+                    "create" => SaveMode::ErrorIfExists,
+                    _ => SaveMode::Unknown,
+                };
+            }
+            Ty::DataFrameWriter => {}
+            _ => return SaveMode::Unknown,
+        }
+        let model = self.model;
+        if self.method == "insertInto" {
+            if let Some(flag) = model.given_arg(self.call, 1, "overwrite") {
+                return match model.constant(flag).map(Const::truthy) {
+                    Some(true) => SaveMode::Overwrite,
+                    Some(false) => SaveMode::Append,
+                    None => SaveMode::Unknown,
+                };
+            }
+            return match self.mode_arg().map(|m| SaveMode::of(model, m)) {
+                Some(SaveMode::Overwrite) => SaveMode::Overwrite,
+                Some(SaveMode::Unknown) => SaveMode::Unknown,
+                _ => SaveMode::Append,
+            };
+        }
+        match self.mode_arg() {
+            Some(m) => SaveMode::of(model, m),
+            None if self.complete => SaveMode::ErrorIfExists,
+            None => SaveMode::Unknown,
+        }
+    }
+
+    /// The writer's declared layout: `partitionBy` / `partitionedBy` columns and the
+    /// layout calls (`bucketBy`, `clusterBy` …).
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    /// No builder call but `.mode()` between the writer and the terminal.
+    pub fn bare(&self) -> bool {
+        self.calls.iter().all(|(m, _)| *m == "mode")
+    }
+
+    /// Write mode text: the terminal's `mode` argument (`save(p, mode="append")`,
     /// `save(p, "delta", "append")`), else the `.mode()` call closest to the terminal
-    /// (lower-cased literal).
-    pub fn mode(&self) -> Option<String> {
-        let lower = |e: &Expr| str_literal(e).map(str::to_ascii_lowercase);
+    /// (a lower-cased string constant). A `None` mode is not given (pyspark keeps the
+    /// mode set before). The rules ask [`Self::write_mode`]; this is the table test's
+    /// view of the text.
+    #[cfg(test)]
+    fn mode(&self) -> Option<String> {
+        self.mode_arg()
+            .and_then(|e| self.model.const_str(e))
+            .map(str::to_ascii_lowercase)
+    }
+
+    /// The expression that sets the mode, as given (see [`Self::mode`]).
+    fn mode_arg(&self) -> Option<&'e Expr> {
+        let model = self.model;
         let at = params(self.class, self.method)
             .iter()
             .position(|p| *p == "mode");
@@ -286,27 +418,32 @@ impl<'e> IoSettings<'e> {
                 .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "mode"))
                 .map(|k| &k.value),
         };
-        if let Some(v) = arg {
-            return lower(v);
+        if let Some(v) = arg.and_then(|a| model.given(a)) {
+            return Some(v);
         }
         self.calls
             .iter()
-            .find(|(m, _)| *m == "mode")
-            .and_then(|(_, c)| c.arguments.args.first().and_then(lower))
+            .filter(|(m, _)| *m == "mode")
+            .find_map(|(_, c)| model.given_arg(c, 0, "saveMode"))
     }
 
-    /// Column names given to `partitionBy` / `partitionedBy` (`"x"` or `F.col("x")`).
-    pub fn partition_by(&self) -> Vec<String> {
-        self.calls
+    fn read_layout(&self, ch: &Checker<'e>) -> Layout {
+        let steps: Vec<&'static str> = self
+            .calls
+            .iter()
+            .filter_map(|(m, _)| LAYOUT_CALLS.iter().find(|l| **l == *m).copied())
+            .collect();
+        let partition_by = self
+            .calls
             .iter()
             .filter(|(m, _)| *m == "partitionBy" || *m == "partitionedBy")
-            .flat_map(|(_, c)| {
-                c.arguments.args.iter().flat_map(|a| match a {
-                    Expr::List(l) => l.elts.iter().filter_map(column_name).collect::<Vec<_>>(),
-                    other => column_name(other).into_iter().collect(),
-                })
-            })
-            .collect()
+            .flat_map(|(_, c)| column_args(c.arguments.args.iter()).exprs)
+            .filter_map(|e| column_name(ch.model, e))
+            .collect();
+        Layout {
+            partition_by,
+            steps,
+        }
     }
 
     // ---------------------------------------------------------------- building
@@ -319,9 +456,10 @@ impl<'e> IoSettings<'e> {
             .or_insert(value);
     }
 
-    fn set_format(&mut self, e: Option<&Expr>) {
+    /// A format argument (a string constant; `None` is not given).
+    fn set_format(&mut self, e: Option<&'e Expr>) {
         if self.format.is_none()
-            && let Some(f) = e.and_then(str_literal)
+            && let Some(f) = e.and_then(|e| self.model.const_str(e))
         {
             self.format = Some(f.to_ascii_lowercase());
         }
@@ -330,7 +468,7 @@ impl<'e> IoSettings<'e> {
     /// Keys of a dict literal (`options(**{..})`, jdbc `properties`).
     fn dict(&mut self, d: &'e ast::ExprDict, strict: bool) {
         for it in &d.items {
-            match it.key.as_ref().and_then(str_literal) {
+            match it.key.as_ref().and_then(|k| self.model.const_str(k)) {
                 Some(k) => self.set(k, Some(&it.value)),
                 None if strict => self.complete = false,
                 None => {}
@@ -361,25 +499,28 @@ impl<'e> IoSettings<'e> {
             used.push(kw);
             match *p {
                 "format" => self.set_format(Some(v)),
-                "schema" => self.schema = true,
+                "schema" => self.schema |= ch.model.given(v).is_some(),
                 "target" | "mode" | "overwrite" | "partitionby" | "outputmode" | "queryname" => {}
                 "properties" => {
-                    let props = match v {
-                        Expr::Name(n) => ch
-                            .model
-                            .single_binding(n)
-                            .and_then(|b| ch.model.binding(b).value),
-                        e => Some(e),
-                    };
                     // An opaque properties value (a parameter, a call) may hold any
                     // option.
-                    match props {
-                        Some(Expr::Dict(d)) => self.dict(d, true),
-                        Some(Expr::NoneLiteral(_)) => {}
-                        _ => self.complete = false,
+                    let (values, complete) = ch.model.known_values(v, Hops::DEFAULT);
+                    self.complete &= complete;
+                    for (p, _) in values {
+                        match p {
+                            Expr::Dict(d) => self.dict(d, true),
+                            Expr::NoneLiteral(_) => {}
+                            _ => self.complete = false,
+                        }
                     }
                 }
-                key => self.set(key, Some(v)),
+                // pyspark drops terminal arguments that are `None` (`_set_opts`;
+                // `jdbc(column=None)` reads on one connection): not given.
+                key => {
+                    if ch.model.given(v).is_some() {
+                        self.set(key, Some(v));
+                    }
+                }
             }
         }
         for k in &c.arguments.keywords {
@@ -387,9 +528,13 @@ impl<'e> IoSettings<'e> {
                 None => self.splat(ch, &k.value),
                 Some(a) if used.contains(&a.as_str()) => {}
                 Some(a) => match a.as_str() {
-                    "schema" => self.schema = true,
+                    "schema" => self.schema |= ch.model.given(&k.value).is_some(),
                     "format" => self.set_format(Some(&k.value)),
-                    other => self.set(other, Some(&k.value)),
+                    other => {
+                        if ch.model.given(&k.value).is_some() {
+                            self.set(other, Some(&k.value));
+                        }
+                    }
                 },
             }
         }
@@ -402,7 +547,7 @@ impl<'e> IoSettings<'e> {
             "format" | "using" => self.set_format(c.arguments.args.first()),
             "schema" => self.schema = true,
             "option" => match call_arg(c, 0, "key") {
-                Some(k) => match str_literal(k) {
+                Some(k) => match ch.model.const_str(k) {
                     Some(k) => self.set(k, call_arg(c, 1, "value")),
                     None => self.complete = false,
                 },
@@ -539,6 +684,7 @@ impl<'e> IoSettings<'e> {
     /// A blank picture for one path of a name bound on several paths.
     fn empty_path(&self) -> IoSettings<'e> {
         IoSettings {
+            model: self.model,
             class: self.class,
             method: self.method,
             call: self.call,
@@ -551,6 +697,7 @@ impl<'e> IoSettings<'e> {
             schema: false,
             complete: true,
             write_to: None,
+            layout: Layout::default(),
         }
     }
 
@@ -609,29 +756,6 @@ impl<'e> IoSettings<'e> {
     }
 }
 
-/// `"x"` or `F.col("x")` → `x`.
-pub fn column_name(e: &Expr) -> Option<String> {
-    if let Some(s) = str_literal(e) {
-        return Some(s.to_string());
-    }
-    if let Expr::Call(c) = e
-        && let Some(n) = match &*c.func {
-            Expr::Name(n) => Some(n.id.as_str()),
-            Expr::Attribute(a) => Some(a.attr.as_str()),
-            _ => None,
-        }
-        && matches!(n, "col" | "column")
-    {
-        return c
-            .arguments
-            .args
-            .first()
-            .and_then(str_literal)
-            .map(str::to_string);
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::IoSettings;
@@ -657,8 +781,25 @@ mod tests {
     }
 
     fn answer(body: &str) -> Option<Answer> {
+        with_settings(body, |ch, io| {
+            let mut keys: Vec<String> = io.options.keys().cloned().collect();
+            keys.sort();
+            Answer {
+                format: io.format().map(str::to_string),
+                keys,
+                schema: io.has_schema(),
+                complete: io.complete(),
+                target: io.target().map(|t| ch.slice(t.range()).to_string()),
+                mode: io.mode(),
+                df: io.df.is_some(),
+            }
+        })
+    }
+
+    /// `f` of the settings of the last statement's call.
+    fn with_settings<T>(body: &str, f: impl FnOnce(&Checker, &IoSettings) -> T) -> Option<T> {
         let src = format!(
-            "from pyspark.sql import SparkSession\nspark = SparkSession.builder.getOrCreate()\ndf = spark.table('t')\n{body}\n"
+            "from pyspark.sql import SparkSession\nfrom pyspark.sql import functions as F\nspark = SparkSession.builder.getOrCreate()\ndf = spark.table('t')\n{body}\n"
         );
         let file = SourceFile::from_text(Path::new("t.py"), src.clone());
         let settings = LinterSettings::for_selectors(&["IOD001"]).unwrap();
@@ -675,17 +816,7 @@ mod tests {
         };
         let sc = ch.model.spark_call(expr)?;
         let io = IoSettings::of(&ch, &sc)?;
-        let mut keys: Vec<String> = io.options.keys().cloned().collect();
-        keys.sort();
-        Some(Answer {
-            format: io.format().map(str::to_string),
-            keys,
-            schema: io.has_schema(),
-            complete: io.complete(),
-            target: io.target().map(|t| ch.slice(t.range()).to_string()),
-            mode: io.mode(),
-            df: io.df.is_some(),
-        })
+        Some(f(&ch, &io))
     }
 
     /// (settings in, answers out): format, option keys, schema, complete, target, mode.
@@ -795,9 +926,18 @@ mod tests {
                 Some("'/p'"),
                 None,
             ),
-            // non-literal option key
+            // option key held in a constant; a key that is no constant
             (
                 "k = 'a'\nx = spark.read.option(k, 1).csv('/p')",
+                Some("csv"),
+                &["a", "path"],
+                false,
+                true,
+                Some("'/p'"),
+                None,
+            ),
+            (
+                "x = spark.read.option(k(), 1).csv('/p')",
                 Some("csv"),
                 &["path"],
                 false,
@@ -948,6 +1088,16 @@ mod tests {
                 Some("'t'"),
                 None,
             ),
+            // `None` arguments are dropped like pyspark does (also through a name)
+            (
+                "n = None\nx = spark.read.jdbc('u', 't', None, predicates=n, inferSchema=None)",
+                Some("jdbc"),
+                &["dbtable", "url"],
+                false,
+                true,
+                Some("'t'"),
+                None,
+            ),
             // streaming writer: start(path, format, ...) and **options
             (
                 "x = df.writeStream.format('delta').start('/o', checkpointLocation='/c')",
@@ -1004,6 +1154,34 @@ mod tests {
                 Some("'t'"),
                 Some("append"),
             ),
+            // a mode held in a constant; a None mode keeps the one set before
+            (
+                "MODE = 'append'\ndf.write.mode(MODE).saveAsTable('t')",
+                None,
+                &[],
+                false,
+                true,
+                Some("'t'"),
+                Some("append"),
+            ),
+            (
+                "df.write.mode('append').saveAsTable('t', mode=None)",
+                None,
+                &[],
+                false,
+                true,
+                Some("'t'"),
+                Some("append"),
+            ),
+            (
+                "df.write.mode('overwrite').mode(None).save('/p')",
+                None,
+                &["path"],
+                false,
+                true,
+                Some("'/p'"),
+                Some("overwrite"),
+            ),
             (
                 "df.writeTo('cat.t').using('delta').append()",
                 Some("delta"),
@@ -1027,6 +1205,134 @@ mod tests {
             };
             assert_eq!(a, want, "{src}");
         }
+    }
+
+    /// (write call, save mode, layout steps): every spelling of the save mode.
+    #[test]
+    fn write_mode_table() {
+        use super::SaveMode::{self, *};
+        let rows: &[(&str, SaveMode, &[&str])] = &[
+            // terminal argument, keyword or positional; `.mode()`; Spark's default
+            ("df.write.save('/p', mode='append')", Append, &[]),
+            (
+                "df.write.mode('append').save('/p', 'delta', 'Overwrite')",
+                Overwrite,
+                &[],
+            ),
+            ("df.write.mode('ignore').saveAsTable('t')", Ignore, &[]),
+            (
+                "df.write.mode('error').saveAsTable('t')",
+                ErrorIfExists,
+                &[],
+            ),
+            (
+                "df.write.mode('errorifexists').parquet('/p')",
+                ErrorIfExists,
+                &[],
+            ),
+            ("df.write.saveAsTable('t')", ErrorIfExists, &[]),
+            (
+                "df.write.mode(saveMode='overwrite').saveAsTable('t')",
+                Overwrite,
+                &[],
+            ),
+            // constants; None is not given; no constant / unknown text
+            (
+                "M = 'append'
+df.write.mode(M).saveAsTable('t')",
+                Append,
+                &[],
+            ),
+            (
+                "df.write.mode('append').mode(None).saveAsTable('t')",
+                Append,
+                &[],
+            ),
+            (
+                "df.write.mode('append').saveAsTable('t', mode=None)",
+                Append,
+                &[],
+            ),
+            ("df.write.mode(m()).saveAsTable('t')", Unknown, &[]),
+            ("df.write.mode('upsert').saveAsTable('t')", Unknown, &[]),
+            // a chain not in view: no mode is no default
+            (
+                "def mk():
+    return df.write
+mk().saveAsTable('t')",
+                Unknown,
+                &[],
+            ),
+            // insertInto: the flag (truthiness) when given, else overwrite only for an
+            // overwrite mode
+            ("df.write.insertInto('t')", Append, &[]),
+            ("df.write.insertInto('t', True)", Overwrite, &[]),
+            (
+                "df.write.mode('overwrite').insertInto('t', overwrite=False)",
+                Append,
+                &[],
+            ),
+            (
+                "df.write.mode('overwrite').insertInto('t', overwrite=None)",
+                Overwrite,
+                &[],
+            ),
+            (
+                "O = None
+df.write.mode('overwrite').insertInto('t', O)",
+                Overwrite,
+                &[],
+            ),
+            (
+                "O = True
+df.write.insertInto('t', O)",
+                Overwrite,
+                &[],
+            ),
+            ("df.write.insertInto('t', 'false')", Overwrite, &[]),
+            ("df.write.insertInto('t', 0)", Append, &[]),
+            ("df.write.insertInto('t', flag())", Unknown, &[]),
+            ("df.write.mode('overwrite').insertInto('t')", Overwrite, &[]),
+            ("df.write.mode('error').insertInto('t')", Append, &[]),
+            ("df.write.mode(m()).insertInto('t')", Unknown, &[]),
+            // writeTo terminals
+            ("df.writeTo('t').append()", Append, &[]),
+            ("df.writeTo('t').overwritePartitions()", Overwrite, &[]),
+            ("df.writeTo('t').overwrite(c)", Overwrite, &[]),
+            ("df.writeTo('t').createOrReplace()", Overwrite, &[]),
+            (
+                "df.writeTo('t').partitionedBy('d').create()",
+                ErrorIfExists,
+                &["partitionedBy"],
+            ),
+            // layout calls, closest to the terminal first
+            (
+                "df.write.partitionBy('d').bucketBy(4, 'k').sortBy('k').saveAsTable('t')",
+                ErrorIfExists,
+                &["sortBy", "bucketBy", "partitionBy"],
+            ),
+            (
+                "df.write.clusterBy('k').mode('append').saveAsTable('t')",
+                Append,
+                &["clusterBy"],
+            ),
+            // a streaming writer has output modes, not save modes
+            (
+                "df.writeStream.outputMode('append').start('/p')",
+                Unknown,
+                &[],
+            ),
+        ];
+        for (src, mode, steps) in rows {
+            let got = with_settings(src, |_, io| (io.write_mode(), io.layout().steps.clone()))
+                .unwrap_or_else(|| panic!("no settings for {src}"));
+            assert_eq!(got, (*mode, steps.to_vec()), "{src}");
+        }
+        let cols = with_settings(
+            "df.write.partitionBy('a', F.col('b')).partitionBy(*['c']).save('/p')",
+            |_, io| io.layout().partition_by.clone(),
+        );
+        assert_eq!(cols, Some(vec!["c".to_string(), "a".into(), "b".into()]));
     }
 
     #[test]

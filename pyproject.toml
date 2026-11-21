@@ -41,6 +41,7 @@ Documentation = "https://clusterbite.github.io/sparklint/"
 Rules = "https://clusterbite.github.io/sparklint/rules/"
 Changelog = "https://github.com/clusterbite/sparklint/blob/main/CHANGELOG.md"
 Issues = "https://github.com/clusterbite/sparklint/issues"
+"Made by ClusterBite" = "https://clusterbite.com/?utm_source=pypi&utm_medium=sidebar&utm_campaign=sparklint"
 
 [tool.maturin]
 bindings = "bin"

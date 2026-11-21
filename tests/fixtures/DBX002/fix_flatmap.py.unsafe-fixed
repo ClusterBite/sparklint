@@ -1,0 +1,14 @@
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+
+spark = SparkSession.builder.getOrCreate()
+
+df = spark.table("t")
+# flatMap flattens what the lambda returns: the column-to-list idiom.
+names = [v for x in df.select("name").collect() for v in x]  # expect: DBX002
+tags = [v for r in df.collect() for v in r.tags]  # expect: DBX002
+# The flattened value gets a name no word of the lambda uses.
+vals = [item for v in df.collect() for item in v.value]  # expect: DBX002
+either = [v for r in df.collect() for v in (r.a if r.b else r.c)]  # expect: DBX002
+# Not collected: reported, no fix.
+first = df.rdd.flatMap(lambda r: r).take(5)  # expect: DBX002

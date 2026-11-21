@@ -11,7 +11,7 @@ Rust 1.97 or newer (edition 2024) and, for the wheel, [maturin](https://www.matu
 | `crates/sparklint_source` | Loader: `.py`, Databricks source notebooks, `.ipynb` (ruff_notebook), cell map |
 | `crates/sparklint_semantic` | Scopes/bindings, def-use, Spark type oracle, function summaries, `ProjectIndex` |
 | `crates/sparklint_linter` | Registry (`spec/rules.json`), `Checker`, rules, noqa, config, fixes |
-| `crates/sparklint` | CLI binary (`check`, `rule`, `rules`, `version`): `check.rs`, `discover.rs` (file discovery), `output.rs` (text / json / github / sarif), `rules_cmd.rs` |
+| `crates/sparklint` | CLI binary (`check`, `rule`, `rules`, `version`): `check.rs`, `discover.rs` (file discovery), `output.rs` (one renderer per format: text / json / github / sarif, each taking an `output::Hook` for additions; plain `check` passes `()`), `rules_cmd.rs` |
 | `python/sparklint` | Python package: `find_sparklint_bin()`, `python -m sparklint` |
 | `spec/pyspark_api.json` | Generated PySpark API model (`scripts/gen_api.py`) |
 | `spec/rules.json` | Rule metadata generated from `docs/RULES_CATALOG.md` (`scripts/gen_rules.py`) |
@@ -39,6 +39,20 @@ together, module names relative to the subdirectory (`from readers import f` res
 - a line ending in `# expect: CODE` (comma-separated list allowed) must produce that
   diagnostic, reported on that line (the diagnostic's start line);
 - no other line may produce it;
+- each code may carry checks that every diagnostic of that code on the line must pass:
+  an optional `[severity]` (`info` / `warning` / `error`), then any number of
+  `~"fragment"` (the message contains it), `!~"fragment"` (it does not) and
+  `help~"fragment"` (the help text contains it); fragments are quoted with `"` or `'`
+  (no escapes), commas inside quotes belong to the fragment:
+
+  ```python
+  for r in rows: pass  # expect: ACT004[info] ~"(rows from df.collect())"
+  x = df.join(b.hint("shuffle_replicate_nl"), "k")  # expect: PRF036 !~"Inside a loop"
+  ```
+
+  A malformed `# expect:` comment fails the test. Put a rule's severity tiers and message
+  variants here, next to its other cases, not in Rust unit tests (the `lib.rs` tests cover
+  engine behaviour only: parsing, notebooks, noqa, fixes);
 - if `<name>.py.fixed` exists, applying the *safe* fixes to `<name>.py` must give exactly
   that text;
 - every implemented rule needs a fixtures directory with at least one positive expectation
@@ -111,6 +125,7 @@ rollup-min-columns = 8          # PRF024: rollup() with >= N columns (N+1 sets);
 pipeline-fanout-min-flows = 3   # DBX017: source streamed by >= N pipeline datasets; 0 = off
 distinct-aggregates-min = 3     # PRF026: >= N distinct aggregates over different columns in one aggregation; 0 = off
 zorder-max-columns = 3          # IOD020: ZORDER BY with more than N columns; 0 = off
+driver-loop-small-max = 10      # ACT005 / IOD006: loops over a literal / constant list of <= N items are info
 broadcast-threshold-max = "1g"  # CFG007: autoBroadcastJoinThreshold at or above this size; "0" = off
 functions-aliases = ["F", "sf"]
 

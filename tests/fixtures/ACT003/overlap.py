@@ -9,3 +9,9 @@ df = spark.table("t")
 
 for _, r in df.toPandas().iterrows():  # expect: ACT003
     print(r)
+
+# ACT009 (driver compute over the pull) wins at the same toPandas() call.
+n = len(df.toPandas())  # expect: ACT003
+total = sum(df.toPandas()["x"])  # expect: ACT003
+pdf = df.toPandas()  # expect: ACT003
+top = max(pdf["x"])

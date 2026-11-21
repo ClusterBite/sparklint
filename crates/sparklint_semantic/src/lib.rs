@@ -7,34 +7,49 @@
 //! model.spark_call(expr)       // -> Some(SparkCall { "pyspark.sql.DataFrame.count", confidence, bounded, .. })
 //! model.in_loop(&node)         // lexically inside a loop of the same function
 //! model.reaching(name) / model.binding_uses(id)   // def-use
+//! model.value_of(e, Hops::DEFAULT) / items_of(e, ..) // what a name / iterable holds
 //! ```
 //! The model is file-pure; cross-file knowledge enters only through a
 //! [`SummaryProvider`] (see [`index::ProjectIndex`]).
 
 pub mod api;
 mod builder;
+pub mod call_run;
+pub mod columns;
+pub mod constant;
 pub mod evidence;
 pub mod facts;
+mod frame_columns;
 pub mod index;
 mod infer;
 pub mod library;
+pub mod literal;
+pub mod loop_character;
+pub mod loop_exit;
 mod model;
+pub mod pulled;
+pub mod size;
 mod spark_call;
 pub mod sql;
+pub mod transform;
 pub mod types;
+pub mod udf_refs;
+pub mod values;
 
 pub use builder::build_model;
-pub use facts::{Facts, Partitioning, Step};
+pub use constant::{Const, int_literal, str_literal};
+pub use facts::{Columns, Facts, Partitioning, Step};
 pub use index::{ProjectIndex, module_name_for_path};
-pub use infer::{
-    call_arg, int_literal, is_dataframe_name, is_logger_name, is_session_name, static_text,
-    str_literal,
-};
+pub use infer::{call_arg, is_dataframe_name, is_logger_name, is_session_name, static_text};
 pub use library::Lib;
 pub use model::*;
+pub use size::Size;
 pub use spark_call::SparkCall;
-pub use sql::{SetPair, SqlCond, SqlConjunct, SqlText};
+pub use sql::{
+    NullComparison, RunningCollect, SetPair, SqlCond, SqlConjunct, SqlSite, SqlSiteKind, SqlText,
+};
 pub use types::{Confidence, Elem, Ty, TypeInfo};
+pub use values::{CONTAINER_MUTATORS, Hops, Item, Items, NAME_HOPS, Reached};
 
 #[cfg(test)]
 mod tests {
@@ -713,10 +728,10 @@ mod tests {
 
     #[test]
     fn window_frames() {
-        let src = "import sys\nfrom pyspark.sql.window import Window as W\nw1 = W.orderBy('t').rowsBetween(W.unboundedPreceding, W.currentRow)\nw2 = W.orderBy('t').rowsBetween(-sys.maxsize - 1, 0)\nw3 = W.orderBy('t').rowsBetween(W.unboundedPreceding, W.unboundedFollowing)\nw4 = W.orderBy('t').rowsBetween(-3, 0)\nw5 = W.orderBy('t').rangeBetween(start=-sys.maxsize, end=5)\nw6 = w1.rowsBetween(-1, 0)\nw7 = W.orderBy('t').rowsBetween(lo, 0)\nw1\nw2\nw3\nw4\nw5\nw6\nw7\n";
+        let src = "import sys\nfrom pyspark.sql.window import Window as W\nw1 = W.orderBy('t').rowsBetween(W.unboundedPreceding, W.currentRow)\nw2 = W.orderBy('t').rowsBetween(-sys.maxsize - 1, 0)\nw3 = W.orderBy('t').rowsBetween(W.unboundedPreceding, W.unboundedFollowing)\nw4 = W.orderBy('t').rowsBetween(-3, 0)\nw5 = W.orderBy('t').rangeBetween(start=-sys.maxsize, end=5)\nw6 = w1.rowsBetween(-1, 0)\nw7 = W.orderBy('t').rowsBetween(lo, 0)\nw8 = W.orderBy('t').rowsBetween(-(2**63), 0)\nw9 = W.orderBy('t').rowsBetween(-10**9, -1)\nw10 = W.orderBy('t').rowsBetween(-1_000_000, 0)\nw11 = W.orderBy('t').rowsBetween(-999_999, 0)\nw12 = W.orderBy('t').rowsBetween(-5, 10**9)\nw1\nw2\nw3\nw4\nw5\nw6\nw7\nw8\nw9\nw10\nw11\nw12\n";
         let g = |n| ty_last(src, n).facts.win_frame_growing;
-        assert!(g("w1") && g("w2") && g("w5"));
-        assert!(!g("w3") && !g("w4") && !g("w6") && !g("w7"));
+        assert!(g("w1") && g("w2") && g("w5") && g("w8") && g("w9") && g("w10"));
+        assert!(!g("w3") && !g("w4") && !g("w6") && !g("w7") && !g("w11") && !g("w12"));
         assert!(ty_last(src, "w7").facts.win_framed);
     }
 

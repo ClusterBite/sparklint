@@ -155,24 +155,37 @@ pub fn run(args: &CheckArgs) -> anyhow::Result<u8> {
 
     // Phase B: lint (and fix) each file.
     let fix = args.fix || args.unsafe_fixes;
-    let results: Vec<(Loaded, Vec<Diagnostic>, Option<String>, usize)> = sources
+    // Suppression-comment tokens that name no rule are warnings (they suppress nothing).
+    type Linted = (Loaded, Vec<Diagnostic>, Option<String>, usize, Vec<String>);
+    let mut results: Vec<Linted> = sources
         .into_par_iter()
         .zip(&settings)
         .map(|(l, settings)| {
             let module = Some(l.module.clone());
+            let unknown = unknown_ref_warnings(&l);
             if fix {
                 let out = lint_and_fix(&l.source, settings, &index, module, args.unsafe_fixes);
-                (l, out.diagnostics, out.fixed_text, out.fixes_applied)
+                (
+                    l,
+                    out.diagnostics,
+                    out.fixed_text,
+                    out.fixes_applied,
+                    unknown,
+                )
             } else {
                 let d = lint_source(&l.source, settings, &index, module);
-                (l, d, None, 0)
+                (l, d, None, 0, unknown)
             }
         })
         .collect();
+    results.sort_by(|a, b| a.0.display.cmp(&b.0.display));
+    for w in results.iter().flat_map(|r| &r.4) {
+        eprintln!("sparklint: warning: {w}");
+    }
 
     let mut reports = Vec::with_capacity(results.len());
     let mut fixed_total = 0;
-    for (l, diagnostics, fixed_text, applied) in results {
+    for (l, diagnostics, fixed_text, applied, _) in results {
         if let Some(original) = &l.stdin {
             if fix {
                 // Like ruff: the (fixed) source goes to stdout, the report to stderr.
@@ -259,17 +272,38 @@ fn print(
     if args.statistics {
         output::statistics(out, reports, args.output_format)?;
     } else {
+        let order = output::file_order(reports);
         match args.output_format {
-            crate::OutputFormat::Text => output::text(out, reports)?,
-            crate::OutputFormat::Json => output::json(out, reports)?,
-            crate::OutputFormat::Github => output::github(out, reports)?,
-            crate::OutputFormat::Sarif => output::sarif(out, reports)?,
+            crate::OutputFormat::Text => output::text(out, reports, &order, &())?,
+            crate::OutputFormat::Json => output::json(out, reports, &order, &())?,
+            crate::OutputFormat::Github => output::github(out, reports, &order, &())?,
+            crate::OutputFormat::Sarif => output::sarif(out, reports, &order, &())?,
         }
     }
     if args.output_format == crate::OutputFormat::Text && !args.quiet {
         output::summary(out, summary)?;
     }
     Ok(())
+}
+
+/// `path:line: unknown rule `x` in a suppression comment ..` for every token in the
+/// file's suppression comments that names no rule (Jupyter: `path:cell N:line`).
+fn unknown_ref_warnings(l: &Loaded) -> Vec<String> {
+    sparklint_linter::unknown_rule_refs(&l.source)
+        .into_iter()
+        .map(|(line, token)| {
+            let loc = l.source.location(l.source.line_index.line_start(line));
+            let at = match (l.source.kind, loc.cell, loc.cell_line) {
+                (sparklint_source::SourceKind::Jupyter, Some(c), Some(cl)) => {
+                    format!("{}:cell {c}:{cl}", l.display)
+                }
+                _ => format!("{}:{line}", l.display),
+            };
+            format!(
+                "{at}: unknown rule `{token}` in a suppression comment (it suppresses nothing; expected a code, prefix, rule name, `tag:<name>`, preset, ALL or cylint code)"
+            )
+        })
+        .collect()
 }
 
 /// The file read from standard input: config and module name from its stated path,

@@ -34,13 +34,19 @@ type oracle the rules rely on.
 ## Adding or changing a rule
 
 1. Describe the rule in [docs/RULES_CATALOG.md](docs/RULES_CATALOG.md) (why it is slow or
-   wrong, what is detected, false-positive risks, sources), then regenerate the metadata:
+   wrong, what is detected, false-positive risks, sources).
+2. Implement it as a hook in the matching module under `crates/sparklint_linter/src/rules/`,
+   declare each message it reports as a `Msg` const (template and help text; the catalog
+   does not repeat them) and add one `Rule::new("CODE")....msgs(&[..])` line to that
+   module's `RULES` table. Then regenerate the metadata:
+   `UPDATE_SPEC=1 cargo test -p sparklint_linter --lib spec_rule_messages` and
    `python3 scripts/gen_rules.py > spec/rules.json`.
-2. Implement it as a hook in the matching module under `crates/sparklint_linter/src/rules/`
-   and add one `Rule::new("CODE")...` line to that module's `RULES` table.
 3. Add `tests/fixtures/<CODE>/positive.py` (each expected finding marked with
    `# expect: <CODE>` on the line where it starts) and `negative.py` (look-alikes that must
-   not fire). Fixable rules also get `<name>.py.fixed` snapshots.
+   not fire). Pin severity tiers and message wording on the same line:
+   `# expect: <CODE>[info] ~"part of the message"` (syntax in
+   [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#rule-fixtures)). Fixable rules also get
+   `<name>.py.fixed` snapshots.
 
 Rules should fire only when the receiver is known to be a Spark object; a false positive
 is worse than a missed finding.

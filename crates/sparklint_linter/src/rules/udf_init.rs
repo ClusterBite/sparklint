@@ -10,19 +10,65 @@ use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashSet;
-use sparklint_semantic::{Ty, call_arg};
+use sparklint_semantic::columns::mentions_name;
+use sparklint_semantic::{Hops, Ty};
 
 use super::Rule;
 use super::helpers::*;
-use super::udf::is_udf_factory;
+use super::msg::Msg;
+use super::udf_target::{
+    Factory, UdfFn, decorated_udf, is_pandas_udf, shown_name, udf_target, wrapped_fns,
+};
 use crate::checker::Checker;
-use crate::diagnostic::Diagnostic;
+use crate::msg;
 
 /// UDF011/012 (see [`super::Rule`]).
 pub const RULES: &[Rule] = &[
-    Rule::new("UDF011").stmt(udf011_stmt).call(pandas_udf_call),
-    Rule::new("UDF012").stmt(udf012_stmt).call(row_sink_call),
+    Rule::new("UDF011")
+        .stmt(udf011_stmt)
+        .call(pandas_udf_call)
+        .msgs(&[
+            UDF011_SERIES,
+            UDF011_GROUPED,
+            UDF011_BATCH_LOOP,
+            UDF011_PER_GROUP,
+        ]),
+    Rule::new("UDF012")
+        .stmt(udf012_stmt)
+        .call(row_sink_call)
+        .msgs(&[UDF012]),
 ];
+
+const UDF011_SERIES: Msg = Msg::new(
+    "UDF011",
+    "series-udf",
+    "{call} inside pandas UDF {name} runs for every Arrow batch (~10k rows) on every task.",
+)
+.help("Use the Iterator[pd.Series] -> Iterator[pd.Series] form and load once before the `for batch in it:` loop, or cache the loader at module level (functools.lru_cache).");
+const UDF011_GROUPED: Msg = Msg::new(
+    "UDF011",
+    "grouped-udf",
+    "{call} inside grouped pandas UDF {name} runs once per group.",
+)
+.help("Cache the loader at module level (functools.lru_cache / a global) so each Python worker loads it once.");
+const UDF011_BATCH_LOOP: Msg = Msg::new(
+    "UDF011",
+    "batch-loop",
+    "{call} inside the batch loop of {api} function {name} runs once per batch.",
+)
+.help("Move the load above the `for batch in iterator:` loop so it runs once per partition.");
+const UDF011_PER_GROUP: Msg = Msg::new(
+    "UDF011",
+    "per-group-function",
+    "{call} inside {api} function {name} runs once per group.",
+)
+.help("Cache the loader at module level (functools.lru_cache / a global), or use mapInPandas and load before the batch loop.");
+const UDF012: Msg = Msg::new(
+    "UDF012",
+    "per-record-connection",
+    "{call} in {sink} function {name} opens an external connection for every record.",
+)
+.help("Open the client once per partition (foreachPartition / mapPartitions / mapInPandas, ForeachWriter.open) or reuse a pooled module-level client.");
 
 fn udf011_stmt(ch: &mut Checker, stmt: &Stmt) {
     if let Stmt::FunctionDef(f) = stmt {
@@ -125,13 +171,6 @@ fn external_conn(q: &str) -> bool {
 
 // ------------------------------------------------------------------ body scan
 
-/// A function Spark calls repeatedly.
-#[derive(Clone, Copy)]
-enum Target<'a, 't> {
-    Def(&'a ast::StmtFunctionDef),
-    Lambda(&'t ast::ExprLambda),
-}
-
 /// Where in the body set-up is repeated.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -153,16 +192,6 @@ fn first_param(f: &ast::StmtFunctionDef) -> Option<String> {
         .iter_non_variadic_params()
         .next()
         .map(|p| p.parameter.name.as_str().to_string())
-}
-
-fn mentions_name(e: &Expr, name: &str) -> bool {
-    let mut found = false;
-    walk_exprs(e, &mut |x| {
-        if matches!(x, Expr::Name(n) if n.id.as_str() == name) {
-            found = true;
-        }
-    });
-    found
 }
 
 /// Names that are local to `body` (assigned without `global`/`nonlocal`) and the
@@ -437,30 +466,11 @@ fn is_memoised(ch: &Checker, f: &ast::StmtFunctionDef) -> bool {
     })
 }
 
-fn resolve_target<'a, 't>(ch: &Checker<'a>, e: &'t Expr) -> Option<Target<'a, 't>> {
-    match e {
-        Expr::Lambda(l) => Some(Target::Lambda(l)),
-        Expr::Name(n) => {
-            let b = ch.model.single_binding(n)?;
-            let b = ch.model.binding(b);
-            ch.fn_defs.get(&b.range.start()).copied().map(Target::Def)
-        }
-        _ => None,
-    }
-}
-
-fn scan(ch: &Checker, t: Target, is_api: fn(&str) -> bool, mode: Mode) -> Vec<Hit> {
+fn scan(ch: &Checker, t: UdfFn, is_api: fn(&str) -> bool, mode: Mode) -> Vec<Hit> {
     let s = Scan::new(ch, is_api, mode, 0);
     match t {
-        Target::Def(f) => s.run_def(f),
-        Target::Lambda(l) => s.run_lambda(l),
-    }
-}
-
-fn target_name(t: Target) -> String {
-    match t {
-        Target::Def(f) => f.name.as_str().to_string(),
-        Target::Lambda(_) => "<lambda>".to_string(),
+        UdfFn::Def(f) => s.run_def(f),
+        UdfFn::Lambda(l) => s.run_lambda(l),
     }
 }
 
@@ -476,13 +486,6 @@ fn decorator_callee(d: &ast::Decorator) -> &Expr {
         Expr::Call(c) => &c.func,
         other => other,
     }
-}
-
-fn is_pandas_udf(ch: &Checker, e: &Expr) -> bool {
-    matches!(
-        ch.model.qualified_name(e).as_deref(),
-        Some("pyspark.sql.functions.pandas_udf")
-    )
 }
 
 // ------------------------------------------------------------------ UDF011
@@ -548,6 +551,32 @@ enum Kind {
     SeriesUdf,
     IterLoop(&'static str),
     PerGroup(&'static str),
+    /// A grouped-aggregate (Series -> scalar) or legacy GROUPED_MAP / GROUPED_AGG pandas UDF.
+    GroupedUdf,
+}
+
+/// A pandas UDF def Spark calls once per group: a Series -> scalar type-hinted def
+/// (grouped aggregate) or a legacy `functionType=PandasUDFType.GROUPED_AGG/GROUPED_MAP`.
+fn pandas_udf_is_grouped(ch: &Checker, f: &ast::StmtFunctionDef, factory: Option<&Expr>) -> bool {
+    let scalar_return = f.returns.as_deref().is_some_and(|r| {
+        ch.model.qualified_name(r).is_some_and(|q| {
+            matches!(
+                q.as_str(),
+                "builtins.int" | "builtins.float" | "builtins.bool" | "builtins.str"
+            ) || (q.starts_with("numpy.") && q != "numpy.ndarray")
+        })
+    });
+    if scalar_return {
+        return true;
+    }
+    let Some(Expr::Call(c)) = factory else {
+        return false;
+    };
+    c.arguments
+        .args
+        .iter()
+        .chain(c.arguments.keywords.iter().map(|k| &k.value))
+        .any(|a| matches!(a, Expr::Attribute(at) if matches!(at.attr.as_str(), "GROUPED_AGG" | "GROUPED_MAP")))
 }
 
 fn report_udf011(ch: &mut Checker, hits: Vec<Hit>, kind: Kind, name: &str) {
@@ -555,36 +584,20 @@ fn report_udf011(ch: &mut Checker, hits: Vec<Hit>, kind: Kind, name: &str) {
         if !ch.state.udf_init_seen.insert((h.range, "UDF011")) {
             continue;
         }
-        let what = hit_text(&h);
-        let (msg, help) = match kind {
-            Kind::SeriesUdf => (
-                format!(
-                    "{what} inside pandas UDF {name} runs for every Arrow batch (~10k rows) on every task."
-                ),
-                "Use the Iterator[pd.Series] -> Iterator[pd.Series] form and load once before the `for batch in it:` loop, or cache the loader at module level (functools.lru_cache).",
-            ),
-            Kind::IterLoop(api) => (
-                format!(
-                    "{what} inside the batch loop of {api} function {name} runs once per batch."
-                ),
-                "Move the load above the `for batch in iterator:` loop so it runs once per partition.",
-            ),
-            Kind::PerGroup(api) => (
-                format!("{what} inside {api} function {name} runs once per group."),
-                "Cache the loader at module level (functools.lru_cache / a global), or use mapInPandas and load before the batch loop.",
-            ),
+        let call = hit_text(&h);
+        let d = match kind {
+            Kind::SeriesUdf => msg!(UDF011_SERIES, h.range, call, name),
+            Kind::IterLoop(api) => msg!(UDF011_BATCH_LOOP, h.range, call, api, name),
+            Kind::PerGroup(api) => msg!(UDF011_PER_GROUP, h.range, call, api, name),
+            Kind::GroupedUdf => msg!(UDF011_GROUPED, h.range, call, name),
         };
-        ch.report(Diagnostic::new("UDF011", msg, h.range).with_help(help));
+        ch.report(d);
     }
 }
 
 /// `@pandas_udf(...)` on a def.
 pub fn pandas_udf_decorator(ch: &mut Checker, f: &ast::StmtFunctionDef) {
-    let Some(dec) = f
-        .decorator_list
-        .iter()
-        .find(|d| is_pandas_udf(ch, decorator_callee(d)))
-    else {
+    let Some(dec) = decorated_udf(ch, f, Factory::PandasUdf).and_then(|t| t.decorator) else {
         return;
     };
     pandas_udf_def(ch, f, Some(&dec.expression));
@@ -596,37 +609,41 @@ fn pandas_udf_def(ch: &mut Checker, f: &ast::StmtFunctionDef, factory: Option<&E
             Mode::InsideLoopOverFirstParam,
             Kind::IterLoop("iterator pandas_udf"),
         )
+    } else if pandas_udf_is_grouped(ch, f, factory) {
+        (Mode::Anywhere, Kind::GroupedUdf)
     } else {
         (Mode::Anywhere, Kind::SeriesUdf)
     };
-    let hits = scan(ch, Target::Def(f), heavy_init, mode);
+    let hits = scan(ch, UdfFn::Def(f), heavy_init, mode);
     let name = f.name.as_str().to_string();
     report_udf011(ch, hits, kind, &name);
 }
 
 /// `pandas_udf(fn, ...)`, `df.mapInPandas(fn, ...)`, `grouped.applyInPandas(fn, ...)`.
-pub fn pandas_udf_call(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
-    if is_pandas_udf(ch, &c.func) {
-        let Some(arg) = call_arg(c, 0, "f") else {
+pub fn pandas_udf_call(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) {
+    if let Some(ut) = udf_target(ch, expr)
+        && ut.factory == Factory::PandasUdf
+    {
+        let Some(arg) = ut.arg else {
             return;
         };
-        let Some(t) = resolve_target(ch, arg) else {
-            return;
-        };
-        match t {
-            Target::Def(f) => {
-                if f.decorator_list
-                    .iter()
-                    .any(|d| is_pandas_udf(ch, decorator_callee(d)))
-                {
-                    return; // reported by the decorator path
+        // every function the argument may be (each binding of a name)
+        for w in &ut.resolved.fns {
+            match w.func {
+                UdfFn::Def(f) => {
+                    if f.decorator_list
+                        .iter()
+                        .any(|d| is_pandas_udf(ch, decorator_callee(d)))
+                    {
+                        continue; // reported by the decorator path
+                    }
+                    pandas_udf_def(ch, f, Some(expr));
                 }
-                pandas_udf_def(ch, f, Some(expr));
-            }
-            Target::Lambda(_) => {
-                let hits = scan(ch, t, heavy_init, Mode::Anywhere);
-                let name = target_name(t);
-                report_udf011(ch, hits, Kind::SeriesUdf, &name);
+                UdfFn::Lambda(_) => {
+                    let hits = scan(ch, w.func, heavy_init, Mode::Anywhere);
+                    let name = shown_name(Some(arg), w);
+                    report_udf011(ch, hits, Kind::SeriesUdf, &name);
+                }
             }
         }
         return;
@@ -661,15 +678,14 @@ pub fn pandas_udf_call(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
         }
         _ => return,
     };
-    let Some(arg) = call_arg(c, 0, "func") else {
+    let Some(arg) = sc.arg(0, "func") else {
         return;
     };
-    let Some(t) = resolve_target(ch, arg) else {
-        return;
-    };
-    let hits = scan(ch, t, heavy_init, mode);
-    let name = target_name(t);
-    report_udf011(ch, hits, kind, &name);
+    for w in wrapped_fns(ch, arg).fns {
+        let hits = scan(ch, w.func, heavy_init, mode);
+        let name = shown_name(Some(arg), &w);
+        report_udf011(ch, hits, kind, &name);
+    }
 }
 
 // ------------------------------------------------------------------ UDF012
@@ -679,44 +695,33 @@ fn report_udf012(ch: &mut Checker, hits: Vec<Hit>, sink: &str, name: &str) {
         if !ch.state.udf_init_seen.insert((h.range, "UDF012")) {
             continue;
         }
-        let what = hit_text(&h);
-        ch.report(
-            Diagnostic::new(
-                "UDF012",
-                format!("{what} in {sink} function {name} opens an external connection for every record."),
-                h.range,
-            )
-            .with_help("Open the client once per partition (foreachPartition / mapPartitions / mapInPandas, ForeachWriter.open) or reuse a pooled module-level client."),
-        );
+        let call = hit_text(&h);
+        ch.report(msg!(UDF012, h.range, call, sink, name));
     }
 }
 
+/// Every function `arg` may be (each binding of a name), scanned per row.
 fn row_target(ch: &mut Checker, arg: &Expr, sink: &str) {
-    let Some(t) = resolve_target(ch, arg) else {
-        return;
-    };
-    if let Target::Def(f) = t
-        && f.decorator_list
-            .iter()
-            .any(|d| is_pandas_udf(ch, decorator_callee(d)))
-    {
-        return; // a pandas UDF works on batches (UDF011)
+    for w in wrapped_fns(ch, arg).fns {
+        if let UdfFn::Def(f) = w.func
+            && f.decorator_list
+                .iter()
+                .any(|d| is_pandas_udf(ch, decorator_callee(d)))
+        {
+            continue; // a pandas UDF works on batches (UDF011)
+        }
+        let hits = scan(ch, w.func, external_conn, Mode::Anywhere);
+        let name = shown_name(Some(arg), &w);
+        report_udf012(ch, hits, sink, &name);
     }
-    let hits = scan(ch, t, external_conn, Mode::Anywhere);
-    let name = target_name(t);
-    report_udf012(ch, hits, sink, &name);
 }
 
 /// `@udf` / `@udf(...)` on a def.
 pub fn row_udf_decorator(ch: &mut Checker, f: &ast::StmtFunctionDef) {
-    if !f
-        .decorator_list
-        .iter()
-        .any(|d| is_udf_factory(ch, decorator_callee(d)))
-    {
+    if decorated_udf(ch, f, Factory::Udf).is_none() {
         return;
     }
-    let hits = scan(ch, Target::Def(f), external_conn, Mode::Anywhere);
+    let hits = scan(ch, UdfFn::Def(f), external_conn, Mode::Anywhere);
     let name = f.name.as_str().to_string();
     report_udf012(ch, hits, "udf", &name);
 }
@@ -729,7 +734,7 @@ fn foreach_writer_class(ch: &mut Checker, class: &ast::StmtClassDef) {
     }) else {
         return;
     };
-    let hits = scan(ch, Target::Def(process), external_conn, Mode::Anywhere);
+    let hits = scan(ch, UdfFn::Def(process), external_conn, Mode::Anywhere);
     let name = format!("{}.process", class.name.as_str());
     report_udf012(ch, hits, "ForeachWriter", &name);
 }
@@ -785,16 +790,8 @@ fn find_class(body: &[Stmt], start: ruff_text_size::TextSize) -> Option<&ast::St
 
 /// The class of `Writer()` or of a name bound to `Writer()`.
 fn writer_class<'a>(ch: &Checker<'a>, arg: &Expr) -> Option<&'a ast::StmtClassDef> {
-    let call = match arg {
-        Expr::Call(c) => c,
-        Expr::Name(n) => {
-            let b = ch.model.single_binding(n)?;
-            match ch.model.binding(b).value? {
-                Expr::Call(c) => c,
-                _ => return None,
-            }
-        }
-        _ => return None,
+    let Expr::Call(call) = ch.model.value_of(arg, Hops::DEFAULT) else {
+        return None;
     };
     let Expr::Name(cls) = &*call.func else {
         return None;
@@ -805,16 +802,12 @@ fn writer_class<'a>(ch: &Checker<'a>, arg: &Expr) -> Option<&'a ast::StmtClassDe
 
 /// `udf(fn)`, `spark.udf.register("n", fn)`, `df.foreach(fn)`, `rdd.map(fn)`,
 /// `df.writeStream.foreach(fn_or_writer)`.
-pub fn row_sink_call(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
-    if is_udf_factory(ch, &c.func) {
-        let arg = c.arguments.args.first().or_else(|| {
-            c.arguments
-                .keywords
-                .iter()
-                .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "f"))
-                .map(|k| &k.value)
-        });
-        if let Some(arg) = arg {
+pub fn row_sink_call(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) {
+    if let Some(t) = udf_target(ch, expr) {
+        // `udf(fn)` / `spark.udf.register("n", fn)` (a pandas UDF works on batches: UDF011)
+        if t.factory == Factory::Udf
+            && let Some(arg) = t.arg
+        {
             row_target(ch, arg, "udf");
         }
         return;
@@ -824,13 +817,8 @@ pub fn row_sink_call(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
     };
     let (m, recv_ty) = (sc.method, sc.class());
     match m {
-        "register" if recv_ty == Ty::UdfRegistration => {
-            if let Some(arg) = c.arguments.args.get(1) {
-                row_target(ch, arg, "udf");
-            }
-        }
         "foreach" if recv_ty == Ty::DataStreamWriter => {
-            let Some(arg) = call_arg(c, 0, "f") else {
+            let Some(arg) = sc.arg(0, "f") else {
                 return;
             };
             if let Some(class) = writer_class(ch, arg) {
@@ -840,14 +828,14 @@ pub fn row_sink_call(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
             }
         }
         "foreach" if sc.is_dataframe() => {
-            if let Some(arg) = call_arg(c, 0, "f") {
+            if let Some(arg) = sc.arg(0, "f") {
                 row_target(ch, arg, "DataFrame.foreach");
             }
         }
         "map" | "flatMap" | "filter" | "foreach" | "mapValues" | "flatMapValues"
             if recv_ty == Ty::Rdd =>
         {
-            if let Some(arg) = call_arg(c, 0, "f") {
+            if let Some(arg) = sc.arg(0, "f") {
                 let sink = format!("RDD.{m}");
                 row_target(ch, arg, &sink);
             }

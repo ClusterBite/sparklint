@@ -37,6 +37,7 @@ def chunked_replace(df: DataFrame, chunks):
 def overwrite_in_loop(df: DataFrame, parts):
     for p in parts:
         df.filter(F.col("p") == p).write.insertInto("cat.db.t", overwrite=True)
+        df.filter(F.col("p") == p).write.mode(saveMode="overwrite").insertInto("cat.db.t")
 
 
 def unknown_mode(df: DataFrame, parts, mode):

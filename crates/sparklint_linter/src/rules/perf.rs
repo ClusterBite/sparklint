@@ -2,25 +2,113 @@
 
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_text_size::Ranged;
-use sparklint_semantic::{LoopInfo, LoopKind, Partitioning, SqlText, Ty, call_arg, int_literal};
+use sparklint_semantic::{Hops, LoopInfo, Partitioning, SqlText, Ty, call_arg};
 
 use super::Rule;
-use super::actions::method_range;
 use super::helpers::*;
+use super::msg::Msg;
 use crate::checker::Checker;
-use crate::diagnostic::{Diagnostic, Edit, Fix, Severity};
+use crate::diagnostic::{Edit, Fix, Severity};
+use crate::fix_text::one_line;
+use crate::msg;
 
 /// PRF001/002/003/005/029/031 (see [`super::Rule`]).
 pub const RULES: &[Rule] = &[
     Rule::new("PRF001")
         .stmt(prf001_stmt)
-        .call(withcolumn_reduce),
-    Rule::new("PRF002").stmt(prf002_stmt),
-    Rule::new("PRF003").call(cartesian_join),
-    Rule::new("PRF005").call(global_window),
-    Rule::new("PRF031").call(running_collect_list),
-    Rule::new("PRF029").call(replicated_storage_level),
+        .call(withcolumn_reduce)
+        .msgs(&[PRF001_LOOP, PRF001_REDUCE]),
+    Rule::new("PRF002").stmt(prf002_stmt).msgs(&[PRF002]),
+    Rule::new("PRF003")
+        .call(cartesian_join)
+        .msgs(&[PRF003_CROSS_JOIN, PRF003_JOIN]),
+    Rule::new("PRF005").call(global_window).msgs(&[PRF005]),
+    Rule::new("PRF031").call(running_collect_list).msgs(&[
+        PRF031,
+        PRF031_GLOBAL,
+        PRF031_SQL,
+        PRF031_SQL_GLOBAL,
+    ]),
+    Rule::new("PRF029")
+        .call(replicated_storage_level)
+        .msgs(&[PRF029, PRF029_LOOP]),
 ];
+
+const PRF001_LOOP: Msg = Msg::new(
+    "PRF001",
+    "loop",
+    ".withColumn() in a loop adds one projection per iteration — use withColumns()/select().",
+)
+.help("Build all expressions first, then apply them once: df.withColumns({{name: expr, ...}}) (Spark >= 3.3) or df.select(\"*\", *exprs).");
+const PRF001_REDUCE: Msg = Msg::new(
+    "PRF001",
+    "reduce",
+    "functools.reduce(...withColumn...) adds one projection per element — use withColumns()/select().",
+);
+const PRF002: Msg = Msg::new(
+    "PRF002",
+    "loop",
+    ".{method}() in a loop adds one plan node per iteration — batch it into one call.",
+)
+.help("Build the full list first: df.withColumnsRenamed({{old: new, ...}}) (Spark >= 3.4), df.drop(*cols), or one df.select(...).");
+const PRF003_HELP: &str = "Join on a key (df.join(other, \"key\", \"inner\")); for a scalar, aggregate it first so one side has one row.";
+const PRF003_CROSS_JOIN: Msg = Msg::new(
+    "PRF003",
+    "cross-join",
+    "Cartesian product: crossJoin() produces |A|×|B| rows.",
+)
+.help(PRF003_HELP);
+const PRF003_JOIN: Msg = Msg::new(
+    "PRF003",
+    "join-without-condition",
+    "Cartesian product: join() without a condition produces |A|×|B| rows.",
+)
+.help(PRF003_HELP);
+const PRF005: Msg = Msg::new(
+    "PRF005",
+    "global-window",
+    "Window without partitionBy() moves all rows into a single partition.",
+)
+.help("Add Window.partitionBy(<key>) — or use df.agg(...) for global totals.");
+const PRF031_HELP: &str = "For all values per key use df.groupBy(k).agg(F.sort_array(F.{name}(F.struct(order_col, value)))); for the last n values bound the frame, e.g. .rowsBetween(-n, Window.currentRow).";
+const PRF031: Msg = Msg::new(
+    "PRF031",
+    "running-window",
+    "{name}() over a running window (ordered, frame from the partition start to the current row) gives every row its own growing array: O(N²) elements per partition.",
+)
+.help(PRF031_HELP);
+const PRF031_GLOBAL: Msg = Msg::new(
+    "PRF031",
+    "running-window-unpartitioned",
+    "{name}() over a running window (ordered, frame from the partition start to the current row) gives every row its own growing array: O(N²) elements per partition. The window has no partitionBy(), so all rows land in one partition.",
+)
+.help(PRF031_HELP);
+const PRF031_SQL_HELP: &str = "For all values per key use GROUP BY k with sort_array({name}(struct(order_col, value))); for the last n values bound the frame, e.g. ROWS BETWEEN n PRECEDING AND CURRENT ROW.";
+const PRF031_SQL: Msg = Msg::new(
+    "PRF031",
+    "sql-running-window",
+    "{name}() over a running window in SQL (ordered, frame from the partition start to the current row) gives every row its own growing array: O(N²) elements per partition.",
+)
+.help(PRF031_SQL_HELP);
+const PRF031_SQL_GLOBAL: Msg = Msg::new(
+    "PRF031",
+    "sql-running-window-unpartitioned",
+    "{name}() over a running window in SQL (ordered, frame from the partition start to the current row) gives every row its own growing array: O(N²) elements per partition. The window has no PARTITION BY, so all rows land in one partition.",
+)
+.help(PRF031_SQL_HELP);
+const PRF029_HELP: &str = "Use StorageLevel.{base} (or plain .cache()); keep replication only for low-latency serving where losing an executor must not trigger recomputation.";
+const PRF029: Msg = Msg::new(
+    "PRF029",
+    "replicated",
+    "Storage level {level} keeps every cached partition {times} (extra executor memory/disk and a network copy of each block); recomputation already makes cached data fault-tolerant.",
+)
+.help(PRF029_HELP);
+const PRF029_LOOP: Msg = Msg::new(
+    "PRF029",
+    "replicated-in-loop",
+    "Storage level {level} keeps every cached partition {times} (extra executor memory/disk and a network copy of each block); recomputation already makes cached data fault-tolerant. Inside a loop it is paid on every iteration.",
+)
+.help(PRF029_HELP);
 
 fn prf001_stmt(ch: &mut Checker, stmt: &Stmt) {
     if let Stmt::Assign(a) = stmt {
@@ -80,23 +168,14 @@ pub(crate) fn loop_carried_call<'a>(
     if !recv_df {
         return None;
     }
-    let loops: Vec<_> = ch
-        .model
-        .loops_at(stmt.start())
-        .into_iter()
-        .filter(|l| l.kind != LoopKind::Comprehension)
-        .collect();
-    let inner = (*loops.last()?).clone();
-    // loop-carried: a binding of the name made in this loop body at or after this
-    // statement reaches the receiver (the previous iteration's value flows in).
-    let carried = ch.model.reaching(root).iter().any(|b| {
-        let b = ch.model.binding(*b);
-        inner.body.contains_range(b.stmt_range) && b.stmt_range.start() >= stmt.start()
-    });
-    if !carried {
+    // The loop that repeats the statement (ACT005 / IOD006 judge the same one): a
+    // retry loop that leaves right after it runs it once.
+    let inner = ch.model.repeating_loop_at(stmt.start())?;
+    // loop-carried: the previous iteration's value flows into the receiver.
+    if !inner.carried(root, stmt.start()) {
         return None;
     }
-    Some((call, m, inner))
+    Some((call, m, inner.info().clone()))
 }
 
 pub fn withcolumn_in_loop(ch: &mut Checker, a: &ast::StmtAssign, stmt: &Stmt) {
@@ -111,13 +190,7 @@ pub fn withcolumn_in_loop(ch: &mut Checker, a: &ast::StmtAssign, stmt: &Stmt) {
         return;
     };
     let small = inner.literal_len.is_some_and(|n| n <= 3);
-    let mut d = Diagnostic::new(
-        "PRF001",
-        ".withColumn() in a loop adds one projection per iteration — use withColumns()/select().",
-        method_range(wc),
-    )
-    .with_site(inner.range)
-    .with_help("Build all expressions first, then apply them once: df.withColumns({name: expr, ...}) (Spark >= 3.3) or df.select(\"*\", *exprs).");
+    let mut d = msg!(PRF001_LOOP, method_range(wc)).with_site(inner.range);
     if small {
         d = d.with_severity(Severity::Info);
     }
@@ -155,7 +228,7 @@ fn withcolumns_fix(
     let val = ch.slice(c.arguments.args[1].range());
     let tgt = ch.slice(f.target.range());
     let iter = ch.slice(f.iter.range());
-    if [key, val, tgt, iter].iter().any(|s| s.contains('\n')) {
+    if !one_line(&[key, val, tgt, iter]) {
         return None;
     }
     let name = target.id.as_str();
@@ -196,13 +269,7 @@ pub fn column_op_in_loop(ch: &mut Checker, a: &ast::StmtAssign, stmt: &Stmt) {
     let [Expr::Name(target)] = a.targets.as_slice() else {
         return;
     };
-    let mut d = Diagnostic::new(
-        "PRF002",
-        format!(".{m}() in a loop adds one plan node per iteration — batch it into one call."),
-        method_range(call),
-    )
-    .with_site(inner.range)
-    .with_help("Build the full list first: df.withColumnsRenamed({old: new, ...}) (Spark >= 3.4), df.drop(*cols), or one df.select(...).");
+    let mut d = msg!(PRF002, method_range(call), method = m).with_site(inner.range);
     if inner.literal_len.is_some_and(|n| n <= 3) {
         d = d.with_severity(Severity::Info);
     }
@@ -237,7 +304,7 @@ fn column_op_fix(
     let text = match (m, c.arguments.args.as_slice()) {
         ("withColumnRenamed", [old, new]) if ch.settings.spark_version >= (3, 4) => {
             let (o, n) = (ch.slice(old.range()), ch.slice(new.range()));
-            if [o, n].iter().any(|s| s.contains('\n')) {
+            if !one_line(&[o, n]) {
                 return None;
             }
             format!("{name} = {name}.withColumnsRenamed({{{o}: {n} for {tgt} in {iter}}})")
@@ -247,7 +314,7 @@ fn column_op_fix(
         }
         _ => return None,
     };
-    if text.contains('\n') {
+    if !one_line(&[&text]) {
         return None;
     }
     Some(Fix::unsafe_(
@@ -286,16 +353,12 @@ pub fn withcolumn_reduce(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
     {
         return;
     }
-    ch.report(Diagnostic::new(
-        "PRF001",
-        "functools.reduce(...withColumn...) adds one projection per element — use withColumns()/select().",
-        expr.range(),
-    ));
+    ch.report(msg!(PRF001_REDUCE, expr.range()));
 }
 
 // ------------------------------------------------------------------ PRF003
 
-pub fn cartesian_join(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
+pub fn cartesian_join(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) {
     let Some(sc) = ch.model.spark_call_named(expr, &["crossJoin", "join"]) else {
         return;
     };
@@ -303,11 +366,11 @@ pub fn cartesian_join(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
         return;
     }
     let (m, rt) = (sc.method, sc.receiver_ty);
-    let Some(other) = call_arg(c, 0, "other") else {
+    let Some(other) = sc.arg(0, "other") else {
         return;
     };
     if m == "join" {
-        match call_arg(c, 1, "on") {
+        match sc.arg(1, "on") {
             // `on=None` is the same as no condition
             None | Some(Expr::NoneLiteral(_)) => {}
             Some(on) => {
@@ -321,21 +384,17 @@ pub fn cartesian_join(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
         }
     }
     let ot = ch.model.ty_of(other);
-    if rt.bounded() == Some(1) || ot.bounded() == Some(1) {
+    let (rs, os) = (rt.size(), ot.size());
+    if rs.one_row() || os.one_row() {
         return; // scalar broadcast idiom
     }
-    let small = rt.bounded().is_some() || ot.bounded().is_some();
-    let what = if m == "crossJoin" {
-        "crossJoin()"
+    let small = rs.broadcastable() || os.broadcastable();
+    let v = if m == "crossJoin" {
+        &PRF003_CROSS_JOIN
     } else {
-        "join() without a condition"
+        &PRF003_JOIN
     };
-    let mut d = Diagnostic::new(
-        "PRF003",
-        format!("Cartesian product: {what} produces |A|×|B| rows."),
-        method_range(expr),
-    )
-    .with_help("Join on a key (df.join(other, \"key\", \"inner\")); for a scalar, aggregate it first so one side has one row.");
+    let mut d = msg!(v, method_range(expr));
     if small {
         d = d.with_severity(Severity::Info);
     }
@@ -361,14 +420,7 @@ pub fn global_window(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
     if t.ty != Ty::WindowSpec || t.facts.win_partitioning != Partitioning::Global {
         return;
     }
-    ch.report(
-        Diagnostic::new(
-            "PRF005",
-            "Window without partitionBy() moves all rows into a single partition.",
-            method_range(expr),
-        )
-        .with_help("Add Window.partitionBy(<key>) — or use df.agg(...) for global totals."),
-    );
+    ch.report(msg!(PRF005, method_range(expr)));
 }
 
 // ------------------------------------------------------------------ PRF031
@@ -383,8 +435,19 @@ const COLLECT_AGGS: &[&str] = &[
 /// preceding .. current row) or an explicit frame that starts unbounded preceding and
 /// ends at a finite offset: every row gets its own, ever longer copy of the array, so a
 /// partition of N rows materialises O(N²) elements. Whole-partition and bounded frames
-/// are not reported.
+/// are not reported. The same window in SQL text (`F.expr`, `selectExpr`, `spark.sql`)
+/// is read through [`SqlText::running_collects`].
 pub fn running_collect_list(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
+    if let Some(found) = sql_running_collect(ch, expr) {
+        let name = found.name;
+        let v = if found.partitioned {
+            &PRF031_SQL
+        } else {
+            &PRF031_SQL_GLOBAL
+        };
+        ch.report(msg!(v, method_range(expr), name));
+        return;
+    }
     let Some((_, recv, m)) = method_call(expr) else {
         return;
     };
@@ -409,17 +472,22 @@ pub fn running_collect_list(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
         return;
     }
     let name = q.rsplit('.').next().unwrap_or("collect_list");
-    let mut msg = format!(
-        "{name}() over a running window (ordered, frame from the partition start to the current row) gives every row its own growing array: O(N²) elements per partition."
-    );
-    if f.win_partitioning != Partitioning::Partitioned {
-        msg.push_str(" The window has no partitionBy(), so all rows land in one partition.");
-    }
-    ch.report(
-        Diagnostic::new("PRF031", msg, method_range(expr)).with_help(format!(
-            "For all values per key use df.groupBy(k).agg(F.sort_array(F.{name}(F.struct(order_col, value)))); for the last n values bound the frame, e.g. .rowsBetween(-n, Window.currentRow)."
-        )),
-    );
+    let v = if f.win_partitioning != Partitioning::Partitioned {
+        &PRF031_GLOBAL
+    } else {
+        &PRF031
+    };
+    ch.report(msg!(v, method_range(expr), name));
+}
+
+/// The first running array aggregate in the SQL text of `F.expr(..)`,
+/// `df.selectExpr(..)` or `spark.sql(..)`.
+fn sql_running_collect(ch: &Checker, expr: &Expr) -> Option<sparklint_semantic::RunningCollect> {
+    ch.model
+        .sql_sites(expr)
+        .into_iter()
+        .filter_map(|s| s.text)
+        .find_map(|q| q.running_collects().into_iter().next())
 }
 
 // ------------------------------------------------------------------ PRF029
@@ -437,12 +505,12 @@ pub fn replicated_storage_level(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr
         return;
     };
     let level = match sc.method {
-        "persist" if sc.is_dataframe() || sc.class() == Ty::Rdd => {
-            call_arg(c, 0, "storageLevel").and_then(|a| replicated_level(ch, a, 0))
-        }
-        "cacheTable" if sc.class() == Ty::Catalog => {
-            call_arg(c, 1, "storageLevel").and_then(|a| replicated_level(ch, a, 0))
-        }
+        "persist" if sc.is_dataframe() || sc.class() == Ty::Rdd => sc
+            .arg(0, "storageLevel")
+            .and_then(|a| replicated_level(ch, a, Hops::DEFAULT)),
+        "cacheTable" if sc.class() == Ty::Catalog => sc
+            .arg(1, "storageLevel")
+            .and_then(|a| replicated_level(ch, a, Hops::DEFAULT)),
         "sql" if sc.class().is_session() => ch
             .model
             .sql_query(c)
@@ -461,22 +529,17 @@ pub fn replicated_storage_level(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr
     } else {
         format!("{n} times")
     };
-    let mut msg = format!(
-        "Storage level {name} keeps every cached partition {times} (extra executor memory/disk and a network copy of each block); recomputation already makes cached data fault-tolerant."
-    );
-    if ch.model.in_loop(expr) {
-        msg.push_str(" Inside a loop it is paid on every iteration.");
-    }
+    let v = if ch.model.in_repeating_loop(expr) {
+        &PRF029_LOOP
+    } else {
+        &PRF029
+    };
     let base = name
         .strip_suffix("_2")
         .or_else(|| name.strip_suffix("_3"))
         .filter(|b| !b.is_empty() && !b.starts_with("StorageLevel("))
         .unwrap_or("MEMORY_AND_DISK");
-    ch.report(
-        Diagnostic::new("PRF029", msg, method_range(expr)).with_help(format!(
-            "Use StorageLevel.{base} (or plain .cache()); keep replication only for low-latency serving where losing an executor must not trigger recomputation."
-        )),
-    );
+    ch.report(msg!(v, method_range(expr), level = name, times, base));
 }
 
 /// `MEMORY_AND_DISK_2` → 2, `DISK_ONLY_3` → 3.
@@ -493,10 +556,7 @@ fn replication_of(level: &str) -> Option<i64> {
 }
 
 /// A `pyspark.StorageLevel` expression with replication > 1 → (display name, replication).
-fn replicated_level(ch: &Checker, e: &Expr, depth: u32) -> Option<(String, i64)> {
-    if depth > 4 {
-        return None;
-    }
+fn replicated_level(ch: &Checker, e: &Expr, hops: Hops) -> Option<(String, i64)> {
     match e {
         Expr::Attribute(a) => {
             let q = ch.model.qualified_name(e)?;
@@ -511,15 +571,12 @@ fn replicated_level(ch: &Checker, e: &Expr, depth: u32) -> Option<(String, i64)>
             if !is_storage_level_class(&q) {
                 return None;
             }
-            let n = int_literal(call_arg(call, 4, "replication")?)?;
+            let n = i64::try_from(ch.model.const_int(call_arg(call, 4, "replication")?)?).ok()?;
             (n > 1).then(|| (format!("StorageLevel(..., replication={n})"), n))
         }
-        Expr::Name(n) => {
-            let b = ch.model.single_binding(n)?;
-            let v = ch.model.binding(b).value?;
-            (v.range() != e.range())
-                .then(|| replicated_level(ch, v, depth + 1))
-                .flatten()
+        Expr::Name(_) => {
+            let (v, h) = ch.model.hop_one(e, hops)?;
+            replicated_level(ch, v, h)
         }
         _ => None,
     }

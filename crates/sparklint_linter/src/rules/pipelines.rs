@@ -15,11 +15,19 @@ use sparklint_semantic::{Ty, static_text};
 
 use super::Rule;
 use super::io_settings::IoSettings;
+use super::msg::Msg;
 use crate::checker::Checker;
-use crate::diagnostic::Diagnostic;
+use crate::msg;
 
 /// DBX017 (see [`super::Rule`]).
-pub const RULES: &[Rule] = &[Rule::new("DBX017").init(stream_fanout)];
+pub const RULES: &[Rule] = &[Rule::new("DBX017").init(stream_fanout).msgs(&[DBX017])];
+
+const DBX017: Msg = Msg::new(
+    "DBX017",
+    "stream-fan-out",
+    "{source} is streamed separately by {by}: {datasets}. Each one is its own streaming query that re-reads every micro-batch, so the cluster is sized for all of them running at once.",
+)
+.help("Read the source once: point one @dp.append_flow at a @dp.foreach_batch_sink (Public Preview, pipeline channel PREVIEW) whose handler does batch_df.persist(), writes each target (with txnAppId/txnVersion options so retried batches don't duplicate rows), then unpersist(). Trade-offs: the targets stop being pipeline-managed tables (no expectations, lineage or full-refresh cleanup) and writes to different targets are not atomic.");
 
 /// Pipeline modules: `import dlt` and `from pyspark import pipelines as dp`.
 const PIPELINE_MODULES: &[&str] = &["dlt", "pyspark.pipelines"];
@@ -108,20 +116,12 @@ fn stream_fanout(ch: &mut Checker) {
             };
             names.push(label);
         }
-        let msg = format!(
-            "{} is streamed separately by {by}: {}. Each one is its own \
-             streaming query that re-reads every micro-batch, so the cluster is sized for all of \
-             them running at once.",
-            first.shown,
-            names.join(", ")
-        );
-        let d = Diagnostic::new("DBX017", msg, first.read).with_help(
-            "Read the source once: point one @dp.append_flow at a @dp.foreach_batch_sink \
-             (Public Preview, pipeline channel PREVIEW) whose handler does batch_df.persist(), \
-             writes each target (with txnAppId/txnVersion options so retried batches don't \
-             duplicate rows), then unpersist(). Trade-offs: the targets stop being \
-             pipeline-managed tables (no expectations, lineage or full-refresh cleanup) and \
-             writes to different targets are not atomic.",
+        let d = msg!(
+            DBX017,
+            first.read,
+            source = first.shown,
+            by,
+            datasets = names.join(", ")
         );
         ch.report(d);
     }
@@ -305,10 +305,10 @@ impl Reads<'_, '_> {
             return None;
         };
         if a.attr.as_str() == "table" {
-            return table_key(c.arguments.args.first()?);
+            return table_key(sc.arg(0, "tableName")?);
         }
         // load(path) or a Kafka/Event Hubs-style load() keyed by its topic option.
-        if let Some(path) = c.arguments.args.first() {
+        if let Some(path) = sc.arg(0, "path") {
             let p = static_text(path)?;
             if p.contains("{}") {
                 return None;

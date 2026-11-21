@@ -30,6 +30,11 @@ j = spark.sql("SELECT 'ORDER BY rand()' AS note FROM t ORDER BY id")
 k = spark.sql("SELECT a FROM t -- ORDER BY rand()\n")
 m = spark.sql("SELECT * FROM t ORDER BY random_score DESC")
 
+# Row-bounded or driver-built frames: sorting a few rows is cheap.
+o = df.limit(100).orderBy(F.rand())
+small = spark.createDataFrame([(1,), (2,)], ["x"])
+q = small.sort(F.rand())
+
 # Not Spark: pandas, plain Python, user classes.
 pdf = pd.DataFrame({"x": [3, 1, 2]})
 n = pdf.sort_values("x")

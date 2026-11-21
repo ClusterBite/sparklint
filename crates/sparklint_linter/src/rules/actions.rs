@@ -2,25 +2,45 @@
 
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{self as ast, CmpOp, Expr, ExprContext, Stmt, UnaryOp};
-use ruff_text_size::{Ranged, TextRange, TextSize};
-use sparklint_semantic::api::action_kind;
-use sparklint_semantic::{BindingKind, Elem, Ty, int_literal, str_literal};
+use ruff_text_size::{Ranged, TextRange};
+use sparklint_semantic::call_run::{Recv, Returns, RunKind, run_of_ty};
+use sparklint_semantic::pulled::{PathStep, Pulled};
+use sparklint_semantic::{BindingKind, Const, SparkCall, Ty, int_literal};
 
 use super::CountVar;
 use super::Rule;
+use super::describe::{self, short};
 use super::helpers::*;
+use super::msg::Msg;
+use super::truth_use::TruthUse;
 use crate::checker::{Checker, Node};
-use crate::diagnostic::{Diagnostic, Edit, Fix, Severity};
+use crate::diagnostic::{Edit, Fix, Severity};
+use crate::msg;
 
 /// ACT001/002/004/006/007/010/015 (see [`super::Rule`]).
 pub const RULES: &[Rule] = &[
-    Rule::new("ACT001").call(spark_action),
-    Rule::new("ACT002").call(collect_unbounded),
-    Rule::new("ACT004").stmt(act004_stmt).expr(act004_expr),
-    Rule::new("ACT006").call(act006_call).expr(act006_expr),
-    Rule::new("ACT007").stmt(act007_stmt).call(act007_call),
-    Rule::new("ACT010").call(debug_action_expr),
-    Rule::new("ACT015").call(approx_quantile_exact),
+    Rule::new("ACT001").call(spark_action).msgs(&[ACT001]),
+    Rule::new("ACT002")
+        .call(collect_unbounded)
+        .msgs(&[ACT002, ACT002_REDUCED]),
+    Rule::new("ACT004")
+        .stmt(act004_stmt)
+        .expr(act004_expr)
+        .msgs(&[ACT004, ACT004_N_PLUS_ONE]),
+    Rule::new("ACT006")
+        .call(act006_call)
+        .expr(act006_expr)
+        .msgs(&[ACT006, ACT006_HELD, ACT006_RDD]),
+    Rule::new("ACT007")
+        .stmt(act007_stmt)
+        .call(act007_call)
+        .msgs(&[ACT007_LOGGED, ACT007_DISCARDED]),
+    Rule::new("ACT010")
+        .call(debug_action_expr)
+        .msgs(&[ACT010, ACT010_PLAN, ACT010_SINK]),
+    Rule::new("ACT015")
+        .call(approx_quantile_exact)
+        .msgs(&[ACT015, ACT015_LOOP]),
 ];
 
 fn act004_stmt(ch: &mut Checker, stmt: &Stmt) {
@@ -64,17 +84,13 @@ fn act007_call(ch: &mut Checker, c: &ast::ExprCall, _expr: &Expr) {
     action_in_logging(ch, c);
 }
 
-/// Range from the method name to the end of the call (`.collect()` part of a chain).
-pub fn method_range(expr: &Expr) -> TextRange {
-    if let Expr::Call(c) = expr
-        && let Expr::Attribute(a) = &*c.func
-    {
-        return TextRange::new(a.attr.range.start(), c.range().end());
-    }
-    expr.range()
-}
-
 // ------------------------------------------------------------------ ACT001
+
+const ACT001: Msg = Msg::new(
+    "ACT001",
+    "action",
+    "Spark action: {call} triggers a job (kind: {kind}).",
+);
 
 const DDL_KEYWORDS: &[&str] = &[
     "CREATE", "INSERT", "MERGE", "DELETE", "UPDATE", "DROP", "ALTER", "OPTIMIZE", "VACUUM",
@@ -82,44 +98,52 @@ const DDL_KEYWORDS: &[&str] = &[
 ];
 
 pub fn spark_action(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
-    if matches!(&*c.func, Expr::Attribute(_)) {
-        let Some(sc) = ch.model.spark_call(expr) else {
-            return;
-        };
-        let (recv, m, rt) = (sc.receiver, sc.method, sc.receiver_ty);
-        let kind = if rt.ty.is_session() && m == "sql" {
-            ch.model
-                .sql_query(c)
-                .filter(|q| q.keyword().is_some_and(|w| DDL_KEYWORDS.contains(&w)))
-                .map(|_| "eager-sql")
-        } else {
-            action_kind(rt.ty, m).map(|k| k.as_str())
-        };
-        if let Some(kind) = kind {
-            let msg = format!(
-                "Spark action: {}.{m}() triggers a job (kind: {kind}).",
-                short(ch, recv)
-            );
-            ch.report(Diagnostic::new("ACT001", msg, method_range(expr)));
+    if let Some(sc) = ch.model.spark_call(expr)
+        && sc.class().is_session()
+        && sc.method == "sql"
+    {
+        if ch
+            .model
+            .sql_query(c)
+            .is_some_and(|q| q.keyword().is_some_and(|w| DDL_KEYWORDS.contains(&w)))
+        {
+            let call = describe::call(ch, expr);
+            ch.report(msg!(ACT001, method_range(expr), call, kind = "eager-sql"));
         }
         return;
     }
-    if let Some(q) = ch.model.qualified_name(&c.func)
-        && q == "databricks.display"
-        && c.arguments
-            .args
-            .first()
-            .is_some_and(|a| ch.model.is_dataframe(a))
-    {
-        ch.report(Diagnostic::new(
-            "ACT001",
-            "Spark action: display() triggers a job (kind: display).",
-            expr.range(),
-        ));
-    }
+    let Some(run) = ch.model.call_run(expr) else {
+        return;
+    };
+    // A Delta table operation changes (or maintains) the table: worded as a write.
+    let kind = match run.kind() {
+        RunKind::DeltaOp => "write",
+        k => k.as_str(),
+    };
+    let range = if run.recv == Recv::Function && run.kind() == RunKind::Display {
+        expr.range()
+    } else {
+        method_range(expr)
+    };
+    let call = describe::call(ch, expr);
+    ch.report(msg!(ACT001, range, call, kind));
 }
 
 // ------------------------------------------------------------------ ACT002
+
+const ACT002_HELP: &str = "Keep the work in Spark (aggregate/write), or bound the result with .limit(n) before collecting.";
+const ACT002: Msg = Msg::new(
+    "ACT002",
+    "unbounded",
+    ".collect() on a DataFrame with no known row bound pulls everything to the driver.",
+)
+.help(ACT002_HELP);
+const ACT002_REDUCED: Msg = Msg::new(
+    "ACT002",
+    "reduced",
+    ".collect() on a DataFrame with no known row bound pulls everything to the driver (filtered/aggregated — size unknown).",
+)
+.help(ACT002_HELP);
 
 pub fn collect_unbounded(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) {
     let Some(sc) = ch.model.spark_call_named(expr, &["collect"]) else {
@@ -129,29 +153,39 @@ pub fn collect_unbounded(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) {
         return;
     }
     let (recv, t) = (sc.receiver, sc.receiver_ty);
-    let mut msg =
-        ".collect() on a DataFrame with no known row bound pulls everything to the driver."
-            .to_string();
-    let mut sev = Severity::Warning;
-    if t.facts.reduced {
-        msg = ".collect() on a DataFrame with no known row bound pulls everything to the driver (filtered/aggregated — size unknown).".to_string();
-        sev = Severity::Info;
-    }
+    let (m, sev) = if t.facts.reduced {
+        (&ACT002_REDUCED, Severity::Info)
+    } else {
+        (&ACT002, Severity::Warning)
+    };
     let limit = ch.settings.collect_limit;
     let fix = Fix::unsafe_(
         format!("Insert .limit({limit}) before .collect()"),
         vec![Edit::insert(recv.range().end(), format!(".limit({limit})"))],
     );
     ch.report(
-        Diagnostic::new("ACT002", msg, method_range(expr))
+        msg!(m, method_range(expr))
             .with_site(expr.range())
             .with_severity(sev)
-            .with_fix(fix)
-            .with_help("Keep the work in Spark (aggregate/write), or bound the result with .limit(n) before collecting."),
+            .with_fix(fix),
     );
 }
 
 // ------------------------------------------------------------------ ACT004
+
+const ACT004_HELP: &str = "Use select/withColumn/groupBy (or mapInPandas/applyInPandas for arbitrary Python) so the work runs on the executors.";
+const ACT004: Msg = Msg::new(
+    "ACT004",
+    "rows",
+    "Iterating rows on the driver ({source}) — express this as a DataFrame transformation.",
+)
+.help(ACT004_HELP);
+const ACT004_N_PLUS_ONE: Msg = Msg::new(
+    "ACT004",
+    "rows-n-plus-one",
+    "Iterating rows on the driver ({source}) — express this as a DataFrame transformation. The loop body also runs a Spark action per row (N+1 jobs).",
+)
+.help(ACT004_HELP);
 
 fn body_has_action(ch: &Checker, body: &[Stmt]) -> bool {
     struct V<'c, 'a> {
@@ -168,12 +202,14 @@ fn body_has_action(ch: &Checker, body: &[Stmt]) -> bool {
             if self.found {
                 return;
             }
-            if let Some(sc) = self.ch.model.spark_call(e) {
-                let t = sc.class();
-                if action_kind(t, sc.method).is_some() && t != Ty::PandasOnSparkFrame {
-                    self.found = true;
-                    return;
-                }
+            if self
+                .ch
+                .model
+                .call_run(e)
+                .is_some_and(|r| r.recv != Recv::Ty(Ty::PandasOnSparkFrame))
+            {
+                self.found = true;
+                return;
             }
             if !matches!(e, Expr::Lambda(_)) {
                 visitor::walk_expr(self, e);
@@ -188,80 +224,78 @@ fn body_has_action(ch: &Checker, body: &[Stmt]) -> bool {
 }
 
 /// Describe a driver-side row iteration source, if `iter` is one, with its overlap
-/// site (the `.collect()` / `.toPandas()` call that pulls the rows).
+/// site: the name holding the rows when they come through one (the rows may serve
+/// other uses too), the `.collect()` / `.toPandas()` call that pulls them otherwise.
 fn row_iteration_source(ch: &Checker, iter: &Expr) -> Option<(String, TextRange)> {
-    // enumerate(x) / zip(x, ...)
-    if let Expr::Call(c) = iter
-        && let Some(q) = ch.model.qualified_name(&c.func)
-        && matches!(
-            q.as_str(),
-            "builtins.enumerate" | "builtins.zip" | "builtins.list" | "builtins.sorted"
-        )
-    {
-        return c
-            .arguments
-            .args
-            .iter()
-            .find_map(|a| row_iteration_source(ch, a));
-    }
-    if let Some((_, recv, m)) = method_call(iter) {
-        match m {
-            "collect" | "toLocalIterator" => {
-                if let Some(sc) = ch.model.spark_call(iter)
-                    && sc.has_no_args()
-                    && (sc.is_dataframe() || sc.class() == Ty::Rdd)
-                    && !sc.driver_sized()
-                {
-                    let what = if sc.class() == Ty::Rdd { "rdd" } else { "df" };
-                    return Some((format!("for row in {what}.{m}()"), iter.range()));
-                }
-            }
-            "iterrows" | "itertuples" | "items" => {
-                if let Some(inner) = ch.model.spark_call_named(recv, &["toPandas"])
-                    && inner.is_dataframe()
-                    && !inner.driver_sized()
-                {
-                    return Some((format!("df.toPandas().{m}()"), recv.range()));
-                }
-                // A pandas frame (not Spark) produced on the driver from a Spark value.
-                let rt = ch.model.ty_of(recv);
-                if rt.ty == Ty::PandasFrame && rt.facts.from_spark && !rt.driver_sized() {
-                    return Some((format!("df.toPandas().{m}()"), recv.range()));
-                }
-            }
-            _ => {}
+    let hit = ch
+        .model
+        .pulled_rows(iter)
+        .into_iter()
+        .find(|p| p.holds.rows() && !p.fits_driver() && !first_rows_only(p))?;
+    // `enumerate(x)` / `zip(x, ..)` / `list(x)` / `sorted(x)` iterate `x`.
+    let i = hit.path.iter().position(|(s, _)| *s != PathStep::Wrap);
+    let iterated = i.map_or(hit.at, |i| hit.path[i].1);
+    let name = hit
+        .path
+        .iter()
+        .find(|(s, _)| matches!(s, PathStep::Name(_)))
+        .map(|(_, e)| *e);
+    let site = name.unwrap_or(hit.pull.map_or(hit.at, |p| p.call)).range();
+    let desc = match i.map(|i| hit.path[i].0) {
+        // `pdf.iterrows()` / `.to_dict("records")` / `table.to_pylist()`.
+        Some(PathStep::FrameRows) => describe::call(ch, iterated),
+        Some(PathStep::Name(_)) => name_source(ch, iterated),
+        _ if hit.pull.is_some() => format!("for row in {}", describe::call(ch, iterated)),
+        _ => name_source(ch, iterated),
+    };
+    Some((desc, site))
+}
+
+/// `rows[:3]`: a few of the pulled rows, whatever the pull cost.
+fn first_rows_only(p: &Pulled) -> bool {
+    p.path.iter().any(|(s, e)| {
+        *s == PathStep::Slice
+            && matches!(e, Expr::Subscript(sub) if matches!(&*sub.slice, Expr::Slice(sl) if sl.upper.is_some()))
+    })
+}
+
+/// How the rows behind a name were pulled: `rows from df.collect()` when every binding
+/// reaching the use is the same call shape, the generic wording otherwise.
+fn name_source(ch: &Checker, name: &Expr) -> String {
+    let Expr::Name(n) = name else {
+        return "rows collected from a DataFrame".into();
+    };
+    let mut found: Option<String> = None;
+    for b in ch.model.reaching(n) {
+        let desc = ch
+            .model
+            .binding(*b)
+            .value
+            .filter(|v| {
+                ch.model
+                    .pull_call(v)
+                    .is_some_and(|p| matches!(p.run.returns, Returns::Rows | Returns::RowIter))
+            })
+            .map(|v| format!("rows from {}", describe::call(ch, v)));
+        match (desc, &found) {
+            (Some(d), None) => found = Some(d),
+            (Some(d), Some(f)) if &d == f => {}
+            _ => return "rows collected from a DataFrame".into(),
         }
-        return None;
     }
-    if let Expr::Name(_) = iter {
-        let t = ch.model.ty_of(iter);
-        if let Ty::List(e) = t.ty
-            && t.facts.from_spark
-            && !t.driver_sized()
-            && matches!(e, Elem::Row | Elem::Unknown)
-        {
-            return Some((
-                format!("rows from {}.collect()", short(ch, iter)),
-                iter.range(),
-            ));
-        }
-    }
-    None
+    found.unwrap_or_else(|| "rows collected from a DataFrame".into())
 }
 
 fn report_row_iteration(ch: &mut Checker, iter: &Expr, body: Option<&[Stmt]>) {
     let Some((desc, site)) = row_iteration_source(ch, iter) else {
         return;
     };
-    let mut msg = format!(
-        "Iterating rows on the driver ({desc}) — express this as a DataFrame transformation."
-    );
-    if body.is_some_and(|b| body_has_action(ch, b)) {
-        msg.push_str(" The loop body also runs a Spark action per row (N+1 jobs).");
-    }
-    ch.report(Diagnostic::new("ACT004", msg, iter.range()).with_site(site).with_help(
-        "Use select/withColumn/groupBy (or mapInPandas/applyInPandas for arbitrary Python) so the work runs on the executors.",
-    ));
+    let m = if body.is_some_and(|b| body_has_action(ch, b)) {
+        &ACT004_N_PLUS_ONE
+    } else {
+        &ACT004
+    };
+    ch.report(msg!(m, iter.range(), source = desc).with_site(site));
 }
 
 pub fn driver_row_iteration_for(ch: &mut Checker, f: &ast::StmtFor) {
@@ -282,6 +316,26 @@ pub fn driver_row_iteration_comp(ch: &mut Checker, expr: &Expr) {
 }
 
 // ------------------------------------------------------------------ ACT006
+
+const ACT006_HELP: &str = "isEmpty() (Spark 3.3+) runs a job that stops at the first row; on older versions use len(df.take(1)) == 0. Keep count() only when the number itself is needed.";
+const ACT006: Msg = Msg::new(
+    "ACT006",
+    "count-check",
+    "{count} used as an emptiness check scans every row — use {receiver}.isEmpty().",
+)
+.help(ACT006_HELP);
+const ACT006_HELD: Msg = Msg::new(
+    "ACT006",
+    "held-count",
+    "{call} is only used as an emptiness check — use {receiver}.isEmpty() (stops at the first row).",
+)
+.help(ACT006_HELP);
+const ACT006_RDD: Msg = Msg::new(
+    "ACT006",
+    "rdd-is-empty",
+    "{call} converts the DataFrame to an RDD first — use {receiver}.isEmpty().",
+)
+.help(ACT006_HELP);
 
 /// Normalised comparison `count OP k` → Some(true) = "is empty", Some(false) =
 /// "is not empty", None = not an emptiness check.
@@ -320,50 +374,6 @@ fn compare_emptiness(cmp: &ast::ExprCompare, subject: TextRange) -> Option<bool>
     }
 }
 
-/// Is the current node (`e`) used directly as a boolean test?
-fn is_test_context(ch: &Checker, e: &Expr) -> bool {
-    let r = e.range();
-    let mut i = 0;
-    let mut cur = r;
-    loop {
-        match ch.ancestor(i) {
-            Some(Node::Stmt(Stmt::If(s))) => {
-                return s.test.range() == cur
-                    || s.elif_else_clauses
-                        .iter()
-                        .any(|c| c.test.as_ref().is_some_and(|t| t.range() == cur));
-            }
-            Some(Node::Stmt(Stmt::While(s))) => return s.test.range() == cur,
-            Some(Node::Stmt(Stmt::Assert(s))) => return s.test.range() == cur,
-            Some(Node::Expr(Expr::If(x))) => return x.test.range() == cur,
-            Some(Node::Expr(Expr::BoolOp(b))) => {
-                cur = b.range;
-                i += 1;
-            }
-            Some(Node::Expr(Expr::UnaryOp(u))) if u.op == UnaryOp::Not => {
-                cur = u.range;
-                i += 1;
-            }
-            _ => return false,
-        }
-    }
-}
-
-fn needs_parens_for_not(ch: &Checker) -> bool {
-    matches!(
-        ch.parent(),
-        Some(Node::Expr(
-            Expr::BinOp(_)
-                | Expr::UnaryOp(_)
-                | Expr::Compare(_)
-                | Expr::Attribute(_)
-                | Expr::Subscript(_)
-                | Expr::Await(_)
-                | Expr::Starred(_)
-        ))
-    )
-}
-
 fn is_empty_fix(ch: &Checker, recv: &Expr, empty: bool, range: TextRange) -> Fix {
     let r = paren_src(ch, recv);
     let modern = ch.settings.spark_version >= (3, 3);
@@ -373,7 +383,7 @@ fn is_empty_fix(ch: &Checker, recv: &Expr, empty: bool, range: TextRange) -> Fix
         } else {
             format!("not {r}.isEmpty()")
         };
-        if !empty && needs_parens_for_not(ch) {
+        if !empty && crate::fix_text::not_needs_parens(ch.parent()) {
             text = format!("({text})");
         }
         Fix::safe(
@@ -393,9 +403,12 @@ fn is_empty_fix(ch: &Checker, recv: &Expr, empty: bool, range: TextRange) -> Fix
     }
 }
 
-fn emptiness_message(ch: &Checker, recv: &Expr) -> String {
-    let s = short(ch, recv);
-    format!("{s}.count() used as an emptiness check scans every row — use {s}.isEmpty().")
+fn emptiness_finding(ch: &Checker, recv: &Expr, range: TextRange) -> crate::Diagnostic {
+    let (count, receiver) = (
+        describe::method(ch, recv, "count", None),
+        describe::receiver(ch, recv),
+    );
+    msg!(ACT006, range, count, receiver)
 }
 
 pub fn count_compare(ch: &mut Checker, c: &ast::ExprCompare, expr: &Expr) {
@@ -407,8 +420,8 @@ pub fn count_compare(ch: &mut Checker, c: &ast::ExprCompare, expr: &Expr) {
             continue;
         };
         let fix = is_empty_fix(ch, recv, empty, expr.range());
-        let msg = emptiness_message(ch, recv);
-        ch.report(Diagnostic::new("ACT006", msg, expr.range()).with_fix(fix));
+        let d = emptiness_finding(ch, recv, expr.range());
+        ch.report(d.with_fix(fix));
         return;
     }
 }
@@ -421,24 +434,29 @@ pub fn not_count(ch: &mut Checker, u: &ast::ExprUnaryOp, expr: &Expr) {
         return;
     };
     let fix = is_empty_fix(ch, recv, true, expr.range());
-    let msg = emptiness_message(ch, recv);
-    ch.report(Diagnostic::new("ACT006", msg, expr.range()).with_fix(fix));
+    let d = emptiness_finding(ch, recv, expr.range());
+    ch.report(d.with_fix(fix));
 }
 
 pub fn count_in_bool_context(ch: &mut Checker, expr: &Expr) {
     let Some(recv) = df_count_call(ch, expr) else {
         return;
     };
-    // `not df.count()` is reported by `not_count`.
+    // `not df.count()` is reported (and fixed as a whole) by `not_count`.
     if matches!(ch.parent(), Some(Node::Expr(Expr::UnaryOp(u))) if u.op == UnaryOp::Not) {
         return;
     }
-    if !is_test_context(ch, expr) {
+    let Some(TruthUse::Test { named }) = ch.truth_use(expr) else {
+        return;
+    };
+    let d = emptiness_finding(ch, recv, expr.range());
+    // Through a walrus the count is also kept in a name: no rewrite of the value.
+    if named {
+        ch.report(d);
         return;
     }
     let fix = is_empty_fix(ch, recv, false, expr.range());
-    let msg = emptiness_message(ch, recv);
-    ch.report(Diagnostic::new("ACT006", msg, expr.range()).with_fix(fix));
+    ch.report(d.with_fix(fix));
 }
 
 pub fn rdd_is_empty(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
@@ -453,13 +471,9 @@ pub fn rdd_is_empty(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
         return;
     }
     let base = paren_src(ch, &a.value);
-    let s = short(ch, &a.value);
+    let (call, receiver) = (describe::call(ch, expr), describe::receiver(ch, &a.value));
     let text = format!("{base}.isEmpty()");
-    let mut d = Diagnostic::new(
-        "ACT006",
-        format!("{s}.rdd.isEmpty() converts the DataFrame to an RDD first — use {s}.isEmpty()."),
-        expr.range(),
-    );
+    let mut d = msg!(ACT006_RDD, expr.range(), call, receiver);
     if ch.settings.spark_version >= (3, 3) {
         d = d.with_fix(Fix::safe(
             format!("Replace with `{text}`"),
@@ -481,12 +495,10 @@ pub fn init_count_vars(ch: &mut Checker) {
         let Some(recv) = df_count_call(ch, v) else {
             continue;
         };
-        if ch.model.ty_of(recv).bounded().is_some() {
-            continue;
-        }
         let cv = CountVar {
             call_range: method_range(v),
-            recv: short(ch, recv),
+            recv: describe::receiver(ch, recv),
+            call: describe::method(ch, recv, "count", None),
             uses: 0,
             emptiness_uses: 0,
             logging_uses: 0,
@@ -526,10 +538,10 @@ pub fn count_var_use(ch: &mut Checker, n: &ast::ExprName, expr: &Expr) {
     if reaching.is_empty() {
         return;
     }
+    // Compared with 0 / 1, tested or converted to bool: an emptiness check.
     let emptiness = match ch.parent() {
         Some(Node::Expr(Expr::Compare(c))) => compare_emptiness(c, expr.range()).is_some(),
-        Some(Node::Expr(Expr::UnaryOp(u))) if u.op == UnaryOp::Not => true,
-        _ => is_test_context(ch, expr),
+        _ => ch.truth_use(expr).is_some(),
     };
     let logging = !emptiness && inside_logging_sink(ch, expr);
     for b in reaching {
@@ -553,39 +565,53 @@ pub fn finish_count_vars(ch: &mut Checker) {
             continue;
         }
         if v.emptiness_uses == v.uses {
-            ch.report(Diagnostic::new(
-                "ACT006",
-                format!(
-                    "{r}.count() is only used as an emptiness check — use {r}.isEmpty() (stops at the first row).",
-                    r = v.recv
-                ),
+            ch.report(msg!(
+                ACT006_HELD,
                 v.call_range,
+                call = v.call,
+                receiver = v.recv
             ));
         } else if v.logging_uses == v.uses {
-            ch.report(Diagnostic::new(
-                "ACT007",
-                format!(
-                    "{}.count() is computed only to be logged — a full job for a log line.",
-                    v.recv
-                ),
-                v.call_range,
-            ));
+            ch.report(msg!(ACT007_LOGGED, v.call_range, call = v.call));
         }
     }
 }
 
 // ------------------------------------------------------------------ ACT007
 
-const LOGGED_ACTIONS: &[&str] = &[
-    "count", "collect", "first", "head", "take", "isEmpty", "toPandas",
-];
+const ACT007_LOGGED: Msg = Msg::new(
+    "ACT007",
+    "logged",
+    "{call} is computed only to be logged — a full job for a log line.",
+)
+.help("Drop it, read numOutputRows from the Delta commit, or use df.observe() to compute the metric in the same job.");
+const ACT007_DISCARDED: Msg = Msg::new(
+    "ACT007",
+    "discarded",
+    "{call} result is discarded — a full Spark job whose result is never used.",
+)
+.help("Remove the call; use df.observe() or the write's Delta history for row counts.");
+
+/// An action whose result is the point of the call: a job or a driver pull returning a
+/// value or rows (`count`, `isEmpty`, `collect`, `first`, …; not `foreach`).
+fn result_action(sc: &SparkCall) -> bool {
+    run_of_ty(sc.class(), sc.method).is_some_and(|r| {
+        matches!(r.kind, RunKind::Job | RunKind::DriverPull) && r.returns != Returns::Nothing
+    })
+}
 
 pub fn discarded_action(ch: &mut Checker, value: &Expr) {
-    let Some(sc) = ch.model.spark_call_named(value, LOGGED_ACTIONS) else {
+    let Some(sc) = ch.model.spark_call(value).filter(result_action) else {
         return;
     };
     let (recv, m) = (sc.receiver, sc.method);
-    if (m == "count" && !sc.has_no_args()) || !sc.is_dataframe() || sc.bounded().is_some() {
+    if (m == "count" && !sc.has_no_args()) || !sc.is_dataframe() || sc.size().cheap_action() {
+        return;
+    }
+    // `df.cache().count()` / `df.persist(..).count()` (or `count()` after a `df.cache()`
+    // statement) is the eager-cache idiom: the job fills the cache that later actions read,
+    // so its work is not lost with the discarded number.
+    if m == "count" && sc.receiver_ty.facts.cached {
         return;
     }
     // `try: df.count() except ...:` / `with pytest.raises(..):` forces evaluation to
@@ -599,19 +625,8 @@ pub fn discarded_action(ch: &mut Checker, value: &Expr) {
     if fills_observation(ch, value, recv) {
         return;
     }
-    ch.report(
-        Diagnostic::new(
-            "ACT007",
-            format!(
-                "{}.{m}() result is discarded — a full Spark job whose result is never used.",
-                short(ch, recv)
-            ),
-            method_range(value),
-        )
-        .with_help(
-            "Remove the call; use df.observe() or the write's Delta history for row counts.",
-        ),
-    );
+    let call = describe::call(ch, value);
+    ch.report(msg!(ACT007_DISCARDED, method_range(value), call));
 }
 
 /// A discarded action runs to fill a Spark `Observation` when its function (or the
@@ -672,63 +687,52 @@ pub fn action_in_logging(ch: &mut Checker, c: &ast::ExprCall) {
             let Some(sc) = ch.model.spark_call(e) else {
                 return;
             };
-            let (recv, m) = (sc.receiver, sc.method);
+            let m = sc.method;
             let hit = if m == "getNumPartitions" {
                 sc.class() == Ty::Rdd
             } else {
-                LOGGED_ACTIONS.contains(&m)
+                result_action(&sc)
                     && !(m == "count" && !sc.has_no_args())
                     && sc.is_dataframe()
-                    && sc.bounded().is_none()
+                    && !sc.size().cheap_action()
             };
             if hit {
-                found.push((method_range(e), format!("{}.{m}()", short(ch, recv))));
+                found.push((method_range(e), describe::call(ch, e)));
             }
         });
     }
     found.sort_by_key(|(r, _)| r.start());
     found.dedup_by_key(|(r, _)| *r);
     for (range, what) in found {
-        ch.report(
-            Diagnostic::new(
-                "ACT007",
-                format!("{what} is computed only to be logged — a full job for a log line."),
-                range,
-            )
-            .with_help("Drop it, read numOutputRows from the Delta commit, or use df.observe() to compute the metric in the same job."),
-        );
+        ch.report(msg!(ACT007_LOGGED, range, call = what));
     }
 }
 
 // ------------------------------------------------------------------ ACT010
 
-pub(crate) fn delete_stmt_fix(ch: &Checker, stmt: &Stmt) -> Fix {
-    let r = stmt.range();
-    if block_len(ch, stmt) <= 1 {
-        return Fix::unsafe_("Replace with `pass`", vec![Edit::replace(r, "pass")]);
-    }
-    let text = &ch.source.text;
-    let start = usize::from(r.start());
-    let end = usize::from(r.end());
-    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
-    let line_end = text[end..].find('\n').map_or(text.len(), |i| end + i + 1);
-    let before = &text[line_start..start];
-    let after = text[end..line_end].trim();
-    if before.trim().is_empty() && (after.is_empty() || after.starts_with('#')) {
-        Fix::unsafe_(
-            "Remove the statement",
-            vec![Edit::delete(TextRange::new(
-                TextSize::from(line_start as u32),
-                TextSize::from(line_end as u32),
-            ))],
-        )
-    } else {
-        Fix::unsafe_("Replace with `pass`", vec![Edit::replace(r, "pass")])
-    }
-}
+const ACT010_HELP: &str = "Delete it before the code runs as a job; where someone reads the output, keep it with `# noqa: ACT010`.";
+const ACT010: Msg = Msg::new(
+    "ACT010",
+    "debug-action",
+    "{call} left in pipeline code triggers extra jobs (nobody reads the output in a scheduled run).",
+)
+.help(ACT010_HELP);
+const ACT010_PLAN: Msg = Msg::new(
+    "ACT010",
+    "debug-plan",
+    "{call} left in pipeline code prints to the driver log: it runs no job, but it is noise in a scheduled run (and a server round trip on Spark Connect).",
+)
+.help(ACT010_HELP);
+const ACT010_SINK: Msg = Msg::new(
+    "ACT010",
+    "debug-sink",
+    "{call} is a debug sink: the stream's output is printed to the driver log (console) or kept in driver memory (memory), not stored.",
+)
+.help("Write the stream to a durable sink such as a Delta table; for a benchmark use the `noop` format.");
 
 pub fn debug_action_expr(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
     let mut always_info = false;
+    let mut variant = &ACT010;
     let what: String;
     // The unsafe fix deletes the statement: only offered when the DataFrame is proven.
     let certain;
@@ -736,22 +740,32 @@ pub fn debug_action_expr(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
         let Some(sc) = ch.model.spark_call(expr) else {
             return;
         };
-        let (recv, m, rt) = (sc.receiver, sc.method, sc.receiver_ty);
+        let (m, rt) = (sc.method, sc.receiver_ty);
         certain = rt.is_certain();
         match m {
-            "show" | "display" if rt.is_dataframe() => what = format!("{}.{m}()", short(ch, recv)),
+            // A cheap preview (`df.limit(10).show()`, driver-built data; not a one-row
+            // aggregate that reads the whole frame) is a deliberate small look, the
+            // same answer as the global `display(x)` below.
+            "show" | "display" if rt.is_dataframe() => {
+                if rt.size().cheap_preview() {
+                    return;
+                }
+                what = describe::call(ch, expr);
+            }
             "printSchema" | "explain" if rt.is_dataframe() => {
                 always_info = true;
-                what = format!("{}.{m}()", short(ch, recv));
+                variant = &ACT010_PLAN;
+                what = describe::call(ch, expr);
             }
             "format" if rt.ty == Ty::DataStreamWriter => {
-                let Some(fmt) = c.arguments.args.first().and_then(str_literal) else {
+                let Some(fmt) = sc.str_arg(ch.model, 0, "source") else {
                     return;
                 };
                 if !matches!(fmt, "console" | "memory") {
                     return;
                 }
-                what = format!("writeStream.format(\"{fmt}\")");
+                variant = &ACT010_SINK;
+                what = describe::call(ch, expr);
             }
             _ => return,
         }
@@ -761,7 +775,8 @@ pub fn debug_action_expr(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
         };
         // `display(x)` runs a Spark job only for a Spark DataFrame: not for
         // `display(dbutils.fs.ls(..))`, a pandas frame, a figure or `display(df.head(5))`,
-        // and a row-bounded frame (`df.limit(10)`) is a deliberate small preview.
+        // and a cheap preview (`df.limit(10)`, driver-built data, catalog metadata; not
+        // `df.agg(..)`, which reads every row) is a deliberate small look.
         // `displayHTML(..)` renders a string and never runs a job.
         if q != "databricks.display" {
             return;
@@ -770,23 +785,18 @@ pub fn debug_action_expr(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
             return;
         };
         let t = ch.model.ty_of(arg);
-        if !t.is_dataframe() || t.bounded().is_some() {
+        if !t.is_dataframe() || t.size().cheap_preview() {
             return;
         }
         certain = t.is_certain();
-        what = "display()".to_string();
+        what = describe::call(ch, expr);
     }
     let severity = if always_info || ch.is_notebook() {
         Severity::Info
     } else {
         Severity::Warning
     };
-    let mut d = Diagnostic::new(
-        "ACT010",
-        format!("{what} left in pipeline code triggers extra jobs (nobody reads the output in a scheduled run)."),
-        method_range(expr),
-    )
-    .with_severity(severity);
+    let mut d = msg!(variant, method_range(expr), call = what).with_severity(severity);
     if certain
         && let Some(Node::Stmt(stmt @ Stmt::Expr(se))) = ch.parent()
         && se.value.range() == expr.range()
@@ -797,26 +807,6 @@ pub fn debug_action_expr(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
 }
 
 // ------------------------------------------------------------------ ACT015
-
-/// Constant value of a numeric literal (`0`, `0.0`, `-0.0`), following one binding.
-fn const_number(ch: &Checker, e: &Expr, depth: u32) -> Option<f64> {
-    match e {
-        Expr::NumberLiteral(n) => match &n.value {
-            ast::Number::Int(i) => i.as_i64().map(|v| v as f64),
-            ast::Number::Float(f) => Some(*f),
-            ast::Number::Complex { .. } => None,
-        },
-        Expr::UnaryOp(u) if matches!(u.op, UnaryOp::USub | UnaryOp::UAdd) => {
-            const_number(ch, &u.operand, depth).map(|v| if u.op == UnaryOp::USub { -v } else { v })
-        }
-        Expr::Name(n) if depth < 3 => {
-            let b = ch.model.single_binding(n)?;
-            let v = ch.model.binding(b).value?;
-            const_number(ch, v, depth + 1)
-        }
-        _ => None,
-    }
-}
 
 /// `df.approxQuantile(col, probs, 0)` / `df.stat.approxQuantile(..., relativeError=0.0)`:
 /// a relative error of 0 computes exact quantiles, which the docs warn "could be very
@@ -841,22 +831,34 @@ pub fn approx_quantile_exact(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
     if !spark || c.arguments.keywords.iter().any(|k| k.arg.is_none()) {
         return;
     }
-    let Some(err) = sparklint_semantic::call_arg(c, 2, "relativeError") else {
+    let Some(err) = sc.arg(2, "relativeError") else {
         return;
     };
-    if const_number(ch, err, 0) != Some(0.0) {
+    if ch.model.constant(err).and_then(Const::as_num) != Some(0.0) {
         return;
     }
-    let mut msg = format!(
-        "approxQuantile(..., relativeError={}) computes exact quantiles: a full pass over the data that the Spark docs call \"very expensive\".",
-        short(ch, err)
-    );
-    if ch.model.in_loop(expr) {
-        msg.push_str(" Inside a loop it runs on every iteration.");
-    }
-    ch.report(
-        Diagnostic::new("ACT015", msg, method_range(expr)).with_help(
-            "Use a small relative error (0.001-0.01 is plenty for thresholds and outlier bounds).",
-        ),
-    );
+    let m = if ch.model.in_repeating_loop(expr) {
+        &ACT015_LOOP
+    } else {
+        &ACT015
+    };
+    let error = short(ch, err);
+    ch.report(msg!(m, method_range(expr), error));
 }
+
+// ------------------------------------------------------------------ ACT015
+
+const ACT015_HELP: &str =
+    "Use a small relative error (0.001-0.01 is plenty for thresholds and outlier bounds).";
+const ACT015: Msg = Msg::new(
+    "ACT015",
+    "exact",
+    "approxQuantile(..., relativeError={error}) computes exact quantiles: a full pass over the data that the Spark docs call \"very expensive\".",
+)
+.help(ACT015_HELP);
+const ACT015_LOOP: Msg = Msg::new(
+    "ACT015",
+    "exact-in-loop",
+    "approxQuantile(..., relativeError={error}) computes exact quantiles: a full pass over the data that the Spark docs call \"very expensive\". Inside a loop it runs on every iteration.",
+)
+.help(ACT015_HELP);

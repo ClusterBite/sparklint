@@ -14,3 +14,12 @@ for i, row in enumerate(df.collect()):  # expect: ACT002
 n = len(df.collect())  # expect: ACT002
 first = df.collect()[0]  # expect: ACT002
 total = sum(r.x for r in df.collect())  # expect: ACT002
+last = df.collect()[-1]  # expect: ACT002
+head = df.collect()[:5]  # expect: ACT002
+rows = df.collect()  # expect: ACT002
+print(len(rows))
+if df.columns:
+    picked = df.collect()  # expect: ACT002
+else:
+    picked = df.where("x > 1").collect()  # expect: ACT002
+print(len(picked))

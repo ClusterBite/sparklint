@@ -418,6 +418,15 @@ fn rule_and_rules_commands() {
     );
     let o = run(t.path(), &["rule", "collect-unbounded"]);
     assert_eq!(o.status.code(), Some(0));
+    // every message variant the rule table declares, with its help line
+    let o = run(t.path(), &["rule", "ACT008"]);
+    let out = stdout(&o);
+    assert!(
+        out.contains("## Messages\n\n- isin: Values collected to the driver are fed back into isin()")
+            && out.contains("- condition-string: Values collected to the driver are interpolated back into {sink} SQL text")
+            && out.contains("  help: Register the source as a view"),
+        "{out}"
+    );
     let o = run(t.path(), &["rule", "XXX"]);
     assert_eq!(o.status.code(), Some(2));
     let o = run(t.path(), &["rules", "--format", "json"]);
@@ -427,4 +436,55 @@ fn rule_and_rules_commands() {
     assert!(stdout(&o).lines().count() >= 16);
     let o = run(t.path(), &["version"]);
     assert!(stdout(&o).starts_with("sparklint "));
+}
+
+#[test]
+fn mistyped_suppression_comment_warns_and_suppresses_nothing() {
+    // A token naming no rule used to silence every rule on the line (or, in a
+    // file-ignore, the file); now it suppresses nothing and is a warning.
+    let t = tempfile::tempdir().unwrap();
+    write(
+        t.path(),
+        "a.py",
+        "# sparklint: file-ignore[tag:nope]\ndf = spark.table('t')\nrows = df.collect()  # noqa: collect-without-limit, E501\nok = df.collect()  # noqa: collect-unbounded\n",
+    );
+    write(
+        t.path(),
+        "b.py",
+        "df = spark.table('t')\nrows = df.collect()  # noqa: ALL\n",
+    );
+    write(t.path(), "c.py", COLLECT);
+    let o = run(t.path(), &["check", "--output-format", "json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let seen: Vec<(String, u64)> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["filename"].as_str().unwrap().to_string(),
+                d["location"]["row"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![("a.py".to_string(), 3), ("c.py".to_string(), 2)],
+        "{v}"
+    );
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    let warnings: Vec<&str> = err
+        .lines()
+        .filter(|l| l.starts_with("sparklint: warning:"))
+        .collect();
+    assert_eq!(warnings.len(), 2, "{err}");
+    assert!(
+        warnings[0].starts_with("sparklint: warning: a.py:1: unknown rule `tag:nope`"),
+        "{err}"
+    );
+    assert!(
+        warnings[1].starts_with("sparklint: warning: a.py:3: unknown rule `collect-without-limit`"),
+        "{err}"
+    );
 }

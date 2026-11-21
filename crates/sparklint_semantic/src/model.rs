@@ -2,7 +2,7 @@
 
 use ruff_python_ast::{Expr, ExprName};
 use ruff_text_size::{Ranged, TextRange, TextSize};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::types::{Ty, TypeInfo};
 
@@ -144,6 +144,9 @@ pub struct LoopInfo {
     pub func_scope: ScopeId,
     /// Number of elements when the iterable is a literal list/tuple/set.
     pub literal_len: Option<usize>,
+    /// Body regions that run at most once per loop (followed by an unconditional
+    /// `break` / `return` in the same block; see `loop_exit`).
+    pub once: Vec<(TextRange, crate::loop_exit::LoopExit)>,
 }
 
 impl LoopInfo {
@@ -182,14 +185,17 @@ pub struct FunctionSummary {
 impl FunctionSummary {
     /// The effective return type.
     pub fn return_type(&self) -> TypeInfo {
-        if let Some(a) = self.annotated_return {
-            return a;
-        }
-        if self.has_return_value {
+        let mut t = if let Some(a) = self.annotated_return {
+            a
+        } else if self.has_return_value {
             self.returns
         } else {
             TypeInfo::certain(Ty::NoneTy)
-        }
+        };
+        // Column identities are local to one call (a returned frame's origin may be a
+        // parameter or an expression of this body): each call result is its own origin.
+        t.facts.columns = crate::facts::Columns::Unknown;
+        t
     }
 }
 
@@ -214,6 +220,10 @@ pub struct SemanticModel<'a> {
     pub(crate) uses: FxHashMap<TextSize, UseSite>,
     pub(crate) binding_uses: Vec<Vec<TextSize>>,
     pub(crate) loops: Vec<LoopInfo>,
+    /// The AST of each loop, by loop range (see [`crate::loop_character`]).
+    pub(crate) loop_nodes: FxHashMap<TextRange, crate::loop_character::LoopNode<'a>>,
+    /// Names whose item is assigned (`d[k] = v`, `d[k] += v`), by use offset.
+    pub(crate) item_stores: FxHashSet<TextSize>,
     pub(crate) branches: Vec<BranchInfo>,
     pub(crate) functions: Vec<FunctionSummary>,
     pub(crate) func_by_scope: FxHashMap<ScopeId, usize>,
@@ -224,6 +234,12 @@ pub struct SemanticModel<'a> {
     pub(crate) external: &'a dyn SummaryProvider,
     /// `from pyspark.sql.functions import *` seen.
     pub(crate) star_functions: bool,
+    /// `from delta.tables import *` (or `from delta import *`) seen: a bare
+    /// `DeltaTable` is `delta.tables.DeltaTable`.
+    pub(crate) star_delta: bool,
+    /// Names registered with `spark.udf.register("name", ..)` in the module
+    /// (lower-case, source order; see [`crate::udf_refs`]).
+    pub(crate) registered_udfs: Vec<String>,
 }
 
 impl<'a> SemanticModel<'a> {
@@ -235,6 +251,8 @@ impl<'a> SemanticModel<'a> {
             uses: FxHashMap::default(),
             binding_uses: Vec::new(),
             loops: Vec::new(),
+            loop_nodes: FxHashMap::default(),
+            item_stores: FxHashSet::default(),
             branches: Vec::new(),
             functions: Vec::new(),
             func_by_scope: FxHashMap::default(),
@@ -244,7 +262,15 @@ impl<'a> SemanticModel<'a> {
             prior: Prior::default(),
             external,
             star_functions: false,
+            star_delta: false,
+            registered_udfs: Vec::new(),
         }
+    }
+
+    /// Names registered with `spark.udf.register("name", ..)` anywhere in the module
+    /// (lower-case, source order): SQL text calling one calls a Python UDF.
+    pub fn registered_udfs(&self) -> &[String] {
+        &self.registered_udfs
     }
 
     pub fn options(&self) -> &SemanticOptions {
@@ -374,6 +400,40 @@ impl<'a> SemanticModel<'a> {
         v.sort_by_key(|l| (l.range.start(), std::cmp::Reverse(l.range.end())));
         v.dedup_by_key(|l| l.range);
         v
+    }
+
+    /// Loops (within the same function) that repeat the code at `offset`, outermost
+    /// first: [`Self::loops_at`] minus each loop the code leaves right after running
+    /// (a `break` drops that loop, a `return` every loop; retry and first-match
+    /// loops). For rules counting work per iteration.
+    pub fn repeating_loops_at(&self, offset: TextSize) -> Vec<&LoopInfo> {
+        use crate::loop_exit::LoopExit;
+        let mut v = self.loops_at(offset);
+        let mut i = v.len();
+        while i > 0 {
+            i -= 1;
+            match v[i]
+                .once
+                .iter()
+                .find(|(r, _)| r.contains(offset))
+                .map(|(_, e)| *e)
+            {
+                Some(LoopExit::Return) => return Vec::new(),
+                Some(LoopExit::Break) => {
+                    v.remove(i);
+                }
+                None => {}
+            }
+        }
+        v
+    }
+
+    /// Whether the node runs once per iteration of some enclosing loop (same
+    /// function): [`Self::repeating_loops_at`] is non-empty, so a retry or
+    /// first-match loop that leaves right after the node does not count. For loop
+    /// notes and loop severities.
+    pub fn in_repeating_loop<T: Ranged>(&self, node: &T) -> bool {
+        !self.repeating_loops_at(node.start()).is_empty()
     }
 
     /// Innermost enclosing loop of the node (same function).

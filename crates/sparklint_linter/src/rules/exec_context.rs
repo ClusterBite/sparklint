@@ -23,13 +23,19 @@
 //! "Directly" means the statement containing the site is an element of that body
 //! (`try: df.count()`), not nested deeper in an `if` / loop / `with` inside it.
 //!
+//! A second question, [`ExecIndex::caught_at`], asks whether an error raised at a
+//! site is handled at all: the site sits anywhere in a `try:` body (any depth, but
+//! not inside a function defined there) whose handlers catch one of the given
+//! exception names or are bare, and do not raise again. Compatibility rules (DBX001) use it: code that
+//! falls back when an API is unavailable is already portable.
+//!
 //! The index is built once per file on first use ([`Checker::run_at`]) and answers by
 //! source range, so it serves both the checker's rules (which also have a parent
 //! stack) and whole-file walkers that keep none. Rules choose which
 //! answers exempt them; they never walk parents for these shapes themselves.
 
 use ruff_python_ast::visitor::{self, Visitor};
-use ruff_python_ast::{Expr, ModModule, Stmt};
+use ruff_python_ast::{ExceptHandler, Expr, ModModule, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 use sparklint_semantic::SemanticModel;
 
@@ -89,6 +95,19 @@ pub struct ExecIndex {
     stmts: Vec<StmtEntry>,
     /// Disjoint failure-only regions (assert messages, raise statements), by start.
     failure: Vec<TextRange>,
+    /// `try:` statements with handlers.
+    guards: Vec<Guard>,
+    /// Function definitions (their bodies run later, outside an enclosing `try`).
+    defs: Vec<TextRange>,
+}
+
+/// A `try:` body and what its handlers catch.
+#[derive(Debug)]
+struct Guard {
+    body: TextRange,
+    /// Last name segment of each caught class (`except (a.B, C)` -> B, C); `None`
+    /// for a bare `except:`. Handlers whose body raises again are left out.
+    catches: Vec<Option<String>>,
 }
 
 impl ExecIndex {
@@ -115,6 +134,24 @@ impl ExecIndex {
             Some(s) => s.probe.map_or(Run::Normal, Run::Probe),
             None => Run::Normal,
         }
+    }
+
+    /// Is an error raised at `site` handled by an enclosing `try:` whose handler is
+    /// bare or catches one of `names` (matched on the last name segment, so
+    /// `except pyspark.errors.PySparkException` matches `PySparkException`)? Sites
+    /// in the handlers, `else` / `finally` arms or a function defined inside the
+    /// body are not guarded.
+    pub fn caught_at(&self, site: TextRange, names: &[&str]) -> bool {
+        self.guards.iter().any(|g| {
+            g.body.contains_range(site)
+                && g.catches
+                    .iter()
+                    .any(|c| c.as_deref().is_none_or(|n| names.contains(&n)))
+                && !self
+                    .defs
+                    .iter()
+                    .any(|d| g.body.contains_range(*d) && d.contains_range(site))
+        })
     }
 
     /// The innermost statement containing `site`: an ancestor-or-self of the last
@@ -177,6 +214,15 @@ impl Builder<'_> {
     }
 }
 
+/// `B` for `B`, `a.B`; empty for anything else.
+fn last_segment(e: &Expr) -> String {
+    match e {
+        Expr::Name(n) => n.id.to_string(),
+        Expr::Attribute(a) => a.attr.to_string(),
+        _ => String::new(),
+    }
+}
+
 impl<'a> Visitor<'a> for Builder<'_> {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
         let parent = self.stack.last().copied();
@@ -194,6 +240,33 @@ impl<'a> Visitor<'a> for Builder<'_> {
                     self.ix.failure.push(m.range());
                 }
             }
+            Stmt::Try(t) if !t.handlers.is_empty() => {
+                if let (Some(first), Some(last)) = (t.body.first(), t.body.last()) {
+                    let catches = t
+                        .handlers
+                        .iter()
+                        .flat_map(|h| {
+                            let ExceptHandler::ExceptHandler(h) = h;
+                            // a handler that raises again does not handle the error
+                            if h.body.iter().any(|s| matches!(s, Stmt::Raise(_))) {
+                                return vec![];
+                            }
+                            match h.type_.as_deref() {
+                                None => vec![None],
+                                Some(Expr::Tuple(tu)) => {
+                                    tu.elts.iter().map(|e| Some(last_segment(e))).collect()
+                                }
+                                Some(e) => vec![Some(last_segment(e))],
+                            }
+                        })
+                        .collect();
+                    self.ix.guards.push(Guard {
+                        body: TextRange::new(first.start(), last.end()),
+                        catches,
+                    });
+                }
+            }
+            Stmt::FunctionDef(f) => self.ix.defs.push(f.range),
             _ => {}
         }
         let saved = self.pending.take();
@@ -352,6 +425,78 @@ mod tests {
         ];
         for (src, needle, want) in cases {
             assert_eq!(run_of(src, needle), *want, "{needle} in:\n{src}");
+        }
+    }
+
+    #[test]
+    fn caught_table() {
+        const NAMES: &[&str] = &["Exception", "NotImplementedError"];
+        let cases: &[(&str, &str, bool)] = &[
+            ("x = sc\n", "sc", false),
+            (
+                "try:\n    x = sc\nexcept Exception:\n    x = None\n",
+                "sc",
+                true,
+            ),
+            // any depth in the body
+            (
+                "try:\n    if c:\n        x = sc\nexcept Exception:\n    pass\n",
+                "sc",
+                true,
+            ),
+            ("try:\n    x = sc\nexcept:\n    pass\n", "sc", true),
+            (
+                "try:\n    x = sc\nexcept (KeyError, errors.NotImplementedError) as e:\n    pass\n",
+                "sc",
+                true,
+            ),
+            // a handler that raises again does not handle it
+            (
+                "try:\n    x = sc\nexcept Exception as e:\n    log(e)\n    raise e\n",
+                "sc",
+                false,
+            ),
+            (
+                "try:\n    x = sc\nexcept KeyError:\n    pass\nexcept Exception:\n    raise\n",
+                "sc",
+                false,
+            ),
+            // a narrow handler does not catch it
+            (
+                "try:\n    x = sc\nexcept KeyError:\n    pass\n",
+                "sc",
+                false,
+            ),
+            // handler / else / finally arms are not guarded
+            (
+                "try:\n    y = 1\nexcept Exception:\n    x = sc\n",
+                "sc",
+                false,
+            ),
+            (
+                "try:\n    y = 1\nexcept Exception:\n    pass\nelse:\n    x = sc\n",
+                "sc",
+                false,
+            ),
+            ("try:\n    x = sc\nfinally:\n    pass\n", "sc", false),
+            // a function defined in the body runs later
+            (
+                "try:\n    def f():\n        return sc\nexcept Exception:\n    pass\n",
+                "sc",
+                false,
+            ),
+            // a try inside the function guards it
+            (
+                "def f():\n    try:\n        return sc\n    except Exception:\n        return None\n",
+                "sc",
+                true,
+            ),
+        ];
+        for (src, needle, want) in cases {
+            let at = src.find(needle).unwrap();
+            let site = TextRange::at(TextSize::new(at as u32), TextSize::of(*needle));
+            let got = with_checker(src, &["ALL"], |ch| ch.caught_at(site, NAMES));
+            assert_eq!(got, *want, "{needle} in:\n{src}");
         }
     }
 

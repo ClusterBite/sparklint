@@ -1,0 +1,8 @@
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+
+df = spark.table("events")
+n = df.count()  # expect: ACT009
+last = df.tail(1)[0]  # expect: ACT009
+head = df.orderBy("ts").take(5)  # expect: ACT009

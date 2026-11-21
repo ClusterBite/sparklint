@@ -12,7 +12,7 @@ use serde::Deserialize;
 use sparklint_semantic::Ty;
 
 use crate::diagnostic::Severity;
-use crate::registry::{self, RuleMeta};
+use crate::registry;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -25,7 +25,7 @@ pub enum ConfigError {
     #[error("invalid TOML in {path}: {message}")]
     Toml { path: PathBuf, message: String },
     #[error(
-        "unknown rule selector `{0}` (expected a code like ACT002, a prefix like ACT, `tag:<name>`, ALL, or a preset: default, review, strict, cylint-compat, serverless)"
+        "unknown rule selector `{0}` (expected a code like ACT002, a prefix like ACT, a rule name, a cylint code like CY001, `tag:<name>` with a known tag, ALL, or a preset: default, review, strict, cylint-compat, serverless)"
     )]
     UnknownSelector(String),
     #[error("invalid glob `{glob}`: {message}")]
@@ -68,6 +68,9 @@ pub struct ConfigFile {
     pub distinct_aggregates_min: Option<u32>,
     /// IOD020: report `ZORDER BY` with more than this many columns (0 disables).
     pub zorder_max_columns: Option<u32>,
+    /// ACT005 / IOD006: loops over a literal / constant iterable of at most this many
+    /// items are info, not warning.
+    pub driver_loop_small_max: Option<u32>,
     /// CFG007: report autoBroadcastJoinThreshold at or above this size (`"1g"`,
     /// `"512m"`, bytes; `"0"` disables).
     pub broadcast_threshold_max: Option<String>,
@@ -152,74 +155,13 @@ pub fn find_config(dir: &Path) -> Result<Option<(PathBuf, ConfigFile)>, ConfigEr
     Ok(None)
 }
 
-/// A rule selector.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Selector {
-    All,
-    Preset(Preset),
-    Tag(String),
-    /// A code prefix (`ACT`, `ACT0`) or full code (`ACT002`).
-    Prefix(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Preset {
-    Default,
-    Review,
-    Strict,
-    CylintCompat,
-    Serverless,
-}
+pub use crate::rule_ref::{Preset, Selector};
 
 impl Selector {
+    /// Read a configured selector ([`crate::rule_ref`]); an unrecognised one is an
+    /// error.
     pub fn parse(s: &str) -> Result<Self, ConfigError> {
-        let t = s.trim();
-        if t.eq_ignore_ascii_case("all") {
-            return Ok(Selector::All);
-        }
-        if let Some(tag) = t.strip_prefix("tag:") {
-            return Ok(Selector::Tag(tag.trim().to_ascii_lowercase()));
-        }
-        let preset = match t.to_ascii_lowercase().as_str() {
-            "default" => Some(Preset::Default),
-            "review" => Some(Preset::Review),
-            "strict" => Some(Preset::Strict),
-            "cylint-compat" | "cylint" => Some(Preset::CylintCompat),
-            "serverless" | "uc-migration" => Some(Preset::Serverless),
-            _ => None,
-        };
-        if let Some(p) = preset {
-            return Ok(Selector::Preset(p));
-        }
-        // kebab rule name
-        if let Some(r) = registry::get(t) {
-            return Ok(Selector::Prefix(r.code.clone()));
-        }
-        let upper = t.to_ascii_uppercase();
-        if registry::rules().iter().any(|r| r.code.starts_with(&upper)) && !upper.is_empty() {
-            return Ok(Selector::Prefix(upper));
-        }
-        Err(ConfigError::UnknownSelector(s.to_string()))
-    }
-
-    /// Specificity if the selector matches the rule (higher = more specific).
-    pub fn matches(&self, r: &RuleMeta) -> Option<u32> {
-        match self {
-            Selector::All => Some(0),
-            Selector::Preset(p) => preset_contains(*p, r).then_some(1),
-            Selector::Tag(t) => r.tags.iter().any(|x| x == t).then_some(2),
-            Selector::Prefix(p) => r.code.starts_with(p.as_str()).then_some(2 + p.len() as u32),
-        }
-    }
-}
-
-fn preset_contains(p: Preset, r: &RuleMeta) -> bool {
-    match p {
-        Preset::Default => r.default_on,
-        Preset::Review => !r.is_style(),
-        Preset::Strict => true,
-        Preset::CylintCompat => r.cylint_compat_on,
-        Preset::Serverless => r.default_on || r.prefix() == "DBX",
+        Selector::read(s).ok_or_else(|| ConfigError::UnknownSelector(s.to_string()))
     }
 }
 
@@ -271,6 +213,9 @@ pub struct LinterSettings {
     pub zorder_max_columns: u32,
     /// CFG007 threshold in bytes (0 = off).
     pub broadcast_threshold_max: u64,
+    /// ACT005 / IOD006: literal / constant loop iterables up to this size are info
+    /// (the shared loop verdict, `LoopCharacter::iterable().small(..)`).
+    pub driver_loop_small_max: u32,
     pub functions_aliases: Vec<String>,
     pub types_aliases: Vec<String>,
 }
@@ -292,6 +237,7 @@ impl Default for LinterSettings {
             distinct_aggregates_min: 3,
             zorder_max_columns: 3,
             broadcast_threshold_max: 1 << 30,
+            driver_loop_small_max: 10,
             functions_aliases: vec!["F".into(), "sf".into()],
             types_aliases: vec!["T".into()],
         }
@@ -455,6 +401,9 @@ impl Configuration {
         }
         if let Some(n) = file.zorder_max_columns {
             base.zorder_max_columns = n;
+        }
+        if let Some(n) = file.driver_loop_small_max {
+            base.driver_loop_small_max = n;
         }
         if let Some(v) = &file.broadcast_threshold_max {
             match crate::rules::conf::parse_bytes(v) {
@@ -627,6 +576,13 @@ mod tests {
     }
 
     #[test]
+    fn driver_loop_small_max_config() {
+        assert_eq!(LinterSettings::default().driver_loop_small_max, 10);
+        let c = cfg("driver-loop-small-max = 3\n", CliOverrides::default());
+        assert_eq!(c.base().driver_loop_small_max, 3);
+    }
+
+    #[test]
     fn default_preset() {
         let c = cfg("", CliOverrides::default());
         let s = c.base();
@@ -729,5 +685,29 @@ mod tests {
     fn unknown_selector_is_an_error() {
         assert!(Selector::parse("XYZ123").is_err());
         assert!(Selector::parse("collect-unbounded").is_ok());
+        assert!(Selector::parse("tag:no-such-tag").is_err());
+    }
+
+    #[test]
+    fn cylint_codes_in_config() {
+        // The same grammar as suppression comments: CY codes map to their rule in
+        // select / ignore / per-file-ignores / severity keys.
+        let c = cfg(
+            "ignore = [\"CY001\"]\n[per-file-ignores]\n\"tests/**\" = [\"cy015\"]\n[severity]\nCY013 = \"error\"\n",
+            CliOverrides::default(),
+        );
+        assert!(!c.base().is_enabled("ACT002"));
+        assert!(c.base().is_enabled("ACT004"));
+        let t = c.settings_for(Path::new("/proj/tests/a.py"));
+        assert!(!t.is_enabled("PRF004"));
+        assert_eq!(
+            c.base().severity_for("IOD003", Severity::Warning),
+            Severity::Error
+        );
+        let f =
+            ConfigFile::from_toml_str(Path::new("sparklint.toml"), "ignore = [\"CY999\"]\n", false)
+                .unwrap()
+                .unwrap();
+        assert!(Configuration::new(Path::new("/p"), None, &f, &CliOverrides::default()).is_err());
     }
 }

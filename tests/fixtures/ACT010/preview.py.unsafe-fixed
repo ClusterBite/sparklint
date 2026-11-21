@@ -1,0 +1,23 @@
+import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+
+spark = SparkSession.builder.getOrCreate()
+big = spark.table("events")
+local = spark.createDataFrame(pd.DataFrame({"id": [1, 2]}))
+tables = spark.sql("SHOW TABLES IN sales")
+n = 20
+
+# A preview of a frame that fits the driver is a deliberate small look: show() and
+# display() give the same answer.
+big.limit(10).show()
+big.limit(n).show()
+big.limit(10).display()
+local.show()
+tables.show(truncate=False)
+display(big.limit(10))
+display(local)
+display(tables)
+
+# Frames that may not fit the driver: a full job left in the code.
+# One row out, but the aggregate reads every row of `big`.

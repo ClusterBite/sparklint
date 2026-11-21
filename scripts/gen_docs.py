@@ -63,27 +63,8 @@ SECTIONS = [
     ("Ex", "Example"),
 ]
 
-SYN001 = {
-    "code": "SYN001",
-    "name": "syntax-error",
-    "family": "Syntax",
-    "severity": "error",
-    "default_on": True,
-    "cylint_compat_on": True,
-    "type_info": "T0",
-    "fix": "none",
-    "tags": ["correctness"],
-    "message": "The file could not be parsed; no rules were run on it.",
-    "docs": (
-        "syntax · error · on · T0 · none\n"
-        "- **Why:** Rules need a syntax tree. A file the Python parser cannot read gets no other findings, "
-        "so one syntax error can hide everything else in it.\n"
-        "- **Detect:** The parser reports a syntax error. In notebooks (Databricks source notebooks and "
-        "`.ipynb`) only the broken cell is skipped: the other cells are still linted, and `--fix` still "
-        "fixes them. Notebook magics (`%pip`, `!cmd`, `x = !cmd`) are not syntax errors; in a plain `.py` "
-        "file that uses them, set `notebook = \"on\"`."
-    ),
-}
+# SYN001 is not a catalog rule: its metadata lives next to the generated spec.
+SYN001 = json.loads((ROOT / "spec" / "syntax_error.json").read_text(encoding="utf-8"))
 
 
 def esc_cell(s: str) -> str:
@@ -169,6 +150,25 @@ def presets_of(r) -> str:
     return ", ".join(on)
 
 
+def message_section(r, items):
+    """The rule's message variants (declared in the rule table, `{placeholders}` filled
+    in from the code) with their help lines, then the catalog's `Wording` notes."""
+    variants = r.get("messages") or []
+    out = ["", "## Message" if len(variants) <= 1 else "## Messages", ""]
+    if not variants:
+        out += ["```text", r["message"] or "(see below)", "```", ""]
+    for v in variants:
+        if len(variants) > 1:
+            out += [f"`{v['id']}`", ""]
+        out += ["```text", v["message"], "```", ""]
+        if v.get("help"):
+            out += ["Help: " + v["help"], ""]
+    for label, text in items:
+        if label == "Wording":
+            out += [nest(text), ""]
+    return out
+
+
 def rule_page(r, cy_for) -> str:
     header, items = parse_entry(r["docs"])
     sev = header[1] if len(header) > 1 else r["severity"]
@@ -191,12 +191,12 @@ def rule_page(r, cy_for) -> str:
         out.append("- **Tags:** " + ", ".join(f"`{t}`" for t in r["tags"]))
     if cy_for.get(r["code"]):
         out.append("- **cylint:** " + ", ".join(f"`{c}`" for c in cy_for[r["code"]]) + " ([mapping](../cylint.md))")
-    out += ["", "## Message", "", "```text", r["message"] or "(see below)", "```", ""]
+    out += message_section(r, items)
 
     order = {key: i for i, (key, _) in enumerate(SECTIONS)}
     groups = {}
     for label, text in items:
-        if label == "Msg":
+        if label in ("Msg", "Wording"):
             continue
         key, title_ = section_of(label)
         if key is None:
@@ -213,6 +213,9 @@ def rule_page(r, cy_for) -> str:
             else:
                 out.append(body)
             out.append("")
+    if r["code"] == "SYN001":
+        # Comments cannot suppress it: they sit in a file that did not parse.
+        return "\n".join(out)
     out += [
         "## Suppressing it",
         "",

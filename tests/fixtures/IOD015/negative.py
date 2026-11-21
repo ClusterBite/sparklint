@@ -39,3 +39,7 @@ def untyped(reader):
 
 # RDD textFile is not a DataFrameReader read.
 r = spark.sparkContext.textFile("/logs/app.log.gz")
+
+# Uncompressed path option, and a streaming text read that takes each file whole.
+plain_option = spark.read.format("csv").option("path", "/raw/opt.csv").load()
+whole_stream = spark.readStream.text(path="/stream/logs/*.gz", wholetext=True)

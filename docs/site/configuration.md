@@ -33,6 +33,11 @@ A selector can be:
 - a tag: `tag:cost`
 - a preset: `default`, `review`, `strict`, `cylint-compat`, `serverless`
 - `ALL`
+- a cylint code: `CY001` (the rule it [maps to](cylint.md#mapping))
+
+The same selectors work in `per-file-ignores`, `[severity]` keys and
+[suppression comments](suppressions.md). A selector that matches no rule (a typo, an
+unknown tag) is an error.
 
 ```bash
 sparklint check --select ACT,PRF          # replaces the configured selection
@@ -82,13 +87,19 @@ ACT = "error"          # any selector -> error | warning | info
 ### Per-file ignores
 
 Test code usually calls actions on purpose: an assert like `df.count() > 0` or a
-`collect()` on a small fixture is fine there.
+`collect()` on a small fixture is fine there. This turns off the rules about pulling data
+to the driver and leftover debug output in tests, and keeps the compatibility and correctness
+rules (DBX001, COR010, ...), which still matter if the suite runs on serverless or Connect:
 
 ```toml
 [tool.sparklint.per-file-ignores]
-"tests/**" = ["ACT"]
+"tests/**" = ["ACT002", "ACT004", "ACT005", "ACT006", "ACT007", "ACT009", "ACT010", "PRF008", "PRF009"]
+"**/test_*.py" = ["ACT002", "ACT004", "ACT005", "ACT006", "ACT007", "ACT009", "ACT010", "PRF008", "PRF009"]
 "notebooks/scratch/*.py" = ["ALL"]
 ```
+
+sparklint has no built-in test-file exemption: test findings are reported until you add
+an entry like this.
 
 ## All options
 
@@ -109,6 +120,7 @@ rollup-min-columns = 8
 pipeline-fanout-min-flows = 3
 distinct-aggregates-min = 3
 zorder-max-columns = 3
+driver-loop-small-max = 10
 broadcast-threshold-max = "1g"
 functions-aliases = ["F", "sf"]
 types-aliases = ["T"]
@@ -139,6 +151,9 @@ types-aliases = ["T"]
   at least this many distinct aggregates over different columns. `0` turns it off.
 - **`zorder-max-columns`**: [IOD020](rules/IOD020.md) reports `ZORDER BY` with more
   columns than this. `0` turns it off.
+- **`driver-loop-small-max`**: [ACT005](rules/ACT005.md) and [IOD006](rules/IOD006.md)
+  report a loop over a literal or constant list of at most this many items as info (a few
+  iterations, not N); only the loop the action or write sits in counts.
 - **`broadcast-threshold-max`**: [CFG007](rules/CFG007.md) reports
   `autoBroadcastJoinThreshold` at or above this size (`"1g"`, `"512m"`, bytes). `"0"`
   turns it off.

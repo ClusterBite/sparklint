@@ -4,7 +4,10 @@
 //!
 //! Each fixture is linted with only `<CODE>` selected. Every line carrying a trailing
 //! `# expect: CODE[, CODE…]` comment must produce that diagnostic (on its first line),
-//! and no other line may produce it. If `<name>.py.fixed` (`<name>.ipynb.fixed`) exists, applying the safe
+//! and no other line may produce it. Each code may carry checks that every diagnostic of
+//! that code on the line must pass (see [`parse_expect`]):
+//! `# expect: ACT004[info] ~"rows from df.collect()" !~"Inside a loop" help~"limit("`
+//! = severity, message contains / does not contain, help contains (`"` or `'` quotes). If `<name>.py.fixed` (`<name>.ipynb.fixed`) exists, applying the safe
 //! fixes to `<name>.py` must give exactly that text (for `.ipynb`: the notebook JSON);
 //! likewise `<name>.py.unsafe-fixed` for safe + unsafe fixes (`--unsafe-fixes`).
 //!
@@ -20,12 +23,14 @@
 //! enables the rule beating it (under `ALL`, always), and every precedence pair must
 //! be exercised by some fixture.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use sparklint_linter::config::{CliOverrides, ConfigFile, Configuration};
+use sparklint_linter::diagnostic::Severity;
 use sparklint_linter::overlap::PRECEDENCE;
 use sparklint_linter::project::ProjectFile;
+use sparklint_linter::rules::msg::Msg;
 use sparklint_linter::{Diagnostic, LinterSettings, lint_and_fix};
 use sparklint_semantic::{NoSummaries, module_name_for_path};
 use sparklint_source::SourceFile;
@@ -34,18 +39,207 @@ fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
 }
 
-fn expected_lines(source: &SourceFile, code: &str) -> BTreeSet<u32> {
-    let mut out = BTreeSet::new();
+/// What one `# expect:` entry asks of the diagnostics of its code on its line.
+#[derive(Debug, Default, Clone)]
+struct Expect {
+    code: String,
+    severity: Option<Severity>,
+    /// Fragments the message must contain.
+    contains: Vec<String>,
+    /// Fragments the message must not contain.
+    lacks: Vec<String>,
+    /// Fragments the help text must contain.
+    help: Vec<String>,
+}
+
+impl Expect {
+    /// Why `d` fails this expectation, if it does.
+    fn mismatch(&self, d: &Diagnostic) -> Option<String> {
+        if let Some(want) = self.severity.filter(|w| *w != d.severity) {
+            return Some(format!(
+                "severity {}, expected {}: {}",
+                d.severity.as_str(),
+                want.as_str(),
+                d.message
+            ));
+        }
+        if let Some(f) = self
+            .contains
+            .iter()
+            .find(|f| !d.message.contains(f.as_str()))
+        {
+            return Some(format!("message lacks {f:?}: {}", d.message));
+        }
+        if let Some(f) = self.lacks.iter().find(|f| d.message.contains(f.as_str())) {
+            return Some(format!("message contains {f:?}: {}", d.message));
+        }
+        let help = d.help.as_deref().unwrap_or_default();
+        if let Some(f) = self
+            .help
+            .iter()
+            .find(|f| d.help.is_none() || !help.contains(f.as_str()))
+        {
+            return Some(format!("help lacks {f:?}: {help}"));
+        }
+        None
+    }
+}
+
+/// Why `d` was not reported through one of its rule's declared message variants
+/// (`sparklint_linter::rules::msg::Msg`): the variant id must be declared and the
+/// message and help must be its templates filled in. Those declarations are what
+/// spec/rules.json, `sparklint rule CODE` and the docs show.
+fn variant_mismatch(d: &Diagnostic) -> Option<String> {
+    let Some(id) = d.variant else {
+        return Some(format!(
+            "reported without a declared message variant (use msg!): {}",
+            d.message
+        ));
+    };
+    let Some(m) = sparklint_linter::rules::messages_of(d.code).find(|m| m.id == id) else {
+        return Some(format!(
+            "variant `{id}` is not declared on the rule's table entry"
+        ));
+    };
+    // config-value rows add one shared note when the key is set back later
+    let set_back = d
+        .message
+        .strip_suffix(sparklint_linter::rules::conf::SET_BACK_NOTE)
+        .is_some_and(|base| m.matches(base));
+    if !m.matches(&d.message) && !set_back {
+        return Some(format!(
+            "message is not variant `{id}` ({:?}): {}",
+            m.text, d.message
+        ));
+    }
+    match (m.help, &d.help) {
+        (None, None) => None,
+        (Some(t), Some(h)) if Msg::new(m.code, m.id, t).matches(h) => None,
+        (t, h) => Some(format!(
+            "help {h:?} is not variant `{id}`'s help template {t:?}"
+        )),
+    }
+}
+
+/// Parses the text after `# expect:`: comma-separated entries
+/// `CODE [ '[' severity ']' ] { ~"msg" | !~"msg" | help~"text" }` (fragments in `"` or
+/// `'` quotes, no escapes; commas inside quotes are part of the fragment).
+fn parse_expect(text: &str) -> Result<Vec<Expect>, String> {
+    let mut out = Vec::new();
+    let mut rest = text.trim_start();
+    loop {
+        let end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(rest.len());
+        let code = &rest[..end];
+        if code.is_empty() {
+            return Err(format!("expected a rule code at {rest:?}"));
+        }
+        let mut e = Expect {
+            code: code.to_string(),
+            ..Expect::default()
+        };
+        rest = &rest[end..];
+        if let Some(r) = rest.strip_prefix('[') {
+            let close = r.find(']').ok_or("unclosed `[`")?;
+            let name = &r[..close];
+            e.severity = Some(Severity::parse(name).ok_or(format!("unknown severity {name:?}"))?);
+            rest = &r[close + 1..];
+        }
+        loop {
+            rest = rest.trim_start();
+            let (list, r) = if let Some(r) = rest.strip_prefix("!~") {
+                (&mut e.lacks, r)
+            } else if let Some(r) = rest.strip_prefix("help~") {
+                (&mut e.help, r)
+            } else if let Some(r) = rest.strip_prefix('~') {
+                (&mut e.contains, r)
+            } else {
+                break;
+            };
+            let quote = r
+                .chars()
+                .next()
+                .filter(|q| *q == '"' || *q == '\'')
+                .ok_or(format!("expected a quoted fragment at {r:?}"))?;
+            let close = r[1..]
+                .find(quote)
+                .ok_or(format!("unclosed {quote} fragment"))?;
+            list.push(r[1..1 + close].to_string());
+            rest = &r[close + 2..];
+        }
+        out.push(e);
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return Ok(out);
+        }
+        rest = rest
+            .strip_prefix(',')
+            .ok_or(format!("expected `,` or the end of the line at {rest:?}"))?
+            .trim_start();
+    }
+}
+
+/// `# expect:` entries by line (1-based).
+type Expectations = BTreeMap<u32, Vec<Expect>>;
+
+/// The `# expect:` entries of every line, and a parse error per bad line.
+fn expectations(source: &SourceFile) -> (Expectations, Vec<(u32, String)>) {
+    let mut out = BTreeMap::new();
+    let mut errors = Vec::new();
     for line in 1..=source.line_index.line_count() {
         let text = source.line_text(line);
         if let Some(idx) = text.find("# expect:") {
-            let codes = &text[idx + "# expect:".len()..];
-            if codes.split(',').any(|c| c.trim() == code) {
-                out.insert(line);
+            match parse_expect(&text[idx + "# expect:".len()..]) {
+                Ok(entries) => {
+                    out.insert(line, entries);
+                }
+                Err(e) => errors.push((line, e)),
             }
         }
     }
-    out
+    (out, errors)
+}
+
+/// The lines expecting `code`, with that code's entries.
+fn expected_for<'a>(all: &'a Expectations, code: &str) -> BTreeMap<u32, Vec<&'a Expect>> {
+    all.iter()
+        .filter_map(|(l, es)| {
+            let mine: Vec<&Expect> = es.iter().filter(|e| e.code == code).collect();
+            (!mine.is_empty()).then_some((*l, mine))
+        })
+        .collect()
+}
+
+#[test]
+fn expect_syntax() {
+    let es = parse_expect(
+        " ACT004[info] ~\"rows from df.collect()\" !~'Inside, a loop' help~\"x\", ACT002",
+    )
+    .unwrap();
+    assert_eq!(es.len(), 2);
+    assert_eq!(es[0].code, "ACT004");
+    assert_eq!(es[0].severity, Some(Severity::Info));
+    assert_eq!(es[0].contains, ["rows from df.collect()"]);
+    assert_eq!(es[0].lacks, ["Inside, a loop"]);
+    assert_eq!(es[0].help, ["x"]);
+    assert_eq!(es[1].code, "ACT002");
+    assert!(es[1].severity.is_none() && es[1].contains.is_empty());
+    let plain = parse_expect(" ACT002, PRF001").unwrap();
+    assert_eq!(
+        plain.iter().map(|e| e.code.as_str()).collect::<Vec<_>>(),
+        ["ACT002", "PRF001"]
+    );
+    for bad in [
+        " ACT002 note",
+        " ACT002[loud]",
+        " ACT002 ~\"open",
+        " ACT002,",
+        " ACT002 ~x",
+        "",
+    ] {
+        assert!(parse_expect(bad).is_err(), "{bad:?}");
+    }
 }
 
 fn is_source(p: &Path) -> bool {
@@ -151,6 +345,13 @@ fn lint_unit(
         .collect()
 }
 
+/// Declared message variants no input reaches yet (keep this list short: a variant
+/// here is wording no fixture checks).
+const UNREACHED_VARIANTS: &[(&str, &str)] = &[
+    // the oracle never marks a pandas-on-Spark frame filtered/aggregated (`reduced`)
+    ("ACT003", "reduced-pandas-on-spark"),
+];
+
 #[test]
 fn rule_fixtures() {
     let root = fixtures_root();
@@ -158,6 +359,7 @@ fn rule_fixtures() {
     assert!(!dirs.is_empty());
     let mut failures = Vec::new();
     let mut checked = 0;
+    let mut exercised: BTreeSet<(&str, &str)> = BTreeSet::new();
     for dir in &dirs {
         let code = dir.file_name().unwrap().to_string_lossy().into_owned();
         let mut positives = 0;
@@ -171,12 +373,31 @@ fn rule_fixtures() {
                     .filter(|d| d.code == code)
                     .map(|d| source.line_index.line_of(d.range.start()))
                     .collect();
-                let expected = expected_lines(&source, &code);
+                let name = file.strip_prefix(&root).unwrap().display().to_string();
+                let (all_expect, errors) = expectations(&source);
+                for (l, e) in errors {
+                    failures.push(format!("{name}:{l}: bad `# expect:` comment: {e}"));
+                }
+                let entries = expected_for(&all_expect, &code);
+                let expected: BTreeSet<u32> = entries.keys().copied().collect();
                 positives += expected.len();
                 if expected.is_empty() {
                     pure_negatives += 1;
                 }
-                let name = file.strip_prefix(&root).unwrap().display().to_string();
+                for d in diags.iter().filter(|d| d.code == code) {
+                    let l = source.line_index.line_of(d.range.start());
+                    if let Some(why) = variant_mismatch(d) {
+                        failures.push(format!("{name}:{l}: {code}: {why}"));
+                    }
+                    if let Some(id) = d.variant {
+                        exercised.insert((d.code, id));
+                    }
+                    for e in entries.get(&l).into_iter().flatten() {
+                        if let Some(why) = e.mismatch(d) {
+                            failures.push(format!("{name}:{l}: {code}: {why}"));
+                        }
+                    }
+                }
                 for l in expected.difference(&actual) {
                     failures.push(format!("{name}:{l}: expected {code}, not reported"));
                 }
@@ -222,6 +443,15 @@ fn rule_fixtures() {
         if pure_negatives == 0 {
             failures.push(format!(
                 "{code}: no negative fixture (a file without expectations)"
+            ));
+        }
+    }
+    // Every declared message variant is reported by some fixture.
+    for m in sparklint_linter::rules::messages() {
+        if !exercised.contains(&(m.code, m.id)) && !UNREACHED_VARIANTS.contains(&(m.code, m.id)) {
+            failures.push(format!(
+                "{}: message variant `{}` is reported by no fixture",
+                m.code, m.id
             ));
         }
     }
@@ -373,5 +603,59 @@ fn preset_fixtures() {
             ));
         }
     }
+    assert!(failures.is_empty(), "failures:\n{}", failures.join("\n"));
+}
+
+/// Property over every fixture file, linted with `ALL`: each fix on its own leaves a
+/// file that parses (no new syntax error), and fixing to a fixed point converges (no
+/// fix is proposed again after the fix loop: a fix that re-creates its own finding
+/// would keep the loop going until its round limit).
+#[test]
+fn every_fix_parses_and_converges() {
+    let mut files = Vec::new();
+    files_under(&fixtures_root(), &mut files);
+    let settings = LinterSettings::for_selectors(&["ALL"]).unwrap();
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    for file in &files {
+        let name = file.display().to_string();
+        let source = SourceFile::load(file).unwrap();
+        let before = sparklint_linter::parse_source(&source).syntax_errors.len();
+        let diags = sparklint_linter::lint_source(&source, &settings, &NoSummaries, None);
+        // One fix at a time (plain text files; notebook JSON is covered by the loop below).
+        if file.extension().is_some_and(|e| e == "py") {
+            for d in diags.iter().filter(|d| d.fix.is_some()) {
+                let (text, applied) = sparklint_linter::fix::apply_fixes(
+                    source.raw_text(),
+                    std::slice::from_ref(d),
+                    true,
+                );
+                if applied == 0 {
+                    continue;
+                }
+                checked += 1;
+                let fixed = SourceFile::from_text(file, text.clone());
+                let after = sparklint_linter::parse_source(&fixed).syntax_errors.len();
+                if after > before {
+                    let line = source.line_index.line_of(d.range.start());
+                    failures.push(format!(
+                        "{name}:{line}: {} fix `{}` does not parse:\n{text}",
+                        d.code,
+                        d.fix.as_ref().unwrap().message
+                    ));
+                }
+            }
+        }
+        let out = lint_and_fix(&source, &settings, &NoSummaries, None, true);
+        for d in out.diagnostics.iter().filter(|d| d.fix.is_some()) {
+            let line = d.range.start();
+            failures.push(format!(
+                "{name}: {} at offset {line:?} still has a fix after fixing ({})",
+                d.code,
+                d.fix.as_ref().unwrap().message
+            ));
+        }
+    }
+    assert!(checked > 100, "only {checked} fixes checked");
     assert!(failures.is_empty(), "failures:\n{}", failures.join("\n"));
 }

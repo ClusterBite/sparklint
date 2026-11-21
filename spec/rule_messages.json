@@ -1,0 +1,1134 @@
+{
+  "ACT001": [
+    {
+      "help": null,
+      "id": "action",
+      "message": "Spark action: {call} triggers a job (kind: {kind})."
+    }
+  ],
+  "ACT002": [
+    {
+      "help": "Keep the work in Spark (aggregate/write), or bound the result with .limit(n) before collecting.",
+      "id": "unbounded",
+      "message": ".collect() on a DataFrame with no known row bound pulls everything to the driver."
+    },
+    {
+      "help": "Keep the work in Spark (aggregate/write), or bound the result with .limit(n) before collecting.",
+      "id": "reduced",
+      "message": ".collect() on a DataFrame with no known row bound pulls everything to the driver (filtered/aggregated — size unknown)."
+    }
+  ],
+  "ACT003": [
+    {
+      "help": "Select only the needed columns and bound the rows (.limit(n)) before converting, or write the result and read it elsewhere.",
+      "id": "unbounded",
+      "message": ".{method}() on an unbounded DataFrame materialises it in driver memory (x2-3 for pandas)."
+    },
+    {
+      "help": "Select only the needed columns and bound the rows (.limit(n)) before converting, or write the result and read it elsewhere.",
+      "id": "unbounded-arrow",
+      "message": ".toArrow() on an unbounded DataFrame materialises it in driver memory as one Arrow table."
+    },
+    {
+      "help": "Select only the needed columns and bound the rows (.limit(n)) before converting, or write the result and read it elsewhere.",
+      "id": "unbounded-pandas-on-spark",
+      "message": ".{method}() on unbounded pandas-on-Spark data materialises it in driver memory (x2-3 for pandas)."
+    },
+    {
+      "help": "Select only the needed columns and bound the rows (.limit(n)) before converting, or write the result and read it elsewhere.",
+      "id": "reduced",
+      "message": ".{method}() on a DataFrame with no known row bound materialises it in driver memory (filtered/aggregated — size unknown)."
+    },
+    {
+      "help": "Select only the needed columns and bound the rows (.limit(n)) before converting, or write the result and read it elsewhere.",
+      "id": "reduced-pandas-on-spark",
+      "message": ".{method}() on pandas-on-Spark data with no known row bound materialises it in driver memory (filtered/aggregated — size unknown)."
+    }
+  ],
+  "ACT004": [
+    {
+      "help": "Use select/withColumn/groupBy (or mapInPandas/applyInPandas for arbitrary Python) so the work runs on the executors.",
+      "id": "rows",
+      "message": "Iterating rows on the driver ({source}) — express this as a DataFrame transformation."
+    },
+    {
+      "help": "Use select/withColumn/groupBy (or mapInPandas/applyInPandas for arbitrary Python) so the work runs on the executors.",
+      "id": "rows-n-plus-one",
+      "message": "Iterating rows on the driver ({source}) — express this as a DataFrame transformation. The loop body also runs a Spark action per row (N+1 jobs)."
+    }
+  ],
+  "ACT005": [
+    {
+      "help": "Compute all iterations in one job: groupBy the loop key (df.groupBy(\"k\").count()), or union the per-iteration frames and write once.",
+      "id": "action",
+      "message": "Spark action {call} inside a loop runs one job per iteration (N jobs, N scans)."
+    },
+    {
+      "help": "Compute all iterations in one job: groupBy the loop key (df.groupBy(\"k\").count()), or union the per-iteration frames and write once.",
+      "id": "write",
+      "message": "write {call} inside a loop runs one job per iteration (N jobs, N scans)."
+    }
+  ],
+  "ACT006": [
+    {
+      "help": "isEmpty() (Spark 3.3+) runs a job that stops at the first row; on older versions use len(df.take(1)) == 0. Keep count() only when the number itself is needed.",
+      "id": "count-check",
+      "message": "{count} used as an emptiness check scans every row — use {receiver}.isEmpty()."
+    },
+    {
+      "help": "isEmpty() (Spark 3.3+) runs a job that stops at the first row; on older versions use len(df.take(1)) == 0. Keep count() only when the number itself is needed.",
+      "id": "held-count",
+      "message": "{call} is only used as an emptiness check — use {receiver}.isEmpty() (stops at the first row)."
+    },
+    {
+      "help": "isEmpty() (Spark 3.3+) runs a job that stops at the first row; on older versions use len(df.take(1)) == 0. Keep count() only when the number itself is needed.",
+      "id": "rdd-is-empty",
+      "message": "{call} converts the DataFrame to an RDD first — use {receiver}.isEmpty()."
+    }
+  ],
+  "ACT007": [
+    {
+      "help": "Drop it, read numOutputRows from the Delta commit, or use df.observe() to compute the metric in the same job.",
+      "id": "logged",
+      "message": "{call} is computed only to be logged — a full job for a log line."
+    },
+    {
+      "help": "Remove the call; use df.observe() or the write's Delta history for row counts.",
+      "id": "discarded",
+      "message": "{call} result is discarded — a full Spark job whose result is never used."
+    }
+  ],
+  "ACT008": [
+    {
+      "help": "df.join(other.select(\"k\"), \"k\", \"left_semi\") runs as one job (broadcast it if small) instead of collect + a huge IN list.",
+      "id": "isin",
+      "message": "Values collected to the driver are fed back into isin() — use a semi join."
+    },
+    {
+      "help": "Register the source as a view and use `WHERE k IN (SELECT k FROM v)` / a LEFT SEMI JOIN instead of a literal list.",
+      "id": "spark-sql",
+      "message": "Values collected to the driver are interpolated back into spark.sql() — use a semi join."
+    },
+    {
+      "help": "df.join(other.select(\"k\"), \"k\", \"left_semi\") runs as one job (broadcast it if small) instead of collect + a literal IN list.",
+      "id": "condition-string",
+      "message": "Values collected to the driver are interpolated back into {sink} SQL text — use a semi join."
+    }
+  ],
+  "ACT009": [
+    {
+      "help": "Use df.count() / df.agg(F.sum(..), F.max(..)).first() so only the scalar leaves the cluster.",
+      "id": "driver-aggregate",
+      "message": "{function}() computed on the driver from {collect} — compute it in Spark."
+    },
+    {
+      "help": null,
+      "id": "index-zero",
+      "message": "{call}[0] pulls every row to the driver to read one — use .first()."
+    },
+    {
+      "help": "df.tail(1)[0] returns the same row (Spark 3.0+); only the last partitions are read.",
+      "id": "index-last",
+      "message": "{call}[-1] pulls every row to the driver to read the last one — use .tail(1)."
+    },
+    {
+      "help": "df.take(n) returns the same rows and stops after the first partitions that hold them.",
+      "id": "slice",
+      "message": "{call}[:{n}] pulls every row to the driver to keep {n} — use .take({n})."
+    }
+  ],
+  "ACT010": [
+    {
+      "help": "Delete it before the code runs as a job; where someone reads the output, keep it with `# noqa: ACT010`.",
+      "id": "debug-action",
+      "message": "{call} left in pipeline code triggers extra jobs (nobody reads the output in a scheduled run)."
+    },
+    {
+      "help": "Delete it before the code runs as a job; where someone reads the output, keep it with `# noqa: ACT010`.",
+      "id": "debug-plan",
+      "message": "{call} left in pipeline code prints to the driver log: it runs no job, but it is noise in a scheduled run (and a server round trip on Spark Connect)."
+    },
+    {
+      "help": "Write the stream to a durable sink such as a Delta table; for a benchmark use the `noop` format.",
+      "id": "debug-sink",
+      "message": "{call} is a debug sink: the stream's output is printed to the driver log (console) or kept in driver memory (memory), not stored."
+    }
+  ],
+  "ACT011": [
+    {
+      "help": ".rdd is unavailable on Spark Connect, serverless and standard access mode; the DataFrame method also keeps the query in the SQL plan.",
+      "id": "rdd-collect",
+      "message": "{call} converts the DataFrame to an RDD only to read rows back; `{fixed}` returns the same rows without the detour."
+    },
+    {
+      "help": "Write the steps as DataFrame operations (select, pyspark.sql.functions, groupBy().agg()) or mapInPandas / mapInArrow (Arrow batches), then collect; .rdd is also unavailable on Spark Connect, serverless and standard access mode.",
+      "id": "rdd-steps",
+      "message": "{call} runs the RDD steps in Python workers: every row is pickled out of the JVM and back, one row at a time."
+    }
+  ],
+  "ACT015": [
+    {
+      "help": "Use a small relative error (0.001-0.01 is plenty for thresholds and outlier bounds).",
+      "id": "exact",
+      "message": "approxQuantile(..., relativeError={error}) computes exact quantiles: a full pass over the data that the Spark docs call \"very expensive\"."
+    },
+    {
+      "help": "Use a small relative error (0.001-0.01 is plenty for thresholds and outlier bounds).",
+      "id": "exact-in-loop",
+      "message": "approxQuantile(..., relativeError={error}) computes exact quantiles: a full pass over the data that the Spark docs call \"very expensive\". Inside a loop it runs on every iteration."
+    }
+  ],
+  "CFG001": [
+    {
+      "help": "Remove the line. If one query misbehaves under AQE, fix that query (a join hint, or a targeted AQE setting) instead of switching AQE off for everything.",
+      "id": "aqe-disabled",
+      "message": "Adaptive Query Execution disabled (spark.sql.adaptive.enabled=false): no partition coalescing, skew-join splitting or runtime broadcast conversion for the rest of the session."
+    },
+    {
+      "help": "Remove the line; to bound task size use spark.sql.adaptive.advisoryPartitionSizeInBytes instead.",
+      "id": "coalescing-disabled",
+      "message": "AQE partition coalescing disabled: every shuffle keeps spark.sql.shuffle.partitions tasks, however little data it has (many tiny tasks and small output files)."
+    },
+    {
+      "help": "Remove the line; tune spark.sql.adaptive.skewJoin.skewedPartitionFactor / ...ThresholdInBytes if splitting is too eager.",
+      "id": "skew-join-disabled",
+      "message": "AQE skew-join handling disabled: a skewed join key leaves one straggler task holding the whole stage."
+    }
+  ],
+  "CFG002": [
+    {
+      "help": "Remove it. For the one join that misbehaved, use a hint on that join (df.hint(\"merge\") or hint(\"shuffle_hash\")) instead.",
+      "id": "broadcast-disabled",
+      "message": "{key}={value} disables {scope} for the whole session: every small-table join becomes a sort-merge join that shuffles the large side."
+    }
+  ],
+  "CFG003": [
+    {
+      "help": "Set it in the cluster / job compute Spark config instead.",
+      "id": "runtime",
+      "message": "{key} cannot be changed at runtime — this has no effect (and raises CANNOT_MODIFY_CONFIG on Spark Connect/serverless)."
+    },
+    {
+      "help": "Set it in the cluster / job compute Spark config instead.",
+      "id": "notebook-builder",
+      "message": "{key} is a static setting: SparkSession.builder.config() on the already-running notebook session ignores it."
+    },
+    {
+      "help": "Set it in the cluster / job compute Spark config instead.",
+      "id": "notebook-spark-conf",
+      "message": "{key} is a static setting: a SparkConf built in a notebook cannot change the already-running session, which ignores it."
+    }
+  ],
+  "CFG007": [
+    {
+      "help": "Keep the default and broadcast specific small, filtered frames with F.broadcast(df); keep table statistics fresh (ANALYZE TABLE ... COMPUTE STATISTICS).",
+      "id": "over-hard-limit",
+      "message": "{key} set to {size}: at or above Spark's 8 GB broadcast limit, so any join that qualifies fails (\"Cannot broadcast the table that is larger than 8GB\"), usually after the driver runs out of memory building it."
+    },
+    {
+      "help": "Keep the default and broadcast specific small, filtered frames with F.broadcast(df); keep table statistics fresh (ANALYZE TABLE ... COMPUTE STATISTICS).",
+      "id": "raised",
+      "message": "{key} raised to {size}: every table estimated under that size is collected to the driver and copied to every executor (driver OOM / broadcast timeouts; stale statistics let big tables through)."
+    }
+  ],
+  "CFG008": [
+    {
+      "help": "Remove the line. If one reader bug forced it, set it back right after that read (or noqa it with the reason).",
+      "id": "pushdown-disabled",
+      "message": "{key}=false: {format} scans stop using row-group min/max statistics to skip data, so every filtered read decodes all of it."
+    },
+    {
+      "help": "Drop the option (the default pushes filters down), or put the filter into the `query`/`dbtable` subquery yourself.",
+      "id": "jdbc-pushdown-disabled",
+      "message": "JDBC read with pushDownPredicate=false: filters are not sent to the database, so the whole table is copied over the network and filtered in Spark."
+    }
+  ],
+  "CFG009": [
+    {
+      "help": "Remove it and let Delta size files (optimized writes + auto compaction). If one latency-bound stream needs it off, set the table property on that table only and schedule OPTIMIZE for it.",
+      "id": "session",
+      "message": "{key}=false turns off {what} for {scope}: appends, MERGEs and streaming writes leave many small files (slower reads, a bigger Delta log, OPTIMIZE debt)."
+    },
+    {
+      "help": "Remove it and let Delta size files (optimized writes + auto compaction). If one latency-bound stream needs it off, set the table property on that table only and schedule OPTIMIZE for it.",
+      "id": "table-property",
+      "message": "Table property {properties} = false: writes to this table stop sizing their files, so appends and streaming writes leave many small files (slower reads, OPTIMIZE debt)."
+    }
+  ],
+  "CFG010": [
+    {
+      "help": "Remove the line (usually left over from a cold-read benchmark). If a job really must not cache, noqa it with the reason.",
+      "id": "disk-cache-disabled",
+      "message": "spark.databricks.io.cache.enabled=false turns off the Databricks disk cache: every later read of the same Parquet/Delta files goes back to cloud storage instead of the workers' local SSDs."
+    }
+  ],
+  "CFG011": [
+    {
+      "help": "Keep the default 10000, or lower it for wide rows; for memory per batch use spark.sql.execution.arrow.maxBytesPerBatch and size spark.executor.memoryOverhead for Python.",
+      "id": "unlimited",
+      "message": "spark.sql.execution.arrow.maxRecordsPerBatch={n} removes the Arrow batch limit: each pandas UDF / applyInPandas / mapInPandas / toPandas batch holds a whole partition outside the JVM heap (Python worker killed, exit 137, no JVM error)."
+    },
+    {
+      "help": "Keep the default 10000, or lower it for wide rows; for memory per batch use spark.sql.execution.arrow.maxBytesPerBatch and size spark.executor.memoryOverhead for Python.",
+      "id": "too-high",
+      "message": "spark.sql.execution.arrow.maxRecordsPerBatch={n} (default 10000): Arrow batches live in executor memory overhead, so big batches of wide rows get Python workers killed (exit 137 / container exceeded memory) on every pandas UDF in the job."
+    },
+    {
+      "help": "Use the default 10000 unless rows are very wide; if memory forced this, raise spark.executor.memoryOverhead instead.",
+      "id": "too-low",
+      "message": "spark.sql.execution.arrow.maxRecordsPerBatch={n} (default 10000): batches this small spend more time crossing the JVM/Python boundary than computing, losing most of the vectorised speed-up."
+    }
+  ],
+  "CFG012": [
+    {
+      "help": "Keep the default. If a CPU-heavy UDF stage needs more tasks, repartition that frame instead of shrinking partitions for the whole session (or noqa it with the reason).",
+      "id": "open-cost-free",
+      "message": "spark.sql.files.openCostInBytes={value} (default 4 MB): small files count as free to open, so one scan task gets packed with thousands of them (slow listing-bound straggler tasks)."
+    },
+    {
+      "help": "Keep the default (128 MB scan / 64 MB advisory) or stay within a few hundred MB; for a skewed join, rely on AQE skew handling instead of bigger partitions.",
+      "id": "too-big",
+      "message": "{key} set to {size} (default {default}): {what} tasks this big spill to disk or run executors out of memory, and too few of them leave cores idle."
+    },
+    {
+      "help": "Keep the default. If a CPU-heavy UDF stage needs more tasks, repartition that frame instead of shrinking partitions for the whole session (or noqa it with the reason).",
+      "id": "too-small",
+      "message": "{key} set to {size} (default {default}): {what} partitions this small turn every stage into thousands of tiny tasks (scheduling overhead, many small output files)."
+    }
+  ],
+  "CFG013": [
+    {
+      "help": "Remove it (Databricks: \"Don't set this property\"). To bound partition size use spark.sql.adaptive.advisoryPartitionSizeInBytes / coalescePartitions.minPartitionSize.",
+      "id": "min-partition-num",
+      "message": "{key}={value} overrides AQE's minPartitionSize: AQE can no longer merge small post-shuffle partitions below this count, so small shuffles keep many tiny tasks (and small output files)."
+    }
+  ],
+  "CFG014": [
+    {
+      "help": "Remove the line (usually a workaround for one old codegen-size or reader-type error). If one query still needs it, set it back right after that query, or noqa it with the reason.",
+      "id": "whole-stage-codegen",
+      "message": "{key}=false turns off whole-stage code generation: every operator of every query runs row by row through virtual iterator calls instead of one compiled loop, multiplying CPU time for the whole session."
+    },
+    {
+      "help": "Remove the line (usually a workaround for one old codegen-size or reader-type error). If one query still needs it, set it back right after that query, or noqa it with the reason.",
+      "id": "parquet-vectorized-reader",
+      "message": "{key}=false makes every Parquet/Delta scan decode values row by row instead of in columnar batches, multiplying CPU time for the whole session."
+    },
+    {
+      "help": "Remove the line (usually a workaround for one old codegen-size or reader-type error). If one query still needs it, set it back right after that query, or noqa it with the reason.",
+      "id": "orc-vectorized-reader",
+      "message": "{key}=false makes every ORC scan decode values row by row instead of in columnar batches, multiplying CPU time for the whole session."
+    }
+  ],
+  "CFG015": [
+    {
+      "help": "Remove the line (usually left from a plan comparison or a benchmark). If one query needs it off, set it back right after that query, or noqa it with the reason.",
+      "id": "dynamic-file-pruning",
+      "message": "{key}=false turns off dynamic file pruning: joins and MERGEs stop skipping the Delta files of the big table that cannot match the small side, so they read every file."
+    },
+    {
+      "help": "Remove the line (usually left from a plan comparison or a benchmark). If one query needs it off, set it back right after that query, or noqa it with the reason.",
+      "id": "dynamic-partition-pruning",
+      "message": "{key}=false turns off dynamic partition pruning: a join on a partition column reads every partition of the big table instead of only the ones the small side selects."
+    }
+  ],
+  "CFG016": [
+    {
+      "help": "Find the join that times out: shrink or filter its broadcast side, drop a forced broadcast hint, or refresh table statistics (ANALYZE TABLE) so Spark stops broadcasting it; keep the default timeout.",
+      "id": "never-times-out",
+      "message": "spark.sql.broadcastTimeout={value} (default 300 s): a negative value means a broadcast never times out, so an oversized or stuck broadcast holds the whole cluster until someone kills the job."
+    },
+    {
+      "help": "Find the join that times out: shrink or filter its broadcast side, drop a forced broadcast hint, or refresh table statistics (ANALYZE TABLE) so Spark stops broadcasting it; keep the default timeout.",
+      "id": "raised",
+      "message": "spark.sql.broadcastTimeout raised to {timeout} (default 300 s): a broadcast that needs longer is usually far bigger than estimated or built by a slow query, and the longer wait keeps the cluster busy on it (AQE broadcast stages ignore this setting since Spark 3.2)."
+    }
+  ],
+  "CFG017": [
+    {
+      "help": "Keep a limit (the default 1g, or a few GB sized below the driver memory) and bring less data to the driver: aggregate or limit in Spark, write the result to a table, or iterate with toLocalIterator().",
+      "id": "unlimited",
+      "message": "spark.driver.maxResultSize={value} removes the driver's result limit (default 1g): an oversized collect(), toPandas() or broadcast then crashes the driver with an out-of-memory error, losing the session while the cluster sits idle, instead of failing that one job cleanly."
+    },
+    {
+      "help": "Keep a limit (the default 1g, or a few GB sized below the driver memory) and bring less data to the driver: aggregate or limit in Spark, write the result to a table, or iterate with toLocalIterator().",
+      "id": "huge",
+      "message": "spark.driver.maxResultSize raised to {size} (default 1g): results this large are serialised and held on the driver, which usually runs out of memory or stalls in garbage collection before the limit is reached."
+    }
+  ],
+  "CFG018": [
+    {
+      "help": "Remove the line (the default true is right for almost every workload); to trade CPU for size, pick a codec with spark.io.compression.codec instead.",
+      "id": "shuffle",
+      "message": "{key}=false: shuffle map output is written and sent uncompressed: several times more shuffle bytes over the network and on local disk."
+    },
+    {
+      "help": "Remove the line (the default true is right for almost every workload); to trade CPU for size, pick a codec with spark.io.compression.codec instead.",
+      "id": "shuffle-spill",
+      "message": "{key}=false: data spilled during shuffles is written uncompressed: several times more local disk traffic in every spilling stage."
+    },
+    {
+      "help": "Remove the line (the default true is right for almost every workload); to trade CPU for size, pick a codec with spark.io.compression.codec instead.",
+      "id": "broadcast",
+      "message": "{key}=false: broadcast variables and broadcast-join tables are sent uncompressed to every executor."
+    },
+    {
+      "help": "Remove the line (the default true is right for almost every workload); to trade CPU for size, pick a codec with spark.io.compression.codec instead.",
+      "id": "columnar-cache",
+      "message": "{key}=false: cached tables and DataFrames are stored uncompressed: they take several times more executor memory, so more blocks are evicted and recomputed."
+    }
+  ],
+  "CFG019": [
+    {
+      "help": "Remove it (deletion vectors are the Databricks default for new tables). Keep it off only for a table that an old Delta reader or an external engine without deletion-vector support must read, and say so in a noqa.",
+      "id": "session-default",
+      "message": "spark.databricks.delta.properties.defaults.enableDeletionVectors=false creates every new Delta table of this session without deletion vectors: every DELETE, UPDATE and MERGE rewrites each whole data file that holds a changed row instead of writing a small row bitmap (write amplification on every change)."
+    },
+    {
+      "help": "Remove it (deletion vectors are the Databricks default for new tables). Keep it off only for a table that an old Delta reader or an external engine without deletion-vector support must read, and say so in a noqa.",
+      "id": "table-property",
+      "message": "Table property delta.enableDeletionVectors = false: every DELETE, UPDATE and MERGE rewrites each whole data file that holds a changed row instead of writing a small row bitmap (write amplification on every change)."
+    }
+  ],
+  "CFG020": [
+    {
+      "help": "Remove it (the default indexes the first 32 columns), or list the filter columns in delta.dataSkippingStatsColumns.",
+      "id": "no-statistics",
+      "message": "{setting} writes no min/max file statistics: every filtered query reads every file (no data skipping), and ZORDER or clustering on the table prunes nothing."
+    },
+    {
+      "help": "List the columns queries filter on in delta.dataSkippingStatsColumns instead (or move them to the front of the schema).",
+      "id": "every-column",
+      "message": "{setting} collects statistics on every column: on wide tables each write pays for min/max on hundreds of columns that no filter uses."
+    }
+  ],
+  "CFG021": [
+    {
+      "help": "Remove it once the optimizer issue it worked around is fixed; otherwise scope it (set it back right after the affected query) and say why in a comment or noqa.",
+      "id": "rules-excluded",
+      "message": "{key} turns off Catalyst optimizer rules ({rules}) for {scope} of this session: lost optimizations such as filter pushdown, column pruning or join reordering make queries read and shuffle more. Unknown rule names are silently ignored, so a name copied from another Spark version does nothing."
+    }
+  ],
+  "CFG022": [
+    {
+      "help": "Remove it and let Databricks autotune file sizes; for a MERGE-heavy table set delta.tuneFileSizesForRewrites = true instead of a fixed small size.",
+      "id": "session-default",
+      "message": "{key} = {size} gives every new Delta table of this session a fixed target file size below 16 MB: OPTIMIZE, auto compaction and optimized writes then aim for files that small instead of autotuning (256 MB to 1 GB by table size), so every read opens many more files and the Delta log grows with every write."
+    },
+    {
+      "help": "Remove it and let Databricks autotune file sizes; for a MERGE-heavy table set delta.tuneFileSizesForRewrites = true instead of a fixed small size.",
+      "id": "table-property",
+      "message": "Table property delta.targetFileSize = {size} is below 16 MB: OPTIMIZE, auto compaction and optimized writes then aim for files that small instead of autotuning (256 MB to 1 GB by table size), so every read opens many more files and the Delta log grows with every write."
+    }
+  ],
+  "COR001": [
+    {
+      "help": null,
+      "id": "eq-none",
+      "message": "Column == None is always NULL (a filter drops every row) — use .isNull()."
+    },
+    {
+      "help": null,
+      "id": "ne-none",
+      "message": "Column != None is always NULL (a filter drops every row) — use .isNotNull()."
+    },
+    {
+      "help": null,
+      "id": "is-none",
+      "message": "`Column is None` is always False in Python — use .isNull()."
+    },
+    {
+      "help": null,
+      "id": "is-not-none",
+      "message": "`Column is not None` is always True in Python — use .isNotNull()."
+    },
+    {
+      "help": null,
+      "id": "sql-eq-null",
+      "message": "`{op} NULL` in SQL text is always NULL (a filter drops every row) — use IS NULL."
+    },
+    {
+      "help": null,
+      "id": "sql-ne-null",
+      "message": "`{op} NULL` in SQL text is always NULL (a filter drops every row) — use IS NOT NULL."
+    }
+  ],
+  "COR002": [
+    {
+      "help": "Combine Column conditions with & (and), | (or) and ~ (not), each comparison in parentheses.",
+      "id": "and-or",
+      "message": "'{keyword}' on Columns — use {operator} (with parentheses); Python cannot convert a Column to bool."
+    },
+    {
+      "help": "Test Python values here; build Column conditions with & / | and pass them to filter() or when().",
+      "id": "bool-test",
+      "message": "This test gets a Column from '{keyword}' (its last operand) — Python cannot convert a Column to bool."
+    },
+    {
+      "help": "Combine Column conditions with & (and), | (or) and ~ (not), each comparison in parentheses.",
+      "id": "not",
+      "message": "'not' on a Column — use ~ (with parentheses); Python cannot convert a Column to bool."
+    }
+  ],
+  "COR003": [
+    {
+      "help": "(F.col(\"a\") > 1) & (F.col(\"b\") < 2)",
+      "id": "precedence",
+      "message": "& / | bind tighter than comparisons: `a > 1 & b < 2` parses as `a > (1 & b) < 2` — parenthesise each comparison."
+    }
+  ],
+  "COR007": [
+    {
+      "help": "df = df.<transformation>(...)",
+      "id": "discarded",
+      "message": "Result of {call} is discarded — DataFrames are immutable; assign it."
+    },
+    {
+      "help": "Finish the chain in the same statement, e.g. df.write.mode(\"overwrite\").saveAsTable(\"t\"), or remove it.",
+      "id": "never-runs",
+      "message": "{call} sets up {what} that never runs — nothing happens until {finish} is called."
+    }
+  ],
+  "COR010": [
+    {
+      "help": "a.unionByName(b) (allowMissingColumns=True when one side lacks columns), or select the same column list on both sides first.",
+      "id": "union",
+      "message": ".{method}() matches columns by position — a different column order silently puts values in the wrong columns; use unionByName()."
+    },
+    {
+      "help": "reduce(DataFrame.unionByName, frames)",
+      "id": "reduce-union",
+      "message": "reduce(DataFrame.union, …) matches columns by position — use DataFrame.unionByName."
+    }
+  ],
+  "COR016": [
+    {
+      "help": "Prefix the literal with r (r\"\\d+\"): a raw string keeps every backslash for the regex engine.",
+      "id": "invalid-escape",
+      "message": "Invalid escape sequence \"{escape}\" in a non-raw string — a SyntaxWarning today, an error in future Python; use r\"...\"."
+    },
+    {
+      "help": "r\"\\bword\\b\": in a raw string \\b reaches the regex engine as a word boundary; in a plain string it is a backspace.",
+      "id": "regex-control-character",
+      "message": "\"{escape}\" in a regex passed as a non-raw string is a control character, not a regex escape — use r\"...\"."
+    },
+    {
+      "help": "r\"\\1\" (or \"\\\\g<1>\" in a replacement): only a raw string or a doubled backslash passes the group number to the regex engine.",
+      "id": "regex-group-reference",
+      "message": "\"{escape}\" in a regex passed as a non-raw string is the control character {char}, not a group reference — use r\"...\"."
+    }
+  ],
+  "DBX001": [
+    {
+      "help": "Use SparkSession APIs: spark.createDataFrame(rows) for parallelize, spark.conf.get(k) for getConf, F.broadcast(df) for broadcast joins.",
+      "id": "context",
+      "message": "{what} is unavailable on Spark Connect and serverless; on standard access mode most of its functions (parallelize, textFile, getConf, …) are blocked on every runtime."
+    },
+    {
+      "help": "Use SparkSession APIs: spark.createDataFrame(rows) for parallelize, spark.conf.get(k) for getConf, F.broadcast(df) for broadcast joins.",
+      "id": "context-global",
+      "message": "The `{name}` global is unavailable on Spark Connect and serverless; on standard access mode most of its functions (parallelize, textFile, getConf, …) are blocked on every runtime."
+    }
+  ],
+  "DBX002": [
+    {
+      "help": "Use DataFrame APIs: df.isEmpty(), df.collect(), mapInPandas/applyInPandas for row-wise Python.",
+      "id": "rdd",
+      "message": "{call} is not supported on Spark Connect, serverless or standard access mode."
+    }
+  ],
+  "DBX003": [
+    {
+      "help": "Read the file-metadata column instead: F.col(\"_metadata.{field}\") on a file-source DataFrame, or _metadata.{field} in SQL over a file-based table.",
+      "id": "input-file-name",
+      "message": "input_file_name() is not available on Unity Catalog, deprecated since Databricks Runtime 13.3 LTS and no longer supported from 17.3 LTS — use the _metadata.file_path column."
+    },
+    {
+      "help": "Read the file-metadata column instead: F.col(\"_metadata.{field}\") on a file-source DataFrame, or _metadata.{field} in SQL over a file-based table.",
+      "id": "input-file-block",
+      "message": "{func}() is not available on Unity Catalog and is deprecated since Databricks Runtime 13.3 LTS — use the _metadata.{field} column."
+    }
+  ],
+  "DBX016": [
+    {
+      "help": "Use {api} — one lookup. A pattern argument (listTables(db, pattern) / SHOW TABLES LIKE) also keeps the listing small.",
+      "id": "listing-lookup",
+      "message": "Existence check for one {what} by listing every {what}: the driver fetches the whole listing (one metastore round trip per page on Unity Catalog) to test a single name."
+    },
+    {
+      "help": "Use {api} — one lookup. A pattern argument (listTables(db, pattern) / SHOW TABLES LIKE) also keeps the listing small.",
+      "id": "listing-lookup-in-loop",
+      "message": "Existence check for one {what} by listing every {what}: the driver fetches the whole listing (one metastore round trip per page on Unity Catalog) to test a single name. Inside a loop, the full listing is fetched on every iteration."
+    }
+  ],
+  "DBX017": [
+    {
+      "help": "Read the source once: point one @dp.append_flow at a @dp.foreach_batch_sink (Public Preview, pipeline channel PREVIEW) whose handler does batch_df.persist(), writes each target (with txnAppId/txnVersion options so retried batches don't duplicate rows), then unpersist(). Trade-offs: the targets stop being pipeline-managed tables (no expectations, lineage or full-refresh cleanup) and writes to different targets are not atomic.",
+      "id": "stream-fan-out",
+      "message": "{source} is streamed separately by {by}: {datasets}. Each one is its own streaming query that re-reads every micro-batch, so the cluster is sized for all of them running at once."
+    }
+  ],
+  "IOD001": [
+    {
+      "help": "Pass an explicit schema: spark.read.schema(SCHEMA)... (a StructType or DDL string).",
+      "id": "csv-infer-schema",
+      "message": "CSV read with inferSchema and no explicit schema — inference scans the data an extra time and the schema drifts."
+    },
+    {
+      "help": "Pass an explicit schema: spark.read.schema(SCHEMA)... (a StructType or DDL string).",
+      "id": "csv-strings",
+      "message": "CSV read without an explicit schema — every column is read as StringType."
+    },
+    {
+      "help": "Pass an explicit schema: spark.read.schema(SCHEMA)... (a StructType or DDL string).",
+      "id": "inferred",
+      "message": "{format} read without an explicit schema — inference scans the data an extra time and the schema drifts."
+    },
+    {
+      "help": "Drop mergeSchema, or read with an explicit schema.",
+      "id": "merge-schema",
+      "message": "{format} read with mergeSchema=true reads every file footer to merge schemas."
+    },
+    {
+      "help": "Pass an explicit schema: spark.readStream.schema(SCHEMA)... (a StructType or DDL string).",
+      "id": "streaming-no-schema",
+      "message": "Streaming {format} source without an explicit schema — fails at runtime unless spark.sql.streaming.schemaInference is set, and the schema drifts."
+    },
+    {
+      "help": "Pass an explicit schema: spark.readStream.schema(SCHEMA)... (a StructType or DDL string).",
+      "id": "streaming-schema-inference",
+      "message": "Streaming {format} source infers its schema (spark.sql.streaming.schemaInference) — only from the files present when the query starts, so later schema changes are not picked up."
+    }
+  ],
+  "IOD002": [
+    {
+      "help": "Add column/lowerBound/upperBound/numPartitions (or predicates=[...]) so the read is split across executors.",
+      "id": "unpartitioned",
+      "message": "JDBC read without partitionColumn/lowerBound/upperBound/numPartitions (or predicates) runs on a single connection and task."
+    },
+    {
+      "help": "Spark does not allow partitionColumn with the `query` option: pass the query as `dbtable` (\"(<query>) t\") and add partitionColumn/lowerBound/upperBound/numPartitions (or use predicates=[...]) so the read is split across executors.",
+      "id": "unpartitioned-query",
+      "message": "JDBC read without partitionColumn/lowerBound/upperBound/numPartitions (or predicates) runs on a single connection and task."
+    }
+  ],
+  "IOD003": [
+    {
+      "help": "Drop it (Delta optimized writes size files), or use repartition(1) so the upstream stage stays parallel.",
+      "id": "coalesce",
+      "message": "{call} before a write funnels the whole output through one task."
+    },
+    {
+      "help": "Drop it (Delta optimized writes size files) unless a single-file export is required.",
+      "id": "repartition",
+      "message": "{call} before a write funnels the whole output through one task."
+    }
+  ],
+  "IOD004": [
+    {
+      "help": null,
+      "id": "append",
+      "message": "insertInto() matches columns by position — a column-order mismatch silently writes data into the wrong columns; use writeTo(t).append()."
+    },
+    {
+      "help": null,
+      "id": "overwrite",
+      "message": "insertInto(overwrite) matches columns by position and may overwrite every partition — use writeTo(t).overwritePartitions()."
+    },
+    {
+      "help": "Drop the {step}() call (the table's own layout is used), and write by name with writeTo(t).append().",
+      "id": "layout",
+      "message": "insertInto() cannot be combined with {step}(): Spark rejects the write because the target table's definition sets its layout."
+    }
+  ],
+  "IOD006": [
+    {
+      "help": "Build the per-iteration frames, union them (reduce(DataFrame.unionByName, frames)) and write once, or compute all iterations in one set-based query.",
+      "id": "append-in-loop",
+      "message": "Append to the same target {target} inside a loop: one commit and a new set of small files per iteration."
+    }
+  ],
+  "IOD015": [
+    {
+      "help": "Re-compress as bzip2 or split the files upstream, or land the data once as Delta/Parquet. If the source cannot change, .repartition(n) right after the read spreads the downstream work.",
+      "id": "unsplittable",
+      "message": "Reading {codec}-compressed {format} ({path}): {codec} is not splittable, so each file is read by a single task whatever its size."
+    }
+  ],
+  "IOD016": [
+    {
+      "help": "Read the files directly with spark.read.json(path) (one JVM scan, no Python round trip; add multiLine=True when each file is one JSON document), and pass an explicit schema to skip inference.",
+      "id": "rdd-of-text-files",
+      "message": "spark.read.json over an RDD without a schema: an extra full job ships every row through Python and infers the schema over all of it before the real read (and RDDs are unsupported on Spark Connect / serverless)."
+    },
+    {
+      "help": "Pass an explicit schema (DDL string), infer it from a small sample (F.schema_of_json on one value, or df.limit(1000)), or on Databricks parse into VARIANT with parse_json.",
+      "id": "rdd",
+      "message": "spark.read.json over an RDD without a schema: an extra full job ships every row through Python and infers the schema over all of it before the real read (and RDDs are unsupported on Spark Connect / serverless)."
+    }
+  ],
+  "IOD017": [
+    {
+      "help": "Set .option(\"numPartitions\", N) (or properties={\"numPartitions\": \"N\"}) to the number of connections the database can take; Spark coalesces to it.",
+      "id": "no-num-partitions",
+      "message": "JDBC write without numPartitions opens one database connection per partition at once (200 after a shuffle), which can exhaust the database's connection limit and stall or fail the write."
+    },
+    {
+      "help": "Set .option(\"numPartitions\", N) (or properties={\"numPartitions\": \"N\"}) to the number of connections the database can take; Spark coalesces to it.",
+      "id": "no-num-partitions-no-batchsize",
+      "message": "JDBC write without numPartitions opens one database connection per partition at once (200 after a shuffle), which can exhaust the database's connection limit and stall or fail the write. batchsize is also unset (1000 rows per round trip); raising it usually speeds up bulk writes."
+    },
+    {
+      "help": "Set .option(\"numPartitions\", N) (or properties={\"numPartitions\": \"N\"}) to the number of connections the database can take; Spark coalesces to it.",
+      "id": "no-num-partitions-in-loop",
+      "message": "JDBC write without numPartitions opens one database connection per partition at once (200 after a shuffle), which can exhaust the database's connection limit and stall or fail the write. Inside a loop, every iteration opens the connections again."
+    },
+    {
+      "help": "Set .option(\"numPartitions\", N) (or properties={\"numPartitions\": \"N\"}) to the number of connections the database can take; Spark coalesces to it.",
+      "id": "no-num-partitions-no-batchsize-in-loop",
+      "message": "JDBC write without numPartitions opens one database connection per partition at once (200 after a shuffle), which can exhaust the database's connection limit and stall or fail the write. batchsize is also unset (1000 rows per round trip); raising it usually speeds up bulk writes. Inside a loop, every iteration opens the connections again."
+    }
+  ],
+  "IOD018": [
+    {
+      "help": "Register only the partitions just written (ALTER TABLE t ADD IF NOT EXISTS PARTITION (...)), or use a Delta table, which needs no partition repair.",
+      "id": "repair",
+      "message": "{how} lists every partition directory of the table on each run, so the job slows down as the table grows even when it wrote one new partition."
+    },
+    {
+      "help": "Register only the partitions just written (ALTER TABLE t ADD IF NOT EXISTS PARTITION (...)), or use a Delta table, which needs no partition repair.",
+      "id": "repair-in-loop",
+      "message": "{how} lists every partition directory of the table on each run, so the job slows down as the table grows even when it wrote one new partition. Inside a loop, the full listing runs on every iteration."
+    }
+  ],
+  "IOD019": [
+    {
+      "help": "Remove the cap and let file size follow the data (Delta: optimized writes / OPTIMIZE, or delta.targetFileSize). Keep a cap only for very wide rows or a downstream reader with a hard row limit, sized in the millions.",
+      "id": "session",
+      "message": "spark.sql.files.maxRecordsPerFile={n} caps every output file of the session at {n} rows: each write task splits its output into many small files (slower listing and opening for every reader, weaker compression and statistics, more compaction work)."
+    },
+    {
+      "help": "Remove the cap and let file size follow the data (Delta: optimized writes / OPTIMIZE, or delta.targetFileSize). Keep a cap only for very wide rows or a downstream reader with a hard row limit, sized in the millions.",
+      "id": "writer-option",
+      "message": "maxRecordsPerFile={n} caps each output file at {n} rows: every write task splits its output into many small files (slower listing and opening for every reader, weaker compression and statistics, more compaction work)."
+    }
+  ],
+  "IOD020": [
+    {
+      "help": "Z-order by the 1-3 high-cardinality columns most used in filters (partition columns never help), or switch the table to liquid clustering (CLUSTER BY) on Databricks.",
+      "id": "zorder-many-columns",
+      "message": "{what} over {n} columns: Z-ordering interleaves every column, so each extra one widens the per-file value range of all the others; data skipping weakens for every column while OPTIMIZE still rewrites the data."
+    }
+  ],
+  "PDS005": [
+    {
+      "help": "Keep the default (False) and combine the data explicitly once (merge/join, or ps.concat), so the cost is visible.",
+      "id": "ops-on-diff-frames",
+      "message": "compute.ops_on_diff_frames=True: every operation between two different pandas-on-Spark frames silently becomes a join (a shuffle per expression)."
+    }
+  ],
+  "PDS006": [
+    {
+      "help": "Group first (psdf.groupby(key).{method}()) or use a Spark Window.partitionBy(...); fine on small frames (# noqa: PDS006).",
+      "id": "single-partition",
+      "message": "{method}() on an un-grouped pandas-on-Spark frame runs over a window with no partition: all rows move to a single partition."
+    }
+  ],
+  "PRF001": [
+    {
+      "help": "Build all expressions first, then apply them once: df.withColumns({name: expr, ...}) (Spark >= 3.3) or df.select(\"*\", *exprs).",
+      "id": "loop",
+      "message": ".withColumn() in a loop adds one projection per iteration — use withColumns()/select()."
+    },
+    {
+      "help": null,
+      "id": "reduce",
+      "message": "functools.reduce(...withColumn...) adds one projection per element — use withColumns()/select()."
+    }
+  ],
+  "PRF002": [
+    {
+      "help": "Build the full list first: df.withColumnsRenamed({old: new, ...}) (Spark >= 3.4), df.drop(*cols), or one df.select(...).",
+      "id": "loop",
+      "message": ".{method}() in a loop adds one plan node per iteration — batch it into one call."
+    }
+  ],
+  "PRF003": [
+    {
+      "help": "Join on a key (df.join(other, \"key\", \"inner\")); for a scalar, aggregate it first so one side has one row.",
+      "id": "cross-join",
+      "message": "Cartesian product: crossJoin() produces |A|×|B| rows."
+    },
+    {
+      "help": "Join on a key (df.join(other, \"key\", \"inner\")); for a scalar, aggregate it first so one side has one row.",
+      "id": "join-without-condition",
+      "message": "Cartesian product: join() without a condition produces |A|×|B| rows."
+    }
+  ],
+  "PRF004": [
+    {
+      "help": "Add an equi-key (e.g. a time bucket: floor(ts/3600) on both sides) next to the range predicate, or use a range-join hint on Databricks.",
+      "id": "non-equi",
+      "message": "Join condition has no equality predicate — it executes as a nested-loop join (O(n·m) comparisons)."
+    }
+  ],
+  "PRF005": [
+    {
+      "help": "Add Window.partitionBy(<key>) — or use df.agg(...) for global totals.",
+      "id": "global-window",
+      "message": "Window without partitionBy() moves all rows into a single partition."
+    }
+  ],
+  "PRF006": [
+    {
+      "help": "Persist it once (`x = x.persist()` … `x.unpersist()`), or restructure so one job produces all outputs.",
+      "id": "recomputed",
+      "message": "`{name}` feeds {n} actions/writes without cache — its full lineage (joins/aggregations) is recomputed each time."
+    }
+  ],
+  "PRF008": [
+    {
+      "help": null,
+      "id": "consumed-once",
+      "message": "`{name}` is cached but consumed only once — .{method}() costs a materialisation and memory with no reuse."
+    },
+    {
+      "help": null,
+      "id": "never-consumed",
+      "message": "`{name}` is cached but never consumed — .{method}() costs a materialisation and memory with no reuse."
+    }
+  ],
+  "PRF009": [
+    {
+      "help": "Call .unpersist() when done (try/finally), or let the job end release it.",
+      "id": "never-unpersisted",
+      "message": "`{name}` is .{method}()-ed but never unpersisted in this scope — the blocks hold executor memory until the session ends."
+    }
+  ],
+  "PRF010": [
+    {
+      "help": null,
+      "id": "repartition-before-write",
+      "message": "repartition() right before a write adds a full shuffle — rely on optimized writes/auto compaction, or repartition by the partitionBy columns."
+    }
+  ],
+  "PRF012": [
+    {
+      "help": "Move the filter below the explode: df.filter(cond).withColumn(\"x\", F.explode(...)).",
+      "id": "explode-first",
+      "message": "explode() runs before a filter that does not use the exploded values — filter first."
+    }
+  ],
+  "PRF015": [
+    {
+      "help": null,
+      "id": "collect-list",
+      "message": "array_distinct(collect_list(x)) materialises duplicates and then drops them — use collect_set(x)."
+    },
+    {
+      "help": null,
+      "id": "collect-set",
+      "message": "array_distinct(collect_set(x)) is redundant — collect_set already deduplicates."
+    }
+  ],
+  "PRF022": [
+    {
+      "help": "Name the columns the write, cache or collect needs; a select() of only some columns before it also clears this.",
+      "id": "select-star",
+      "message": "SELECT * in spark.sql() flows into a write/collect/cache — list the columns you need."
+    }
+  ],
+  "PRF023": [
+    {
+      "help": "Pass the values: .pivot(\"col\", [\"a\", \"b\", ...]) (this also fixes the column order).",
+      "id": "no-values",
+      "message": "pivot({column}) without a values list runs an extra Spark job to find the distinct values."
+    },
+    {
+      "help": "Pass the values: .pivot(\"col\", [\"a\", \"b\", ...]) (this also fixes the column order).",
+      "id": "no-values-in-loop",
+      "message": "pivot({column}) without a values list runs an extra Spark job to find the distinct values. Inside a loop that job repeats on every iteration."
+    }
+  ],
+  "PRF024": [
+    {
+      "help": "List only the grouping sets you need: GROUP BY GROUPING SETS ((a, b), (a), ()) in SQL, or df.groupingSets(...) on Spark >= 4.0.",
+      "id": "cube",
+      "message": "{op} over {n} columns makes {sets} grouping sets: every input row is copied {sets} times before the shuffle."
+    },
+    {
+      "help": "List only the grouping sets you need: GROUP BY GROUPING SETS ((a, b), (a), ()) in SQL, or df.groupingSets(...) on Spark >= 4.0.",
+      "id": "cube-in-loop",
+      "message": "{op} over {n} columns makes {sets} grouping sets: every input row is copied {sets} times before the shuffle. Inside a loop it runs on every iteration."
+    },
+    {
+      "help": "List only the grouping sets you need: GROUP BY GROUPING SETS ((a, b), (a), ()) in SQL, or df.groupingSets(...) on Spark >= 4.0.",
+      "id": "sql-cube",
+      "message": "SQL {op} over {n} columns makes {sets} grouping sets: every input row is copied {sets} times before the shuffle."
+    },
+    {
+      "help": "List only the grouping sets you need: GROUP BY GROUPING SETS ((a, b), (a), ()) in SQL, or df.groupingSets(...) on Spark >= 4.0.",
+      "id": "sql-cube-in-loop",
+      "message": "SQL {op} over {n} columns makes {sets} grouping sets: every input row is copied {sets} times before the shuffle. Inside a loop it runs on every iteration."
+    },
+    {
+      "help": "List only the grouping sets you need: GROUP BY GROUPING SETS ((a, b), (a), ()) in SQL, or df.groupingSets(...) on Spark >= 4.0.",
+      "id": "sql-combined",
+      "message": "SQL GROUP BY combines {n} CUBE / ROLLUP / GROUPING SETS items into {sets} grouping sets (the product of each item's sets): every input row is copied {sets} times before the shuffle."
+    },
+    {
+      "help": "List only the grouping sets you need: GROUP BY GROUPING SETS ((a, b), (a), ()) in SQL, or df.groupingSets(...) on Spark >= 4.0.",
+      "id": "sql-combined-in-loop",
+      "message": "SQL GROUP BY combines {n} CUBE / ROLLUP / GROUPING SETS items into {sets} grouping sets (the product of each item's sets): every input row is copied {sets} times before the shuffle. Inside a loop it runs on every iteration."
+    }
+  ],
+  "PRF025": [
+    {
+      "help": "If the subquery column has no NULLs, write NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k) or use a DataFrame left_anti join: both plan as ordinary hash or sort-merge anti joins.",
+      "id": "not-in-subquery",
+      "message": "SQL `NOT IN (SELECT ...)` is planned as a null-aware anti join, usually a broadcast nested-loop join: very slow, or a broadcast failure when the subquery is large."
+    },
+    {
+      "help": "If the subquery column has no NULLs, write NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k) or use a DataFrame left_anti join: both plan as ordinary hash or sort-merge anti joins.",
+      "id": "not-in-subquery-in-loop",
+      "message": "SQL `NOT IN (SELECT ...)` is planned as a null-aware anti join, usually a broadcast nested-loop join: very slow, or a broadcast failure when the subquery is large. Inside a loop it runs on every iteration."
+    }
+  ],
+  "PRF026": [
+    {
+      "help": "Use F.approx_count_distinct where an estimate is enough, or compute each distinct count in its own aggregation over pre-deduplicated rows (df.select(k, c).distinct().groupBy(k).count()) and join the results.",
+      "id": "distinct-aggregates",
+      "message": "{n} exact distinct aggregates over different columns in one {what}: Spark copies every input row about {n} times (one copy per distinct column set) before the shuffle."
+    },
+    {
+      "help": "Use F.approx_count_distinct where an estimate is enough, or compute each distinct count in its own aggregation over pre-deduplicated rows (df.select(k, c).distinct().groupBy(k).count()) and join the results.",
+      "id": "distinct-aggregates-in-loop",
+      "message": "{n} exact distinct aggregates over different columns in one {what}: Spark copies every input row about {n} times (one copy per distinct column set) before the shuffle. Inside a loop that repeats on every iteration."
+    }
+  ],
+  "PRF027": [
+    {
+      "help": "To pick random rows use df.sample(fraction=p) (then .limit(n) for at most n rows) or df.where(F.rand() < p); for per-group samples use sampleBy, or row_number() over Window.partitionBy(k).orderBy(F.rand()).",
+      "id": "order-by-rand",
+      "message": "{method}(rand()) sorts the whole dataset (a sampling job plus a full shuffle) just to randomise the row order."
+    },
+    {
+      "help": "To pick random rows use df.sample(fraction=p) (then .limit(n) for at most n rows) or df.where(F.rand() < p); for per-group samples use sampleBy, or row_number() over Window.partitionBy(k).orderBy(F.rand()).",
+      "id": "order-by-rand-in-loop",
+      "message": "{method}(rand()) sorts the whole dataset (a sampling job plus a full shuffle) just to randomise the row order. Inside a loop it runs on every iteration."
+    },
+    {
+      "help": "Use TABLESAMPLE (p PERCENT) or WHERE rand() < p (then LIMIT n) instead of sorting by a random key.",
+      "id": "sql-order-by-rand",
+      "message": "SQL ORDER BY rand() sorts the whole dataset (a sampling job plus a full shuffle) just to randomise the row order."
+    },
+    {
+      "help": "Use TABLESAMPLE (p PERCENT) or WHERE rand() < p (then LIMIT n) instead of sorting by a random key.",
+      "id": "sql-order-by-rand-in-loop",
+      "message": "SQL ORDER BY rand() sorts the whole dataset (a sampling job plus a full shuffle) just to randomise the row order. Inside a loop it runs on every iteration."
+    }
+  ],
+  "PRF029": [
+    {
+      "help": "Use StorageLevel.{base} (or plain .cache()); keep replication only for low-latency serving where losing an executor must not trigger recomputation.",
+      "id": "replicated",
+      "message": "Storage level {level} keeps every cached partition {times} (extra executor memory/disk and a network copy of each block); recomputation already makes cached data fault-tolerant."
+    },
+    {
+      "help": "Use StorageLevel.{base} (or plain .cache()); keep replication only for low-latency serving where losing an executor must not trigger recomputation.",
+      "id": "replicated-in-loop",
+      "message": "Storage level {level} keeps every cached partition {times} (extra executor memory/disk and a network copy of each block); recomputation already makes cached data fault-tolerant. Inside a loop it is paid on every iteration."
+    }
+  ],
+  "PRF031": [
+    {
+      "help": "For all values per key use df.groupBy(k).agg(F.sort_array(F.{name}(F.struct(order_col, value)))); for the last n values bound the frame, e.g. .rowsBetween(-n, Window.currentRow).",
+      "id": "running-window",
+      "message": "{name}() over a running window (ordered, frame from the partition start to the current row) gives every row its own growing array: O(N²) elements per partition."
+    },
+    {
+      "help": "For all values per key use df.groupBy(k).agg(F.sort_array(F.{name}(F.struct(order_col, value)))); for the last n values bound the frame, e.g. .rowsBetween(-n, Window.currentRow).",
+      "id": "running-window-unpartitioned",
+      "message": "{name}() over a running window (ordered, frame from the partition start to the current row) gives every row its own growing array: O(N²) elements per partition. The window has no partitionBy(), so all rows land in one partition."
+    },
+    {
+      "help": "For all values per key use GROUP BY k with sort_array({name}(struct(order_col, value))); for the last n values bound the frame, e.g. ROWS BETWEEN n PRECEDING AND CURRENT ROW.",
+      "id": "sql-running-window",
+      "message": "{name}() over a running window in SQL (ordered, frame from the partition start to the current row) gives every row its own growing array: O(N²) elements per partition."
+    },
+    {
+      "help": "For all values per key use GROUP BY k with sort_array({name}(struct(order_col, value))); for the last n values bound the frame, e.g. ROWS BETWEEN n PRECEDING AND CURRENT ROW.",
+      "id": "sql-running-window-unpartitioned",
+      "message": "{name}() over a running window in SQL (ordered, frame from the partition start to the current row) gives every row its own growing array: O(N²) elements per partition. The window has no PARTITION BY, so all rows land in one partition."
+    }
+  ],
+  "PRF032": [
+    {
+      "help": "Join once per OR branch on its equality and unionByName the results (dropDuplicates if a row can match both), or explode the candidate keys into one key column and equi-join on it.",
+      "id": "or-of-equalities",
+      "message": "Join condition ORs equalities together — Spark can't use it as a join key, so it runs a nested-loop join (O(n·m) comparisons)."
+    }
+  ],
+  "PRF035": [
+    {
+      "help": "Group by a real key, or use df.mapInPandas(fn, schema) to run the function once per partition in parallel.",
+      "id": "one-group",
+      "message": "{grouping} before {method}(): the whole DataFrame is one group, so a single task loads every row into one pandas DataFrame (no parallelism, OOM once it outgrows one executor)."
+    },
+    {
+      "help": "Group by a real key, or use df.mapInPandas(fn, schema) to run the function once per partition in parallel.",
+      "id": "one-group-in-loop",
+      "message": "{grouping} before {method}(): the whole DataFrame is one group, so a single task loads every row into one pandas DataFrame (no parallelism, OOM once it outgrows one executor). Inside a loop that repeats on every iteration."
+    },
+    {
+      "help": "Group by a real key, or use df.mapInPandas(fn, schema) to run the function once per partition in parallel.",
+      "id": "one-group-stateful",
+      "message": "{grouping} before {method}(): the whole stream is one group, so every micro-batch runs in a single task against one global state (no parallelism)."
+    },
+    {
+      "help": "Group by a real key, or use df.mapInPandas(fn, schema) to run the function once per partition in parallel.",
+      "id": "one-group-stateful-in-loop",
+      "message": "{grouping} before {method}(): the whole stream is one group, so every micro-batch runs in a single task against one global state (no parallelism). Inside a loop that repeats on every iteration."
+    }
+  ],
+  "PRF036": [
+    {
+      "help": "Drop the hint and let Spark pick the join (or use BROADCAST / MERGE / SHUFFLE_HASH for an equi-join); keep it only for a theta join of two small inputs, with a comment saying so.",
+      "id": "nested-loop-hint",
+      "message": "{hint} forces a shuffle-and-replicate nested-loop join: every row of one side is compared with every row of the other (a cartesian product filtered afterwards), even when the join has an equality key a hash or sort-merge join could use."
+    },
+    {
+      "help": "Drop the hint and let Spark pick the join (or use BROADCAST / MERGE / SHUFFLE_HASH for an equi-join); keep it only for a theta join of two small inputs, with a comment saying so.",
+      "id": "nested-loop-hint-in-loop",
+      "message": "{hint} forces a shuffle-and-replicate nested-loop join: every row of one side is compared with every row of the other (a cartesian product filtered afterwards), even when the join has an equality key a hash or sort-merge join could use. Inside a loop it runs on every iteration."
+    }
+  ],
+  "STM001": [
+    {
+      "help": ".option(\"checkpointLocation\", f\"{CHECKPOINT_ROOT}/<query>\") — one location per query.",
+      "id": "no-checkpoint",
+      "message": "writeStream.{method}() without checkpointLocation — no exactly-once, progress is lost on restart."
+    }
+  ],
+  "STM002": [
+    {
+      "help": null,
+      "id": "trigger-once",
+      "message": "trigger(once=True) is deprecated — use trigger(availableNow=True) (respects rate limits, processes the backlog in batches)."
+    }
+  ],
+  "STM010": [
+    {
+      "help": "Add .option(\"maxOffsetsPerTrigger\", <records per batch>); trigger(availableNow=True) honours it and drains a backlog in several batches. Low-volume topics can ignore this.",
+      "id": "earliest",
+      "message": "Kafka stream from the earliest offsets without maxOffsetsPerTrigger: the first micro-batch reads the whole retained topic at once (long batch, executor OOM risk, cluster sized for the spike)."
+    },
+    {
+      "help": "Add .option(\"maxOffsetsPerTrigger\", <records per batch>); trigger(availableNow=True) honours it and drains a backlog in several batches. Low-volume topics can ignore this.",
+      "id": "timestamp",
+      "message": "Kafka stream from a start timestamp without maxOffsetsPerTrigger: the first micro-batch reads everything since that time at once (long batch, executor OOM risk, cluster sized for the spike)."
+    },
+    {
+      "help": "Add .option(\"maxOffsetsPerTrigger\", <records per batch>); trigger(availableNow=True) honours it and drains a backlog in several batches. Low-volume topics can ignore this.",
+      "id": "latest",
+      "message": "Kafka stream without maxOffsetsPerTrigger: after downtime or a lagging restart, one micro-batch reads the whole backlog at once."
+    }
+  ],
+  "STM011": [
+    {
+      "help": "Use the RocksDB provider (org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider; the Databricks default from DBR 17.3), or remove the line. Keep the heap store only for queries with small, bounded state.",
+      "id": "heap-state-store",
+      "message": "Streaming state store set to HDFSBackedStateStoreProvider: all state lives in the executor JVM heap, so as the number of keys grows micro-batches slow down in garbage collection and executors run out of memory. A query's provider cannot change for an existing checkpoint, so this choice is locked in."
+    }
+  ],
+  "STY001": [
+    {
+      "help": null,
+      "id": "alias",
+      "message": "Import pyspark.sql.{module} as {allowed} (found `{found}`)."
+    }
+  ],
+  "STY002": [
+    {
+      "help": null,
+      "id": "missing-how",
+      "message": "join() without an explicit how= — state the join type (defaults to inner)."
+    }
+  ],
+  "STY003": [
+    {
+      "help": null,
+      "id": "drop-before-select",
+      "message": "drop() before select() of explicit columns is redundant — select() already picks the columns."
+    }
+  ],
+  "UDF001": [
+    {
+      "help": "Python UDFs serialise every row JVM→Python→JVM and block Catalyst/Photon; the built-in runs natively (note: built-ins return NULL for NULL input).",
+      "id": "builtin-equivalent",
+      "message": "UDF body is equivalent to built-in {builtin} — drop the UDF."
+    }
+  ],
+  "UDF002": [
+    {
+      "help": "Rewrite the predicate with built-in functions. Splitting it does not help: Spark already applies the native conditions of a filter before the UDF.",
+      "id": "filter-predicate",
+      "message": "UDF {name}() used as a filter predicate — Spark cannot push it into the scan (no file or row-group skipping on it) and runs Python on every remaining row."
+    }
+  ],
+  "UDF006": [
+    {
+      "help": "Pass returnType: F.udf(fn, \"long\") / @F.udf(\"double\") / spark.udf.register(\"n\", fn, \"int\").",
+      "id": "non-string-return",
+      "message": "udf() without returnType defaults to StringType — the function returns a non-string, so results become strings (or NULL)."
+    },
+    {
+      "help": "Pass returnType: F.udf(fn, \"long\") / @F.udf(\"double\") / spark.udf.register(\"n\", fn, \"int\").",
+      "id": "unknown-return",
+      "message": "udf() without returnType defaults to StringType — state the return type explicitly."
+    }
+  ],
+  "UDF011": [
+    {
+      "help": "Use the Iterator[pd.Series] -> Iterator[pd.Series] form and load once before the `for batch in it:` loop, or cache the loader at module level (functools.lru_cache).",
+      "id": "series-udf",
+      "message": "{call} inside pandas UDF {name} runs for every Arrow batch (~10k rows) on every task."
+    },
+    {
+      "help": "Cache the loader at module level (functools.lru_cache / a global) so each Python worker loads it once.",
+      "id": "grouped-udf",
+      "message": "{call} inside grouped pandas UDF {name} runs once per group."
+    },
+    {
+      "help": "Move the load above the `for batch in iterator:` loop so it runs once per partition.",
+      "id": "batch-loop",
+      "message": "{call} inside the batch loop of {api} function {name} runs once per batch."
+    },
+    {
+      "help": "Cache the loader at module level (functools.lru_cache / a global), or use mapInPandas and load before the batch loop.",
+      "id": "per-group-function",
+      "message": "{call} inside {api} function {name} runs once per group."
+    }
+  ],
+  "UDF012": [
+    {
+      "help": "Open the client once per partition (foreachPartition / mapPartitions / mapInPandas, ForeachWriter.open) or reuse a pooled module-level client.",
+      "id": "per-record-connection",
+      "message": "{call} in {sink} function {name} opens an external connection for every record."
+    }
+  ],
+  "UDF013": [
+    {
+      "help": "Pass only the columns the function reads: f(F.col(\"a\"), F.col(\"b\")). For whole-row hashes or JSON use built-ins: xxhash64(*cols), sha2(concat_ws(...), 256), to_json(struct(\"*\")).",
+      "id": "whole-row",
+      "message": "{udf}() gets {how} — all columns are shipped to Python and back, and Spark can't prune the unread ones from the scan."
+    }
+  ],
+  "UDF014": [
+    {
+      "help": "Join on a cheap equality key first (a blocking key, token or floor(x / bin)), then filter the candidate pairs with the UDF; or use built-ins (levenshtein, soundex) in the condition.",
+      "id": "join-condition",
+      "message": "UDF {name}() in {place} — Spark can't derive a join key from it, so it runs a nested-loop / cartesian join and calls Python once per row PAIR."
+    }
+  ]
+}

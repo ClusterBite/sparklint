@@ -73,6 +73,7 @@ etl.py:6:4: ACT006 [*] orders.count() used as an emptiness check scans every row
   |    ^^^^^^^^^^^^^^^^^^ ACT006
 7 |     orders.write.mode("overwrite").saveAsTable("analytics.big_orders")
   |
+  = help: isEmpty() (Spark 3.3+) runs a job that stops at the first row; on older versions use len(df.take(1)) == 0. Keep count() only when the number itself is needed.
   = fix: Replace with `not orders.isEmpty()`
 
 Found 2 findings in 1 file checked (0.00s).

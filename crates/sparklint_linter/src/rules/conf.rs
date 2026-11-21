@@ -33,30 +33,37 @@
 //! IOD019 and PDS005 are rows in their own modules).
 
 use ruff_python_ast::visitor::{self, Visitor};
-use ruff_python_ast::{self as ast, Expr, Operator, UnaryOp};
-use ruff_text_size::{Ranged, TextRange};
+use ruff_python_ast::{self as ast, Expr};
+use ruff_text_size::TextRange;
 use rustc_hash::FxHashSet;
-use sparklint_semantic::{SqlText, Ty, call_arg, int_literal};
+use sparklint_semantic::{Const, Hops, SqlText, Ty, call_arg};
 
 use super::Rule;
-use super::actions::method_range;
 use super::helpers::*;
+use super::msg::{Args, Msg};
 use crate::checker::Checker;
 use crate::config::LinterSettings;
 use crate::diagnostic::{Diagnostic, Severity};
+use crate::finding;
 
 /// The config-value rules (see [`Conf`]). CFG008's JDBC-reader half is a separate hook.
 pub const RULES: &[Rule] = &[
-    Rule::new("CFG001").conf(&Conf::new(
-        &[
-            "spark.sql.adaptive.enabled",
-            "spark.sql.adaptive.coalescePartitions.enabled",
-            "spark.sql.adaptive.skewJoin.enabled",
-        ],
-        aqe_disabled,
-    )),
-    Rule::new("CFG002").conf(&Conf::new(BROADCAST_KEYS, broadcast_disabled)),
-    Rule::new("CFG007").conf(&Conf::new(BROADCAST_KEYS, broadcast_threshold_too_high)),
+    Rule::new("CFG001")
+        .conf(&Conf::new(
+            &[
+                "spark.sql.adaptive.enabled",
+                "spark.sql.adaptive.coalescePartitions.enabled",
+                "spark.sql.adaptive.skewJoin.enabled",
+            ],
+            aqe_disabled,
+        ))
+        .msgs(&[CFG001_AQE, CFG001_COALESCE, CFG001_SKEW]),
+    Rule::new("CFG002")
+        .conf(&Conf::new(BROADCAST_KEYS, broadcast_disabled))
+        .msgs(&[CFG002]),
+    Rule::new("CFG007")
+        .conf(&Conf::new(BROADCAST_KEYS, broadcast_threshold_too_high))
+        .msgs(&[CFG007_HARD_LIMIT, CFG007_RAISED]),
     Rule::new("CFG008")
         .conf(&Conf::new(
             &[
@@ -65,120 +72,149 @@ pub const RULES: &[Rule] = &[
             ],
             predicate_pushdown_disabled,
         ))
-        .call(super::config_stream::jdbc_pushdown_disabled),
-    Rule::new("CFG009").conf(
-        &Conf::new(
+        .call(super::config_stream::jdbc_pushdown_disabled)
+        .msgs(&[CFG008, super::config_stream::CFG008_JDBC]),
+    Rule::new("CFG009")
+        .conf(
+            &Conf::new(
+                &[
+                    "spark.databricks.delta.optimizeWrite.enabled",
+                    "spark.databricks.delta.autoCompact.enabled",
+                    "spark.databricks.delta.properties.defaults.autoOptimize.optimizeWrite",
+                    "spark.databricks.delta.properties.defaults.autoOptimize.autoCompact",
+                ],
+                delta_file_compaction_disabled,
+            )
+            .table(
+                &[
+                    "delta.autoOptimize.optimizeWrite",
+                    "delta.autoOptimize.autoCompact",
+                ],
+                compaction_properties_off,
+            ),
+        )
+        .msgs(&[CFG009, CFG009_TABLE]),
+    Rule::new("CFG010")
+        .conf(&Conf::new(
+            &["spark.databricks.io.cache.enabled"],
+            disk_cache_disabled,
+        ))
+        .msgs(&[CFG010]),
+    Rule::new("CFG011")
+        .conf(&Conf::new(
+            &["spark.sql.execution.arrow.maxRecordsPerBatch"],
+            arrow_batch_size_extreme,
+        ))
+        .msgs(&[CFG011_UNLIMITED, CFG011_HIGH, CFG011_LOW]),
+    Rule::new("CFG012")
+        .conf(&Conf::new(
             &[
-                "spark.databricks.delta.optimizeWrite.enabled",
-                "spark.databricks.delta.autoCompact.enabled",
-                "spark.databricks.delta.properties.defaults.autoOptimize.optimizeWrite",
-                "spark.databricks.delta.properties.defaults.autoOptimize.autoCompact",
+                "spark.sql.files.maxPartitionBytes",
+                "spark.sql.adaptive.advisoryPartitionSizeInBytes",
+                // Spark 3.0 name of the advisory size (still read as a fallback).
+                "spark.sql.adaptive.shuffle.targetPostShuffleInputSize",
+                "spark.sql.files.openCostInBytes",
             ],
-            delta_file_compaction_disabled,
-        )
-        .table(
+            file_partition_size_extreme,
+        ))
+        .msgs(&[CFG012_OPEN_COST, CFG012_HIGH, CFG012_LOW]),
+    Rule::new("CFG013")
+        .conf(&Conf::new(
             &[
-                "delta.autoOptimize.optimizeWrite",
-                "delta.autoOptimize.autoCompact",
+                "spark.sql.adaptive.coalescePartitions.minPartitionNum",
+                // Spark 3.0 name.
+                "spark.sql.adaptive.minNumPostShufflePartitions",
             ],
-            compaction_properties_off,
-        ),
-    ),
-    Rule::new("CFG010").conf(&Conf::new(
-        &["spark.databricks.io.cache.enabled"],
-        disk_cache_disabled,
-    )),
-    Rule::new("CFG011").conf(&Conf::new(
-        &["spark.sql.execution.arrow.maxRecordsPerBatch"],
-        arrow_batch_size_extreme,
-    )),
-    Rule::new("CFG012").conf(&Conf::new(
-        &[
-            "spark.sql.files.maxPartitionBytes",
-            "spark.sql.adaptive.advisoryPartitionSizeInBytes",
-            // Spark 3.0 name of the advisory size (still read as a fallback).
-            "spark.sql.adaptive.shuffle.targetPostShuffleInputSize",
-            "spark.sql.files.openCostInBytes",
-        ],
-        file_partition_size_extreme,
-    )),
-    Rule::new("CFG013").conf(&Conf::new(
-        &[
-            "spark.sql.adaptive.coalescePartitions.minPartitionNum",
-            // Spark 3.0 name.
-            "spark.sql.adaptive.minNumPostShufflePartitions",
-        ],
-        aqe_min_partition_num_set,
-    )),
-    Rule::new("CFG014").conf(&Conf::new(
-        &[
-            "spark.sql.codegen.wholeStage",
-            "spark.sql.parquet.enableVectorizedReader",
-            "spark.sql.orc.enableVectorizedReader",
-        ],
-        engine_acceleration_disabled,
-    )),
-    Rule::new("CFG015").conf(&Conf::new(
-        &[
-            "spark.databricks.optimizer.dynamicFilePruning",
-            "spark.sql.optimizer.dynamicPartitionPruning.enabled",
-        ],
-        dynamic_pruning_disabled,
-    )),
-    Rule::new("CFG016").conf(&Conf::new(
-        &["spark.sql.broadcastTimeout"],
-        broadcast_timeout_raised,
-    )),
-    Rule::new("CFG017").conf(&Conf::new(
-        &["spark.driver.maxResultSize"],
-        driver_result_limit_removed,
-    )),
-    Rule::new("CFG018").conf(&Conf::new(
-        &[
-            "spark.shuffle.compress",
-            "spark.shuffle.spill.compress",
-            "spark.broadcast.compress",
-            "spark.sql.inMemoryColumnarStorage.compressed",
-        ],
-        io_compression_disabled,
-    )),
-    Rule::new("CFG019").conf(
-        &Conf::new(
-            &["spark.databricks.delta.properties.defaults.enableDeletionVectors"],
-            deletion_vectors_disabled,
-        )
-        .table(
-            &["delta.enableDeletionVectors"],
-            deletion_vectors_property_off,
-        ),
-    ),
-    Rule::new("CFG020").conf(
-        &Conf::new(
-            &["spark.databricks.delta.properties.defaults.dataSkippingNumIndexedCols"],
-            file_statistics_disabled,
-        )
-        .table(
+            aqe_min_partition_num_set,
+        ))
+        .msgs(&[CFG013]),
+    Rule::new("CFG014")
+        .conf(&Conf::new(
             &[
-                "delta.dataSkippingNumIndexedCols",
-                "delta.dataSkippingStatsColumns",
+                "spark.sql.codegen.wholeStage",
+                "spark.sql.parquet.enableVectorizedReader",
+                "spark.sql.orc.enableVectorizedReader",
             ],
-            file_statistics_properties,
-        ),
-    ),
-    Rule::new("CFG021").conf(&Conf::new(
-        &[
-            "spark.sql.optimizer.excludedRules",
-            "spark.sql.adaptive.optimizer.excludedRules",
-        ],
-        optimizer_rules_excluded,
-    )),
-    Rule::new("CFG022").conf(
-        &Conf::new(
-            &["spark.databricks.delta.properties.defaults.targetFileSize"],
-            target_file_size_default_small,
+            engine_acceleration_disabled,
+        ))
+        .msgs(&[CFG014_CODEGEN, CFG014_PARQUET, CFG014_ORC]),
+    Rule::new("CFG015")
+        .conf(&Conf::new(
+            &[
+                "spark.databricks.optimizer.dynamicFilePruning",
+                "spark.sql.optimizer.dynamicPartitionPruning.enabled",
+            ],
+            dynamic_pruning_disabled,
+        ))
+        .msgs(&[CFG015_FILE, CFG015_PARTITION]),
+    Rule::new("CFG016")
+        .conf(&Conf::new(
+            &["spark.sql.broadcastTimeout"],
+            broadcast_timeout_raised,
+        ))
+        .msgs(&[CFG016_NEVER, CFG016_RAISED]),
+    Rule::new("CFG017")
+        .conf(&Conf::new(
+            &["spark.driver.maxResultSize"],
+            driver_result_limit_removed,
+        ))
+        .msgs(&[CFG017_UNLIMITED, CFG017_HUGE]),
+    Rule::new("CFG018")
+        .conf(&Conf::new(
+            &[
+                "spark.shuffle.compress",
+                "spark.shuffle.spill.compress",
+                "spark.broadcast.compress",
+                "spark.sql.inMemoryColumnarStorage.compressed",
+            ],
+            io_compression_disabled,
+        ))
+        .msgs(&[CFG018_SHUFFLE, CFG018_SPILL, CFG018_BROADCAST, CFG018_CACHE]),
+    Rule::new("CFG019")
+        .conf(
+            &Conf::new(
+                &["spark.databricks.delta.properties.defaults.enableDeletionVectors"],
+                deletion_vectors_disabled,
+            )
+            .table(
+                &["delta.enableDeletionVectors"],
+                deletion_vectors_property_off,
+            ),
         )
-        .table(&["delta.targetFileSize"], target_file_size_property_small),
-    ),
+        .msgs(&[CFG019, CFG019_TABLE]),
+    Rule::new("CFG020")
+        .conf(
+            &Conf::new(
+                &["spark.databricks.delta.properties.defaults.dataSkippingNumIndexedCols"],
+                file_statistics_disabled,
+            )
+            .table(
+                &[
+                    "delta.dataSkippingNumIndexedCols",
+                    "delta.dataSkippingStatsColumns",
+                ],
+                file_statistics_properties,
+            ),
+        )
+        .msgs(&[CFG020_NONE, CFG020_ALL]),
+    Rule::new("CFG021")
+        .conf(&Conf::new(
+            &[
+                "spark.sql.optimizer.excludedRules",
+                "spark.sql.adaptive.optimizer.excludedRules",
+            ],
+            optimizer_rules_excluded,
+        ))
+        .msgs(&[CFG021]),
+    Rule::new("CFG022")
+        .conf(
+            &Conf::new(
+                &["spark.databricks.delta.properties.defaults.targetFileSize"],
+                target_file_size_default_small,
+            )
+            .table(&["delta.targetFileSize"], target_file_size_property_small),
+        )
+        .msgs(&[CFG022, CFG022_TABLE]),
 ];
 
 // ------------------------------------------------------------------ rule rows
@@ -204,20 +240,25 @@ pub struct Prop {
     pub value: String,
 }
 
-/// What a verdict reports: the message, help and severity (`None` = the rule's
-/// default) of one diagnostic; the module adds the code and the range.
+/// What a verdict reports: the message variant (rendered message and help) and the
+/// severity (`None` = the rule's default) of one diagnostic; the module adds the code
+/// and the range. Build it with [`finding!`](crate::finding!).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Finding {
     pub message: String,
-    pub help: &'static str,
+    pub help: Option<String>,
+    /// The [`Msg::id`] it was built from.
+    pub variant: &'static str,
     pub severity: Option<Severity>,
 }
 
 impl Finding {
-    pub fn new(message: impl Into<String>, help: &'static str) -> Self {
+    /// A finding of variant `m` with `args` filled in.
+    pub fn of(m: &Msg, args: Args<'_>) -> Self {
         Self {
-            message: message.into(),
-            help,
+            message: m.text(args),
+            help: m.help_text(args),
+            variant: m.id,
             severity: None,
         }
     }
@@ -232,7 +273,9 @@ impl Finding {
     }
 
     fn diagnostic(self, code: &'static str, at: TextRange) -> Diagnostic {
-        let d = Diagnostic::new(code, self.message, at).with_help(self.help);
+        let mut d = Diagnostic::new(code, self.message, at);
+        d.help = self.help;
+        d.variant = Some(self.variant);
         match self.severity {
             Some(s) => d.with_severity(s),
             None => d,
@@ -396,13 +439,17 @@ fn finish(ch: &mut Checker, code: &'static str) {
             .iter()
             .any(|l| l.key == mine[i].key && l.diag.is_none() && l.at.start() > mine[i].at.start());
         if restored {
-            d.message
-                .push_str(" (Set back later in this file, so it is scoped to part of the job.)");
+            d.message.push_str(SET_BACK_NOTE);
             d = d.with_severity(Severity::Info);
         }
         ch.report(d);
     }
 }
+
+/// Appended to a config-value finding whose key a later write in the file sets back
+/// (the finding is then info): the one message text not declared per rule.
+pub const SET_BACK_NOTE: &str =
+    " (Set back later in this file, so it is scoped to part of the job.)";
 
 /// The query of a `spark.sql(..)` call on a session.
 fn session_sql(ch: &Checker, c: &ast::ExprCall, expr: &Expr) -> Option<SqlText> {
@@ -462,8 +509,11 @@ const SPARKCONF_SETTERS: &[&str] = &[
     "setSparkHome",
 ];
 
+/// How many names a `SparkConf` receiver is followed through.
+const SPARKCONF_HOPS: Hops = Hops::DEFAULT;
+
 /// `SparkConf()` / `SparkConf().setAppName(..)` / a name bound once to one.
-fn is_sparkconf(ch: &Checker, mut e: &Expr, depth: u32) -> bool {
+fn is_sparkconf(ch: &Checker, mut e: &Expr, hops: Hops) -> bool {
     loop {
         match e {
             Expr::Call(c) => {
@@ -477,65 +527,23 @@ fn is_sparkconf(ch: &Checker, mut e: &Expr, depth: u32) -> bool {
                     _ => return false,
                 }
             }
-            Expr::Name(n) if depth < 3 => {
+            Expr::Name(_) => {
                 return ch
                     .model
-                    .single_binding(n)
-                    .and_then(|b| ch.model.binding(b).value)
-                    .is_some_and(|v| v.range() != e.range() && is_sparkconf(ch, v, depth + 1));
+                    .hop_one(e, hops)
+                    .is_some_and(|(v, h)| is_sparkconf(ch, v, h));
             }
             _ => return false,
         }
     }
 }
 
-/// Constant integer value (`10 * 1024 * 1024`, `2 ** 30`, `-1`, `1 << 30`).
-fn const_int(ch: &Checker, e: &Expr, depth: u32) -> Option<i128> {
-    if depth > 8 {
-        return None;
-    }
-    if let Some(v) = int_literal(e) {
-        return Some(v as i128);
-    }
-    match e {
-        Expr::UnaryOp(u) if u.op == UnaryOp::USub => {
-            const_int(ch, &u.operand, depth + 1)?.checked_neg()
-        }
-        Expr::BinOp(b) => {
-            let l = const_int(ch, &b.left, depth + 1)?;
-            let r = const_int(ch, &b.right, depth + 1)?;
-            match b.op {
-                Operator::Mult => l.checked_mul(r),
-                Operator::Add => l.checked_add(r),
-                Operator::Sub => l.checked_sub(r),
-                Operator::Pow => u32::try_from(r).ok().and_then(|r| l.checked_pow(r)),
-                Operator::LShift => u32::try_from(r)
-                    .ok()
-                    .filter(|r| *r < 100)
-                    .and_then(|r| l.checked_mul(1i128 << r)),
-                Operator::FloorDiv if r != 0 => Some(l.div_euclid(r)),
-                _ => None,
-            }
-        }
-        Expr::Name(n) => {
-            let b = ch.model.single_binding(n)?;
-            let v = ch.model.binding(b).value?;
-            (v.range() != e.range())
-                .then(|| const_int(ch, v, depth + 1))
-                .flatten()
-        }
-        _ => None,
-    }
-}
-
 /// Normalised constant value text of a config value expression.
 fn value_text(ch: &Checker, e: &Expr) -> Option<String> {
-    if let Some(b) = bool_literal(e)
-        && !matches!(e, Expr::StringLiteral(_))
-    {
+    if let Some(b) = ch.model.constant(e).and_then(Const::as_bool) {
         return Some(b.to_string());
     }
-    if let Some(n) = const_int(ch, e, 0) {
+    if let Some(n) = ch.model.const_int(e) {
         return Some(n.to_string());
     }
     // `str(10 * 1024 * 1024)`
@@ -545,7 +553,10 @@ fn value_text(ch: &Checker, e: &Expr) -> Option<String> {
         && c.arguments.args.len() == 1
         && c.arguments.keywords.is_empty()
     {
-        return const_int(ch, &c.arguments.args[0], 0).map(|n| n.to_string());
+        return ch
+            .model
+            .const_int(&c.arguments.args[0])
+            .map(|n| n.to_string());
     }
     ch.model
         .resolve_text(e)
@@ -561,20 +572,36 @@ fn key_text(ch: &Checker, e: &Expr) -> Option<String> {
         .map(|t| t.trim().to_string())
 }
 
-/// A dict literal, or a name bound once to one (`config(map=SETTINGS)`).
-fn dict_of<'e>(ch: &Checker<'e>, e: &'e Expr) -> Option<&'e ast::ExprDict> {
-    match e {
-        Expr::Dict(d) => Some(d),
-        Expr::Name(n) => match ch
-            .model
-            .single_binding(n)
-            .and_then(|b| ch.model.binding(b).value)
-        {
-            Some(Expr::Dict(d)) => Some(d),
-            _ => None,
-        },
-        _ => None,
+/// The dict literals `e` holds on every path that holds one (`config(map=SETTINGS)`,
+/// `SETTINGS` bound in an if/else gives both dicts' writes).
+fn dicts_of<'e>(ch: &Checker<'e>, e: &'e Expr) -> Vec<&'e ast::ExprDict> {
+    ch.model.dicts_of(e, Hops::DEFAULT).0
+}
+
+/// The (key, value) items a `set(k, v)` call inside `for k, v in <items>:` writes,
+/// when `k` and `v` are the two names of that loop's target and the items are
+/// constant ([`SemanticModel::items_of`](sparklint_semantic::SemanticModel::items_of)
+/// on every path: `D.items()` over dict literals, list / tuple / set literals of
+/// 2-tuples). Items that are no pair and unknown spreads are skipped.
+fn loop_pairs<'e>(ch: &Checker<'e>, k: &Expr, v: &Expr) -> Option<Vec<(&'e Expr, &'e Expr)>> {
+    let (Expr::Name(kn), Expr::Name(vn)) = (k, v) else {
+        return None;
+    };
+    let (bk, bv) = (ch.model.single_binding(kn)?, ch.model.single_binding(vn)?);
+    if ch.model.binding(bk).stmt_range != ch.model.binding(bv).stmt_range {
+        return None;
     }
+    let (target, items) = ch.model.for_items(bk, Hops::DEFAULT)?;
+    let Expr::Tuple(t) = target else {
+        return None;
+    };
+    let [Expr::Name(t0), Expr::Name(t1)] = &t.elts[..] else {
+        return None;
+    };
+    if t0.id != kn.id || t1.id != vn.id {
+        return None;
+    }
+    Some(items.items.iter().filter_map(|it| it.pair()).collect())
 }
 
 /// The config writes with a constant key made by this call (several for
@@ -583,6 +610,25 @@ fn dict_of<'e>(ch: &Checker<'e>, e: &'e Expr) -> Option<&'e ast::ExprDict> {
 pub(crate) fn writes(ch: &Checker, c: &ast::ExprCall, expr: &Expr) -> Vec<Write> {
     let at = method_range(expr);
     let pair = |via: Via, k: Option<&Expr>, v: Option<&Expr>| -> Vec<Write> {
+        // `for k, v in SETTINGS.items(): spark.conf.set(k, v)`: one write per item.
+        if let (Some(k), Some(v)) = (k, v)
+            && let Some(items) = loop_pairs(ch, k, v)
+        {
+            return items
+                .into_iter()
+                .filter_map(|(k, v)| {
+                    let name = key_text(ch, k)?;
+                    Some(Write {
+                        key: name.to_ascii_lowercase(),
+                        name,
+                        value: value_text(ch, v),
+                        unset: false,
+                        via,
+                        at,
+                    })
+                })
+                .collect();
+        }
         match (k.and_then(|k| key_text(ch, k)), v) {
             (Some(name), Some(v)) => vec![Write {
                 key: name.to_ascii_lowercase(),
@@ -600,12 +646,11 @@ pub(crate) fn writes(ch: &Checker, c: &ast::ExprCall, expr: &Expr) -> Vec<Write>
         .spark_call_named(expr, &["set", "unset", "config", "sql"])
     {
         return match (sc.class(), sc.method) {
-            (Ty::RuntimeConfig, "set") => pair(
-                Via::RuntimeConf,
-                call_arg(c, 0, "key"),
-                call_arg(c, 1, "value"),
-            ),
-            (Ty::RuntimeConfig, "unset") => call_arg(c, 0, "key")
+            (Ty::RuntimeConfig, "set") => {
+                pair(Via::RuntimeConf, sc.arg(0, "key"), sc.arg(1, "value"))
+            }
+            (Ty::RuntimeConfig, "unset") => sc
+                .arg(0, "key")
                 .and_then(|k| key_text(ch, k))
                 .map(|name| {
                     vec![Write {
@@ -619,16 +664,23 @@ pub(crate) fn writes(ch: &Checker, c: &ast::ExprCall, expr: &Expr) -> Vec<Write>
                 })
                 .unwrap_or_default(),
             (Ty::SessionBuilder, "config") => {
-                let map = call_arg(c, 0, "key")
-                    .and_then(|k| dict_of(ch, k))
-                    .or_else(|| call_arg(c, 99, "map").and_then(|m| dict_of(ch, m)));
-                if let Some(d) = map {
-                    d.items
-                        .iter()
+                let mut maps = sc
+                    .arg(0, "key")
+                    .map(|k| dicts_of(ch, k))
+                    .unwrap_or_default();
+                if maps.is_empty() {
+                    maps = sc
+                        .arg(99, "map")
+                        .map(|m| dicts_of(ch, m))
+                        .unwrap_or_default();
+                }
+                if !maps.is_empty() {
+                    maps.iter()
+                        .flat_map(|d| &d.items)
                         .flat_map(|it| pair(Via::Builder, it.key.as_ref(), Some(&it.value)))
                         .collect()
                 } else {
-                    pair(Via::Builder, call_arg(c, 0, "key"), call_arg(c, 1, "value"))
+                    pair(Via::Builder, sc.arg(0, "key"), sc.arg(1, "value"))
                 }
             }
             (t, "sql") if t.is_session() => ch
@@ -650,25 +702,20 @@ pub(crate) fn writes(ch: &Checker, c: &ast::ExprCall, expr: &Expr) -> Vec<Write>
         };
     }
     match method_call(expr) {
-        Some((_, recv, "set" | "setIfMissing")) if is_sparkconf(ch, recv, 0) => pair(
+        Some((_, recv, "set" | "setIfMissing")) if is_sparkconf(ch, recv, SPARKCONF_HOPS) => pair(
             Via::SparkConf,
             call_arg(c, 0, "key"),
             call_arg(c, 1, "value"),
         ),
-        Some((_, recv, "setAll")) if is_sparkconf(ch, recv, 0) => {
-            let items = match call_arg(c, 0, "pairs") {
-                Some(Expr::List(l)) => &l.elts[..],
-                Some(Expr::Tuple(t)) => &t.elts[..],
-                _ => &[],
-            };
+        Some((_, recv, "setAll")) if is_sparkconf(ch, recv, SPARKCONF_HOPS) => {
+            let items = call_arg(c, 0, "pairs")
+                .and_then(|p| ch.model.items_of(p, Hops::DEFAULT))
+                .unwrap_or_default();
             items
+                .items
                 .iter()
-                .flat_map(|it| match it {
-                    Expr::Tuple(t) if t.elts.len() == 2 => {
-                        pair(Via::SparkConf, Some(&t.elts[0]), Some(&t.elts[1]))
-                    }
-                    _ => Vec::new(),
-                })
+                .filter_map(|it| it.pair())
+                .flat_map(|(k, v)| pair(Via::SparkConf, Some(k), Some(v)))
                 .collect()
         }
         _ => Vec::new(),
@@ -764,25 +811,35 @@ fn is_false(v: &str) -> bool {
 
 // ------------------------------------------------------------------ CFG001
 
+const CFG001_AQE: Msg = Msg::new(
+    "CFG001",
+    "aqe-disabled",
+    "Adaptive Query Execution disabled (spark.sql.adaptive.enabled=false): no partition coalescing, skew-join splitting or runtime broadcast conversion for the rest of the session.",
+)
+.help("Remove the line. If one query misbehaves under AQE, fix that query (a join hint, or a targeted AQE setting) instead of switching AQE off for everything.");
+const CFG001_COALESCE: Msg = Msg::new(
+    "CFG001",
+    "coalescing-disabled",
+    "AQE partition coalescing disabled: every shuffle keeps spark.sql.shuffle.partitions tasks, however little data it has (many tiny tasks and small output files).",
+)
+.help("Remove the line; to bound task size use spark.sql.adaptive.advisoryPartitionSizeInBytes instead.");
+const CFG001_SKEW: Msg = Msg::new(
+    "CFG001",
+    "skew-join-disabled",
+    "AQE skew-join handling disabled: a skewed join key leaves one straggler task holding the whole stage.",
+)
+.help("Remove the line; tune spark.sql.adaptive.skewJoin.skewedPartitionFactor / ...ThresholdInBytes if splitting is too eager.");
+
 fn aqe_disabled(s: &Setting) -> Option<Finding> {
     if !is_false(s.value) {
         return None;
     }
-    let (msg, help) = match s.key {
-        "spark.sql.adaptive.enabled" => (
-            "Adaptive Query Execution disabled (spark.sql.adaptive.enabled=false): no partition coalescing, skew-join splitting or runtime broadcast conversion for the rest of the session.",
-            "Remove the line. If one query misbehaves under AQE, fix that query (a join hint, or a targeted AQE setting) instead of switching AQE off for everything.",
-        ),
-        "spark.sql.adaptive.coalescePartitions.enabled" => (
-            "AQE partition coalescing disabled: every shuffle keeps spark.sql.shuffle.partitions tasks, however little data it has (many tiny tasks and small output files).",
-            "Remove the line; to bound task size use spark.sql.adaptive.advisoryPartitionSizeInBytes instead.",
-        ),
-        _ => (
-            "AQE skew-join handling disabled: a skewed join key leaves one straggler task holding the whole stage.",
-            "Remove the line; tune spark.sql.adaptive.skewJoin.skewedPartitionFactor / ...ThresholdInBytes if splitting is too eager.",
-        ),
+    let m = match s.key {
+        "spark.sql.adaptive.enabled" => &CFG001_AQE,
+        "spark.sql.adaptive.coalescePartitions.enabled" => &CFG001_COALESCE,
+        _ => &CFG001_SKEW,
     };
-    Some(Finding::new(msg, help))
+    Some(finding!(m))
 }
 
 // ------------------------------------------------------------------ CFG002 / CFG007
@@ -793,27 +850,43 @@ const BROADCAST_KEYS: &[&str] = &[
     "spark.databricks.adaptive.autoBroadcastJoinThreshold",
 ];
 
+const CFG002: Msg = Msg::new(
+    "CFG002",
+    "broadcast-disabled",
+    "{key}={value} disables {scope} for the whole session: every small-table join becomes a sort-merge join that shuffles the large side.",
+)
+.help("Remove it. For the one join that misbehaved, use a hint on that join (df.hint(\"merge\") or hint(\"shuffle_hash\")) instead.");
+
 fn broadcast_disabled(s: &Setting) -> Option<Finding> {
     let n = parse_bytes(s.value)?;
     if n > 0 {
         return None;
     }
-    let (name, v) = (s.key, s.value);
-    let scope = if name.contains(".adaptive.") {
+    let (key, value) = (s.key, s.value);
+    let scope = if key.contains(".adaptive.") {
         "runtime (AQE) broadcast conversion"
     } else {
         "automatic broadcast joins"
     };
-    Some(Finding::new(
-        format!(
-            "{name}={v} disables {scope} for the whole session: every small-table join becomes a sort-merge join that shuffles the large side."
-        ),
-        "Remove it. For the one join that misbehaved, use a hint on that join (df.hint(\"merge\") or hint(\"shuffle_hash\")) instead.",
-    ))
+    Some(finding!(CFG002, key, value, scope))
 }
 
 /// Spark's hard limit for one broadcast relation.
 const BROADCAST_HARD_LIMIT: i128 = 8 << 30;
+
+const CFG007_HELP: &str = "Keep the default and broadcast specific small, filtered frames with F.broadcast(df); keep table statistics fresh (ANALYZE TABLE ... COMPUTE STATISTICS).";
+const CFG007_HARD_LIMIT: Msg = Msg::new(
+    "CFG007",
+    "over-hard-limit",
+    "{key} set to {size}: at or above Spark's 8 GB broadcast limit, so any join that qualifies fails (\"Cannot broadcast the table that is larger than 8GB\"), usually after the driver runs out of memory building it.",
+)
+.help(CFG007_HELP);
+const CFG007_RAISED: Msg = Msg::new(
+    "CFG007",
+    "raised",
+    "{key} raised to {size}: every table estimated under that size is collected to the driver and copied to every executor (driver OOM / broadcast timeouts; stale statistics let big tables through).",
+)
+.help(CFG007_HELP);
 
 fn broadcast_threshold_too_high(s: &Setting) -> Option<Finding> {
     let n = parse_bytes(s.value)?;
@@ -821,72 +894,69 @@ fn broadcast_threshold_too_high(s: &Setting) -> Option<Finding> {
     if max == 0 || n < max as i128 {
         return None;
     }
-    let name = s.key;
+    let key = s.key;
     let size = human_bytes(n);
-    const HELP: &str = "Keep the default and broadcast specific small, filtered frames with F.broadcast(df); keep table statistics fresh (ANALYZE TABLE ... COMPUTE STATISTICS).";
     Some(if n >= BROADCAST_HARD_LIMIT {
-        Finding::new(
-            format!(
-                "{name} set to {size}: at or above Spark's 8 GB broadcast limit, so any join that qualifies fails (\"Cannot broadcast the table that is larger than 8GB\"), usually after the driver runs out of memory building it."
-            ),
-            HELP,
-        )
-        .with_severity(Severity::Error)
+        finding!(CFG007_HARD_LIMIT, key, size).with_severity(Severity::Error)
     } else {
-        Finding::new(
-            format!(
-                "{name} raised to {size}: every table estimated under that size is collected to the driver and copied to every executor (driver OOM / broadcast timeouts; stale statistics let big tables through)."
-            ),
-            HELP,
-        )
+        finding!(CFG007_RAISED, key, size)
     })
 }
 
 // ------------------------------------------------------------------ CFG008
 
+const CFG008: Msg = Msg::new(
+    "CFG008",
+    "pushdown-disabled",
+    "{key}=false: {format} scans stop using row-group min/max statistics to skip data, so every filtered read decodes all of it.",
+)
+.help("Remove the line. If one reader bug forced it, set it back right after that read (or noqa it with the reason).");
+
 fn predicate_pushdown_disabled(s: &Setting) -> Option<Finding> {
     if !is_false(s.value) {
         return None;
     }
-    let name = s.key;
-    let fmt = if name.contains(".orc.") {
+    let key = s.key;
+    let format = if key.contains(".orc.") {
         "ORC"
     } else {
         "Parquet"
     };
-    Some(Finding::new(
-        format!(
-            "{name}=false: {fmt} scans stop using row-group min/max statistics to skip data, so every filtered read decodes all of it."
-        ),
-        "Remove the line. If one reader bug forced it, set it back right after that read (or noqa it with the reason).",
-    ))
+    Some(finding!(CFG008, key, format))
 }
 
 // ------------------------------------------------------------------ CFG009
 
 const COMPACTION_HELP: &str = "Remove it and let Delta size files (optimized writes + auto compaction). If one latency-bound stream needs it off, set the table property on that table only and schedule OPTIMIZE for it.";
+const CFG009: Msg = Msg::new(
+    "CFG009",
+    "session",
+    "{key}=false turns off {what} for {scope}: appends, MERGEs and streaming writes leave many small files (slower reads, a bigger Delta log, OPTIMIZE debt).",
+)
+.help(COMPACTION_HELP);
+const CFG009_TABLE: Msg = Msg::new(
+    "CFG009",
+    "table-property",
+    "Table property {properties} = false: writes to this table stop sizing their files, so appends and streaming writes leave many small files (slower reads, OPTIMIZE debt).",
+)
+.help(COMPACTION_HELP);
 
 fn delta_file_compaction_disabled(s: &Setting) -> Option<Finding> {
     if !is_false(s.value) {
         return None;
     }
-    let name = s.key;
-    let what = if name.contains("optimizeWrite") {
+    let key = s.key;
+    let what = if key.contains("optimizeWrite") {
         "optimized writes"
     } else {
         "auto compaction"
     };
-    let scope = if name.contains(".defaults.") {
+    let scope = if key.contains(".defaults.") {
         "every Delta table this session creates"
     } else {
         "every Delta table this session writes"
     };
-    Some(Finding::new(
-        format!(
-            "{name}=false turns off {what} for {scope}: appends, MERGEs and streaming writes leave many small files (slower reads, a bigger Delta log, OPTIMIZE debt)."
-        ),
-        COMPACTION_HELP,
-    ))
+    Some(finding!(CFG009, key, what, scope))
 }
 
 /// `delta.autoOptimize.optimizeWrite` / `autoCompact` = false, one finding naming
@@ -901,25 +971,23 @@ fn compaction_properties_off(props: &[Prop]) -> Option<Finding> {
     if off.is_empty() {
         return None;
     }
-    let names = off.join(", ");
-    Some(Finding::new(
-        format!(
-            "Table property {names} = false: writes to this table stop sizing their files, so appends and streaming writes leave many small files (slower reads, OPTIMIZE debt)."
-        ),
-        COMPACTION_HELP,
-    ))
+    Some(finding!(CFG009_TABLE, properties = off.join(", ")))
 }
 
 // ------------------------------------------------------------------ CFG010
+
+const CFG010: Msg = Msg::new(
+    "CFG010",
+    "disk-cache-disabled",
+    "spark.databricks.io.cache.enabled=false turns off the Databricks disk cache: every later read of the same Parquet/Delta files goes back to cloud storage instead of the workers' local SSDs.",
+)
+.help("Remove the line (usually left over from a cold-read benchmark). If a job really must not cache, noqa it with the reason.");
 
 fn disk_cache_disabled(s: &Setting) -> Option<Finding> {
     if !is_false(s.value) {
         return None;
     }
-    Some(Finding::new(
-        "spark.databricks.io.cache.enabled=false turns off the Databricks disk cache: every later read of the same Parquet/Delta files goes back to cloud storage instead of the workers' local SSDs.",
-        "Remove the line (usually left over from a cold-read benchmark). If a job really must not cache, noqa it with the reason.",
-    ))
+    Some(finding!(CFG010))
 }
 
 // ------------------------------------------------------------------ CFG011
@@ -929,34 +997,34 @@ const ARROW_BATCH_HIGH: i64 = 100_000;
 /// Below this many rows per batch, the vectorised path loses most of its benefit.
 const ARROW_BATCH_LOW: i64 = 500;
 
+const CFG011_HIGH_HELP: &str = "Keep the default 10000, or lower it for wide rows; for memory per batch use spark.sql.execution.arrow.maxBytesPerBatch and size spark.executor.memoryOverhead for Python.";
+const CFG011_UNLIMITED: Msg = Msg::new(
+    "CFG011",
+    "unlimited",
+    "spark.sql.execution.arrow.maxRecordsPerBatch={n} removes the Arrow batch limit: each pandas UDF / applyInPandas / mapInPandas / toPandas batch holds a whole partition outside the JVM heap (Python worker killed, exit 137, no JVM error).",
+)
+.help(CFG011_HIGH_HELP);
+const CFG011_HIGH: Msg = Msg::new(
+    "CFG011",
+    "too-high",
+    "spark.sql.execution.arrow.maxRecordsPerBatch={n} (default 10000): Arrow batches live in executor memory overhead, so big batches of wide rows get Python workers killed (exit 137 / container exceeded memory) on every pandas UDF in the job.",
+)
+.help(CFG011_HIGH_HELP);
+const CFG011_LOW: Msg = Msg::new(
+    "CFG011",
+    "too-low",
+    "spark.sql.execution.arrow.maxRecordsPerBatch={n} (default 10000): batches this small spend more time crossing the JVM/Python boundary than computing, losing most of the vectorised speed-up.",
+)
+.help("Use the default 10000 unless rows are very wide; if memory forced this, raise spark.executor.memoryOverhead instead.");
+
 fn arrow_batch_size_extreme(s: &Setting) -> Option<Finding> {
     let n: i64 = s.value.trim().parse().ok()?;
-    const KEY: &str = "spark.sql.execution.arrow.maxRecordsPerBatch";
-    const HIGH_HELP: &str = "Keep the default 10000, or lower it for wide rows; for memory per batch use spark.sql.execution.arrow.maxBytesPerBatch and size spark.executor.memoryOverhead for Python.";
     if n <= 0 {
-        Some(Finding::new(
-            format!(
-                "{KEY}={n} removes the Arrow batch limit: each pandas UDF / applyInPandas / mapInPandas / toPandas batch holds a whole partition outside the JVM heap (Python worker killed, exit 137, no JVM error)."
-            ),
-            HIGH_HELP,
-        ))
+        Some(finding!(CFG011_UNLIMITED, n))
     } else if n >= ARROW_BATCH_HIGH {
-        Some(Finding::new(
-            format!(
-                "{KEY}={n} (default 10000): Arrow batches live in executor memory overhead, so big batches of wide rows get Python workers killed (exit 137 / container exceeded memory) on every pandas UDF in the job."
-            ),
-            HIGH_HELP,
-        ))
+        Some(finding!(CFG011_HIGH, n))
     } else if n < ARROW_BATCH_LOW {
-        Some(
-            Finding::new(
-                format!(
-                    "{KEY}={n} (default 10000): batches this small spend more time crossing the JVM/Python boundary than computing, losing most of the vectorised speed-up."
-                ),
-                "Use the default 10000 unless rows are very wide; if memory forced this, raise spark.executor.memoryOverhead instead.",
-            )
-            .info(),
-        )
+        Some(finding!(CFG011_LOW, n).info())
     } else {
         None
     }
@@ -969,6 +1037,24 @@ const PARTITION_SIZE_LOW: i128 = 8 << 20;
 
 const PARTITION_HIGH_HELP: &str = "Keep the default (128 MB scan / 64 MB advisory) or stay within a few hundred MB; for a skewed join, rely on AQE skew handling instead of bigger partitions.";
 const PARTITION_LOW_HELP: &str = "Keep the default. If a CPU-heavy UDF stage needs more tasks, repartition that frame instead of shrinking partitions for the whole session (or noqa it with the reason).";
+const CFG012_OPEN_COST: Msg = Msg::new(
+    "CFG012",
+    "open-cost-free",
+    "spark.sql.files.openCostInBytes={value} (default 4 MB): small files count as free to open, so one scan task gets packed with thousands of them (slow listing-bound straggler tasks).",
+)
+.help(PARTITION_LOW_HELP);
+const CFG012_HIGH: Msg = Msg::new(
+    "CFG012",
+    "too-big",
+    "{key} set to {size} (default {default}): {what} tasks this big spill to disk or run executors out of memory, and too few of them leave cores idle.",
+)
+.help(PARTITION_HIGH_HELP);
+const CFG012_LOW: Msg = Msg::new(
+    "CFG012",
+    "too-small",
+    "{key} set to {size} (default {default}): {what} partitions this small turn every stage into thousands of tiny tasks (scheduling overhead, many small output files).",
+)
+.help(PARTITION_LOW_HELP);
 
 fn file_partition_size_extreme(s: &Setting) -> Option<Finding> {
     let (name, v) = (s.key, s.value);
@@ -980,15 +1066,7 @@ fn file_partition_size_extreme(s: &Setting) -> Option<Finding> {
             if n > 0 {
                 return None;
             }
-            return Some(
-                Finding::new(
-                    format!(
-                        "spark.sql.files.openCostInBytes={v} (default 4 MB): small files count as free to open, so one scan task gets packed with thousands of them (slow listing-bound straggler tasks)."
-                    ),
-                    PARTITION_LOW_HELP,
-                )
-                .info(),
-            );
+            return Some(finding!(CFG012_OPEN_COST, value = v).info());
         }
         _ => ("64 MB", 2i128 << 30),
     };
@@ -1002,22 +1080,9 @@ fn file_partition_size_extreme(s: &Setting) -> Option<Finding> {
     }
     let size = human_bytes(n);
     if n > high {
-        Some(Finding::new(
-            format!(
-                "{name} set to {size} (default {default}): {what} tasks this big spill to disk or run executors out of memory, and too few of them leave cores idle."
-            ),
-            PARTITION_HIGH_HELP,
-        ))
+        Some(finding!(CFG012_HIGH, key = name, size, default, what))
     } else if n < PARTITION_SIZE_LOW {
-        Some(
-            Finding::new(
-                format!(
-                    "{name} set to {size} (default {default}): {what} partitions this small turn every stage into thousands of tiny tasks (scheduling overhead, many small output files)."
-                ),
-                PARTITION_LOW_HELP,
-            )
-            .info(),
-        )
+        Some(finding!(CFG012_LOW, key = name, size, default, what).info())
     } else {
         None
     }
@@ -1025,57 +1090,79 @@ fn file_partition_size_extreme(s: &Setting) -> Option<Finding> {
 
 // ------------------------------------------------------------------ CFG013
 
+const CFG013: Msg = Msg::new(
+    "CFG013",
+    "min-partition-num",
+    "{key}={value} overrides AQE's minPartitionSize: AQE can no longer merge small post-shuffle partitions below this count, so small shuffles keep many tiny tasks (and small output files).",
+)
+.help("Remove it (Databricks: \"Don't set this property\"). To bound partition size use spark.sql.adaptive.advisoryPartitionSizeInBytes / coalescePartitions.minPartitionSize.");
+
 fn aqe_min_partition_num_set(s: &Setting) -> Option<Finding> {
-    let (name, v) = (s.key, s.value);
-    Some(
-        Finding::new(
-            format!(
-                "{name}={v} overrides AQE's minPartitionSize: AQE can no longer merge small post-shuffle partitions below this count, so small shuffles keep many tiny tasks (and small output files)."
-            ),
-            "Remove it (Databricks: \"Don't set this property\"). To bound partition size use spark.sql.adaptive.advisoryPartitionSizeInBytes / coalescePartitions.minPartitionSize.",
-        )
-        .info(),
-    )
+    Some(finding!(CFG013, key = s.key, value = s.value).info())
 }
 
 // ------------------------------------------------------------------ CFG014
+
+const CFG014_HELP: &str = "Remove the line (usually a workaround for one old codegen-size or reader-type error). If one query still needs it, set it back right after that query, or noqa it with the reason.";
+const CFG014_CODEGEN: Msg = Msg::new(
+    "CFG014",
+    "whole-stage-codegen",
+    "{key}=false turns off whole-stage code generation: every operator of every query runs row by row through virtual iterator calls instead of one compiled loop, multiplying CPU time for the whole session.",
+)
+.help(CFG014_HELP);
+const CFG014_PARQUET: Msg = Msg::new(
+    "CFG014",
+    "parquet-vectorized-reader",
+    "{key}=false makes every Parquet/Delta scan decode values row by row instead of in columnar batches, multiplying CPU time for the whole session.",
+)
+.help(CFG014_HELP);
+const CFG014_ORC: Msg = Msg::new(
+    "CFG014",
+    "orc-vectorized-reader",
+    "{key}=false makes every ORC scan decode values row by row instead of in columnar batches, multiplying CPU time for the whole session.",
+)
+.help(CFG014_HELP);
 
 fn engine_acceleration_disabled(s: &Setting) -> Option<Finding> {
     if !is_false(s.value) {
         return None;
     }
-    let name = s.key;
-    let what = match name {
-        "spark.sql.codegen.wholeStage" => {
-            "turns off whole-stage code generation: every operator of every query runs row by row through virtual iterator calls instead of one compiled loop"
-        }
-        "spark.sql.parquet.enableVectorizedReader" => {
-            "makes every Parquet/Delta scan decode values row by row instead of in columnar batches"
-        }
-        _ => "makes every ORC scan decode values row by row instead of in columnar batches",
+    let key = s.key;
+    let m = match key {
+        "spark.sql.codegen.wholeStage" => &CFG014_CODEGEN,
+        "spark.sql.parquet.enableVectorizedReader" => &CFG014_PARQUET,
+        _ => &CFG014_ORC,
     };
-    Some(Finding::new(
-        format!("{name}=false {what}, multiplying CPU time for the whole session."),
-        "Remove the line (usually a workaround for one old codegen-size or reader-type error). If one query still needs it, set it back right after that query, or noqa it with the reason.",
-    ))
+    Some(finding!(m, key))
 }
 
 // ------------------------------------------------------------------ CFG015
+
+const CFG015_HELP: &str = "Remove the line (usually left from a plan comparison or a benchmark). If one query needs it off, set it back right after that query, or noqa it with the reason.";
+const CFG015_FILE: Msg = Msg::new(
+    "CFG015",
+    "dynamic-file-pruning",
+    "{key}=false turns off dynamic file pruning: joins and MERGEs stop skipping the Delta files of the big table that cannot match the small side, so they read every file.",
+)
+.help(CFG015_HELP);
+const CFG015_PARTITION: Msg = Msg::new(
+    "CFG015",
+    "dynamic-partition-pruning",
+    "{key}=false turns off dynamic partition pruning: a join on a partition column reads every partition of the big table instead of only the ones the small side selects.",
+)
+.help(CFG015_HELP);
 
 fn dynamic_pruning_disabled(s: &Setting) -> Option<Finding> {
     if !is_false(s.value) {
         return None;
     }
-    let name = s.key;
-    let what = if name.starts_with("spark.databricks.") {
-        "dynamic file pruning: joins and MERGEs stop skipping the Delta files of the big table that cannot match the small side, so they read every file"
+    let key = s.key;
+    let m = if key.starts_with("spark.databricks.") {
+        &CFG015_FILE
     } else {
-        "dynamic partition pruning: a join on a partition column reads every partition of the big table instead of only the ones the small side selects"
+        &CFG015_PARTITION
     };
-    Some(Finding::new(
-        format!("{name}=false turns off {what}."),
-        "Remove the line (usually left from a plan comparison or a benchmark). If one query needs it off, set it back right after that query, or noqa it with the reason.",
-    ))
+    Some(finding!(m, key))
 }
 
 // ------------------------------------------------------------------ CFG016
@@ -1110,42 +1197,60 @@ fn parse_seconds_ms(s: &str) -> Option<i128> {
 
 /// The CFG016 message for a `spark.sql.broadcastTimeout` value, or None (default or
 /// lower, or not a constant duration).
+const CFG016_HELP: &str = "Find the join that times out: shrink or filter its broadcast side, drop a forced broadcast hint, or refresh table statistics (ANALYZE TABLE) so Spark stops broadcasting it; keep the default timeout.";
+const CFG016_NEVER: Msg = Msg::new(
+    "CFG016",
+    "never-times-out",
+    "spark.sql.broadcastTimeout={value} (default 300 s): a negative value means a broadcast never times out, so an oversized or stuck broadcast holds the whole cluster until someone kills the job.",
+)
+.help(CFG016_HELP);
+const CFG016_RAISED: Msg = Msg::new(
+    "CFG016",
+    "raised",
+    "spark.sql.broadcastTimeout raised to {timeout} (default 300 s): a broadcast that needs longer is usually far bigger than estimated or built by a slow query, and the longer wait keeps the cluster busy on it (AQE broadcast stages ignore this setting since Spark 3.2).",
+)
+.help(CFG016_HELP);
+
 fn broadcast_timeout_raised(s: &Setting) -> Option<Finding> {
     let v = s.value;
     let ms = parse_seconds_ms(v)?;
-    let msg = if ms < 0 {
-        format!(
-            "spark.sql.broadcastTimeout={v} (default 300 s): a negative value means a broadcast never times out, so an oversized or stuck broadcast holds the whole cluster until someone kills the job."
-        )
+    let f = if ms < 0 {
+        finding!(CFG016_NEVER, value = v)
     } else {
         if ms <= BROADCAST_TIMEOUT_DEFAULT_S * 1000 {
             return None;
         }
         let secs = ms / 1000;
-        let shown = if secs >= 3600 && secs % 3600 == 0 {
+        let timeout = if secs >= 3600 && secs % 3600 == 0 {
             format!("{} h", secs / 3600)
         } else if secs >= 60 && secs % 60 == 0 {
             format!("{} min", secs / 60)
         } else {
             format!("{secs} s")
         };
-        format!(
-            "spark.sql.broadcastTimeout raised to {shown} (default 300 s): a broadcast that needs longer is usually far bigger than estimated or built by a slow query, and the longer wait keeps the cluster busy on it (AQE broadcast stages ignore this setting since Spark 3.2)."
-        )
+        finding!(CFG016_RAISED, timeout)
     };
-    Some(
-        Finding::new(
-            msg,
-            "Find the join that times out: shrink or filter its broadcast side, drop a forced broadcast hint, or refresh table statistics (ANALYZE TABLE) so Spark stops broadcasting it; keep the default timeout.",
-        )
-        .info(),
-    )
+    Some(f.info())
 }
 
 // ------------------------------------------------------------------ CFG017
 
 /// A `spark.driver.maxResultSize` at or above this is reported (info).
 const DRIVER_RESULT_HUGE: i128 = 16 << 30;
+
+const CFG017_HELP: &str = "Keep a limit (the default 1g, or a few GB sized below the driver memory) and bring less data to the driver: aggregate or limit in Spark, write the result to a table, or iterate with toLocalIterator().";
+const CFG017_UNLIMITED: Msg = Msg::new(
+    "CFG017",
+    "unlimited",
+    "spark.driver.maxResultSize={value} removes the driver's result limit (default 1g): an oversized collect(), toPandas() or broadcast then crashes the driver with an out-of-memory error, losing the session while the cluster sits idle, instead of failing that one job cleanly.",
+)
+.help(CFG017_HELP);
+const CFG017_HUGE: Msg = Msg::new(
+    "CFG017",
+    "huge",
+    "spark.driver.maxResultSize raised to {size} (default 1g): results this large are serialised and held on the driver, which usually runs out of memory or stalls in garbage collection before the limit is reached.",
+)
+.help(CFG017_HELP);
 
 fn driver_result_limit_removed(s: &Setting) -> Option<Finding> {
     // A launch-time key: on a running session the write has no effect (CFG003).
@@ -1154,87 +1259,87 @@ fn driver_result_limit_removed(s: &Setting) -> Option<Finding> {
     }
     let v = s.value;
     let n = parse_bytes(v)?;
-    let (sev, msg) = if n <= 0 {
-        (
-            Severity::Warning,
-            format!(
-                "spark.driver.maxResultSize={v} removes the driver's result limit (default 1g): an oversized collect(), toPandas() or broadcast then crashes the driver with an out-of-memory error, losing the session while the cluster sits idle, instead of failing that one job cleanly."
-            ),
-        )
+    Some(if n <= 0 {
+        finding!(CFG017_UNLIMITED, value = v).with_severity(Severity::Warning)
     } else if n < DRIVER_RESULT_HUGE {
         return None;
     } else {
-        (
-            Severity::Info,
-            format!(
-                "spark.driver.maxResultSize raised to {} (default 1g): results this large are serialised and held on the driver, which usually runs out of memory or stalls in garbage collection before the limit is reached.",
-                human_bytes(n)
-            ),
-        )
-    };
-    Some(
-        Finding::new(
-            msg,
-            "Keep a limit (the default 1g, or a few GB sized below the driver memory) and bring less data to the driver: aggregate or limit in Spark, write the result to a table, or iterate with toLocalIterator().",
-        )
-        .with_severity(sev),
-    )
+        finding!(CFG017_HUGE, size = human_bytes(n)).with_severity(Severity::Info)
+    })
 }
 
 // ------------------------------------------------------------------ CFG018
 
+const CFG018_HELP: &str = "Remove the line (the default true is right for almost every workload); to trade CPU for size, pick a codec with spark.io.compression.codec instead.";
+const CFG018_SHUFFLE: Msg = Msg::new(
+    "CFG018",
+    "shuffle",
+    "{key}=false: shuffle map output is written and sent uncompressed: several times more shuffle bytes over the network and on local disk.",
+)
+.help(CFG018_HELP);
+const CFG018_SPILL: Msg = Msg::new(
+    "CFG018",
+    "shuffle-spill",
+    "{key}=false: data spilled during shuffles is written uncompressed: several times more local disk traffic in every spilling stage.",
+)
+.help(CFG018_HELP);
+const CFG018_BROADCAST: Msg = Msg::new(
+    "CFG018",
+    "broadcast",
+    "{key}=false: broadcast variables and broadcast-join tables are sent uncompressed to every executor.",
+)
+.help(CFG018_HELP);
+const CFG018_CACHE: Msg = Msg::new(
+    "CFG018",
+    "columnar-cache",
+    "{key}=false: cached tables and DataFrames are stored uncompressed: they take several times more executor memory, so more blocks are evicted and recomputed.",
+)
+.help(CFG018_HELP);
+
 fn io_compression_disabled(s: &Setting) -> Option<Finding> {
-    let name = s.key;
+    let key = s.key;
     // The core (non-SQL) keys are read at launch: on a running session the write is
     // rejected or ignored, which CFG003 reports.
-    if !is_false(s.value) || (s.via.is_runtime() && !name.starts_with("spark.sql.")) {
+    if !is_false(s.value) || (s.via.is_runtime() && !key.starts_with("spark.sql.")) {
         return None;
     }
-    let what = match name {
-        "spark.shuffle.compress" => {
-            "shuffle map output is written and sent uncompressed: several times more shuffle bytes over the network and on local disk"
-        }
-        "spark.shuffle.spill.compress" => {
-            "data spilled during shuffles is written uncompressed: several times more local disk traffic in every spilling stage"
-        }
-        "spark.broadcast.compress" => {
-            "broadcast variables and broadcast-join tables are sent uncompressed to every executor"
-        }
-        _ => {
-            "cached tables and DataFrames are stored uncompressed: they take several times more executor memory, so more blocks are evicted and recomputed"
-        }
+    let m = match key {
+        "spark.shuffle.compress" => &CFG018_SHUFFLE,
+        "spark.shuffle.spill.compress" => &CFG018_SPILL,
+        "spark.broadcast.compress" => &CFG018_BROADCAST,
+        _ => &CFG018_CACHE,
     };
-    Some(Finding::new(
-        format!("{name}=false: {what}."),
-        "Remove the line (the default true is right for almost every workload); to trade CPU for size, pick a codec with spark.io.compression.codec instead.",
-    ))
+    Some(finding!(m, key))
 }
 
 // ------------------------------------------------------------------ CFG019
 
-const DELETION_VECTOR_WHAT: &str = "every DELETE, UPDATE and MERGE rewrites each whole data file that holds a changed row instead of writing a small row bitmap (write amplification on every change)";
-
 const DELETION_VECTOR_HELP: &str = "Remove it (deletion vectors are the Databricks default for new tables). Keep it off only for a table that an old Delta reader or an external engine without deletion-vector support must read, and say so in a noqa.";
+const CFG019: Msg = Msg::new(
+    "CFG019",
+    "session-default",
+    "spark.databricks.delta.properties.defaults.enableDeletionVectors=false creates every new Delta table of this session without deletion vectors: every DELETE, UPDATE and MERGE rewrites each whole data file that holds a changed row instead of writing a small row bitmap (write amplification on every change).",
+)
+.help(DELETION_VECTOR_HELP);
+const CFG019_TABLE: Msg = Msg::new(
+    "CFG019",
+    "table-property",
+    "Table property delta.enableDeletionVectors = false: every DELETE, UPDATE and MERGE rewrites each whole data file that holds a changed row instead of writing a small row bitmap (write amplification on every change).",
+)
+.help(DELETION_VECTOR_HELP);
 
 fn deletion_vectors_disabled(s: &Setting) -> Option<Finding> {
     if !is_false(s.value) {
         return None;
     }
-    Some(Finding::new(
-        format!(
-            "spark.databricks.delta.properties.defaults.enableDeletionVectors=false creates every new Delta table of this session without deletion vectors: {DELETION_VECTOR_WHAT}."
-        ),
-        DELETION_VECTOR_HELP,
-    ))
+    Some(finding!(CFG019))
 }
 
 fn deletion_vectors_property_off(props: &[Prop]) -> Option<Finding> {
-    props.iter().any(|p| is_false(&p.value)).then(|| {
-        Finding::new(
-            format!("Table property delta.enableDeletionVectors = false: {DELETION_VECTOR_WHAT}."),
-            DELETION_VECTOR_HELP,
-        )
-    })
+    props
+        .iter()
+        .any(|p| is_false(&p.value))
+        .then(|| finding!(CFG019_TABLE))
 }
 
 // ------------------------------------------------------------------ CFG020
@@ -1249,28 +1354,37 @@ fn stats_cols_verdict(v: &str) -> Option<bool> {
     }
 }
 
-fn stats_finding(subject: &str, none: bool) -> Finding {
+const CFG020_NONE: Msg = Msg::new(
+    "CFG020",
+    "no-statistics",
+    "{setting} writes no min/max file statistics: every filtered query reads every file (no data skipping), and ZORDER or clustering on the table prunes nothing.",
+)
+.help("Remove it (the default indexes the first 32 columns), or list the filter columns in delta.dataSkippingStatsColumns.");
+const CFG020_ALL: Msg = Msg::new(
+    "CFG020",
+    "every-column",
+    "{setting} collects statistics on every column: on wide tables each write pays for min/max on hundreds of columns that no filter uses.",
+)
+.help("List the columns queries filter on in delta.dataSkippingStatsColumns instead (or move them to the front of the schema).");
+
+/// `setting` names the key and its value as written (`X = 0`, `X = ''`).
+fn stats_finding(setting: &str, none: bool) -> Finding {
     if none {
-        Finding::new(
-            format!(
-                "{subject} = 0 writes no min/max file statistics: every filtered query reads every file (no data skipping), and ZORDER or clustering on the table prunes nothing."
-            ),
-            "Remove it (the default indexes the first 32 columns), or list the filter columns in delta.dataSkippingStatsColumns.",
-        )
+        finding!(CFG020_NONE, setting)
     } else {
-        Finding::new(
-            format!(
-                "{subject} = -1 collects statistics on every column: on wide tables each write pays for min/max on hundreds of columns that no filter uses."
-            ),
-            "List the columns queries filter on in delta.dataSkippingStatsColumns instead (or move them to the front of the schema).",
-        )
-        .info()
+        finding!(CFG020_ALL, setting).info()
     }
+}
+
+/// `<what> = 0` / `<what> = -1` for a `dataSkippingNumIndexedCols` verdict.
+fn num_indexed_finding(what: &str, none: bool) -> Finding {
+    let value = if none { "0" } else { "-1" };
+    stats_finding(&format!("{what} = {value}"), none)
 }
 
 fn file_statistics_disabled(s: &Setting) -> Option<Finding> {
     let none = stats_cols_verdict(s.value)?;
-    Some(stats_finding(
+    Some(num_indexed_finding(
         "spark.databricks.delta.properties.defaults.dataSkippingNumIndexedCols (the default for every new Delta table of this session)",
         none,
     ))
@@ -1286,8 +1400,9 @@ fn file_statistics_properties(props: &[Prop]) -> Option<Finding> {
                 .is_empty()
                 .then(|| stats_finding("Table property delta.dataSkippingStatsColumns = ''", true))
         } else {
-            stats_cols_verdict(&p.value)
-                .map(|none| stats_finding("Table property delta.dataSkippingNumIndexedCols", none))
+            stats_cols_verdict(&p.value).map(|none| {
+                num_indexed_finding("Table property delta.dataSkippingNumIndexedCols", none)
+            })
         }
     })
 }
@@ -1305,31 +1420,30 @@ fn excluded_rule_names(v: &str) -> Vec<&str> {
         .collect()
 }
 
+const CFG021: Msg = Msg::new(
+    "CFG021",
+    "rules-excluded",
+    "{key} turns off Catalyst optimizer rules ({rules}) for {scope} of this session: lost optimizations such as filter pushdown, column pruning or join reordering make queries read and shuffle more. Unknown rule names are silently ignored, so a name copied from another Spark version does nothing.",
+)
+.help("Remove it once the optimizer issue it worked around is fixed; otherwise scope it (set it back right after the affected query) and say why in a comment or noqa.");
+
 fn optimizer_rules_excluded(s: &Setting) -> Option<Finding> {
     let names = excluded_rule_names(s.value);
     if names.is_empty() {
         return None;
     }
-    let name = s.key;
-    let scope = if name.contains(".adaptive.") {
+    let key = s.key;
+    let scope = if key.contains(".adaptive.") {
         "every adaptive re-optimisation"
     } else {
         "every query"
     };
-    let shown = if names.len() > 3 {
+    let rules = if names.len() > 3 {
         format!("{} and {} more", names[..3].join(", "), names.len() - 3)
     } else {
         names.join(", ")
     };
-    Some(
-        Finding::new(
-            format!(
-                "{name} turns off Catalyst optimizer rules ({shown}) for {scope} of this session: lost optimizations such as filter pushdown, column pruning or join reordering make queries read and shuffle more. Unknown rule names are silently ignored, so a name copied from another Spark version does nothing."
-            ),
-            "Remove it once the optimizer issue it worked around is fixed; otherwise scope it (set it back right after the affected query) and say why in a comment or noqa.",
-        )
-        .info(),
-    )
+    Some(finding!(CFG021, key, rules, scope).info())
 }
 
 // ------------------------------------------------------------------ CFG022
@@ -1338,9 +1452,19 @@ fn optimizer_rules_excluded(s: &Setting) -> Option<Finding> {
 /// 256 MB - 1 GB by table size; its own MERGE-heavy tuning goes no lower than ~16 MB).
 const TARGET_FILE_SIZE_MIN: i128 = 16 << 20;
 
-const TARGET_FILE_SIZE_WHAT: &str = "OPTIMIZE, auto compaction and optimized writes then aim for files that small instead of autotuning (256 MB to 1 GB by table size), so every read opens many more files and the Delta log grows with every write";
-
 const TARGET_FILE_SIZE_HELP: &str = "Remove it and let Databricks autotune file sizes; for a MERGE-heavy table set delta.tuneFileSizesForRewrites = true instead of a fixed small size.";
+const CFG022: Msg = Msg::new(
+    "CFG022",
+    "session-default",
+    "{key} = {size} gives every new Delta table of this session a fixed target file size below 16 MB: OPTIMIZE, auto compaction and optimized writes then aim for files that small instead of autotuning (256 MB to 1 GB by table size), so every read opens many more files and the Delta log grows with every write.",
+)
+.help(TARGET_FILE_SIZE_HELP);
+const CFG022_TABLE: Msg = Msg::new(
+    "CFG022",
+    "table-property",
+    "Table property delta.targetFileSize = {size} is below 16 MB: OPTIMIZE, auto compaction and optimized writes then aim for files that small instead of autotuning (256 MB to 1 GB by table size), so every read opens many more files and the Delta log grows with every write.",
+)
+.help(TARGET_FILE_SIZE_HELP);
 
 /// The fixed target size `v` when it is a valid size below the threshold.
 fn small_target_size(v: &str) -> Option<i128> {
@@ -1349,27 +1473,12 @@ fn small_target_size(v: &str) -> Option<i128> {
 
 fn target_file_size_default_small(s: &Setting) -> Option<Finding> {
     let n = small_target_size(s.value)?;
-    Some(Finding::new(
-        format!(
-            "{} = {} gives every new Delta table of this session a fixed target file size below 16 MB: {TARGET_FILE_SIZE_WHAT}.",
-            s.key,
-            human_bytes(n)
-        ),
-        TARGET_FILE_SIZE_HELP,
-    ))
+    Some(finding!(CFG022, key = s.key, size = human_bytes(n)))
 }
 
 fn target_file_size_property_small(props: &[Prop]) -> Option<Finding> {
     props.iter().find_map(|p| {
-        small_target_size(&p.value).map(|n| {
-            Finding::new(
-                format!(
-                    "Table property delta.targetFileSize = {} is below 16 MB: {TARGET_FILE_SIZE_WHAT}.",
-                    human_bytes(n)
-                ),
-                TARGET_FILE_SIZE_HELP,
-            )
-        })
+        small_target_size(&p.value).map(|n| finding!(CFG022_TABLE, size = human_bytes(n)))
     })
 }
 
@@ -1666,7 +1775,7 @@ mod tests {
         .unwrap();
         assert!(
             f.message
-                .starts_with("Table property delta.dataSkippingStatsColumns = '' = 0")
+                .starts_with("Table property delta.dataSkippingStatsColumns = '' writes no")
         );
         let f = table("CFG020", &[("delta.dataskippingnumindexedcols", "-1")]).unwrap();
         assert_eq!(f.severity, Some(Severity::Info));

@@ -1,10 +1,11 @@
 //! Shared helpers for rules.
 
-use ruff_python_ast::{self as ast, Expr};
-use ruff_text_size::Ranged;
-use sparklint_semantic::{Ty, is_logger_name};
+use ruff_python_ast::{self as ast, Expr, Stmt};
+use ruff_text_size::{Ranged, TextRange, TextSize};
+use sparklint_semantic::{SqlSite, SqlSiteKind, Ty, is_logger_name};
 
 use crate::checker::Checker;
+use crate::diagnostic::{Edit, Fix};
 
 /// `recv.method(...)` → (call, receiver, method).
 pub fn method_call(e: &Expr) -> Option<(&ast::ExprCall, &Expr, &str)> {
@@ -32,67 +33,24 @@ pub fn has_no_args(c: &ast::ExprCall) -> bool {
     c.arguments.args.is_empty() && c.arguments.keywords.is_empty()
 }
 
-/// Expressions that never need parentheses when used as a receiver/operand.
-pub fn is_atomic(e: &Expr) -> bool {
-    matches!(
-        e,
-        Expr::Name(_)
-            | Expr::Attribute(_)
-            | Expr::Call(_)
-            | Expr::Subscript(_)
-            | Expr::StringLiteral(_)
-            | Expr::NumberLiteral(_)
-            | Expr::BooleanLiteral(_)
-            | Expr::NoneLiteral(_)
-            | Expr::List(_)
-            | Expr::Dict(_)
-            | Expr::Set(_)
-            | Expr::ListComp(_)
-            | Expr::DictComp(_)
-            | Expr::SetComp(_)
-            | Expr::FString(_)
-    ) || matches!(e, Expr::Tuple(t) if t.parenthesized)
-        || matches!(e, Expr::Generator(g) if g.parenthesized)
-}
+pub use crate::fix_text::is_atomic;
 
-/// Source of `e`, parenthesised unless atomic.
+/// Source of `e` as a receiver / operand ([`crate::fix_text::FixText::operand`]):
+/// parenthesised unless atomic.
 pub fn paren_src(ch: &Checker, e: &Expr) -> String {
-    let s = ch.slice(e.range());
-    if is_atomic(e) {
-        s.to_string()
-    } else {
-        format!("({s})")
-    }
+    ch.fix_text().operand(e)
 }
 
-/// A short human description of an expression for messages (`df`, `orders_df…`).
-pub fn short(ch: &Checker, e: &Expr) -> String {
-    let s = ch.slice(e.range());
-    if s.len() <= 32 && !s.contains('\n') {
-        return s.to_string();
-    }
-    match root_name(e) {
-        Some(n) => format!("{}…", n.id.as_str()),
-        None => "…".to_string(),
-    }
-}
-
-/// `True` / `"true"` literal → Some(true), `False` / `"false"` → Some(false).
-pub fn bool_literal(e: &Expr) -> Option<bool> {
-    match e {
-        Expr::BooleanLiteral(b) => Some(b.value),
-        Expr::StringLiteral(s) => match s.value.to_str().to_ascii_lowercase().as_str() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// `F.lit(None)`.
+/// `F.lit(None)`, also cast to a type (`F.lit(None).cast("string")`, `.astype(..)`):
+/// still a NULL literal.
 pub fn is_lit_none(ch: &Checker, e: &Expr) -> bool {
     let Expr::Call(c) = e else { return false };
+    if let Expr::Attribute(a) = &*c.func
+        && matches!(a.attr.as_str(), "cast" | "astype")
+        && c.arguments.args.len() + c.arguments.keywords.len() == 1
+    {
+        return is_lit_none(ch, &a.value);
+    }
     ch.model.is_spark_function(&c.func, "lit")
         && c.arguments.args.len() == 1
         && c.arguments.args[0].is_none_literal_expr()
@@ -169,8 +127,17 @@ pub fn is_logging_sink(ch: &Checker, c: &ast::ExprCall) -> bool {
 /// Is `e` a `DataFrame.count()` call with no arguments? Returns the receiver.
 pub fn df_count_call<'e>(ch: &Checker, e: &'e Expr) -> Option<&'e Expr> {
     let sc = ch.model.spark_call_named(e, &["count"])?;
-    // Counting a bounded frame (`df.limit(1).count()`) is cheap: not an issue.
-    (sc.has_no_args() && sc.is_dataframe() && sc.bounded().is_none()).then_some(sc.receiver)
+    // Counting a small frame (`df.limit(1).count()`) is cheap: not an issue.
+    (sc.has_no_args() && sc.is_dataframe() && !sc.size().cheap_action()).then_some(sc.receiver)
+}
+
+/// The `F.expr(..)` SQL site of `e` (`text` `None`: the call's text can't be read);
+/// `None` when `e` is no `F.expr` call.
+pub fn f_expr_site<'a: 'e, 'e>(ch: &Checker<'a>, e: &'e Expr) -> Option<SqlSite<'e>> {
+    ch.model
+        .sql_sites(e)
+        .into_iter()
+        .find(|s| s.kind == SqlSiteKind::Expression)
 }
 
 /// Visit every expression below `e` (not entering lambdas or nested scopes).
@@ -218,4 +185,41 @@ pub fn block_len(ch: &Checker, stmt: &ast::Stmt) -> usize {
         _ => None,
     };
     n.unwrap_or(2)
+}
+
+/// Range from the method name to the end of the call (`.collect()` part of a chain).
+pub fn method_range(expr: &Expr) -> TextRange {
+    if let Expr::Call(c) = expr
+        && let Expr::Attribute(a) = &*c.func
+    {
+        return TextRange::new(a.attr.range.start(), c.range().end());
+    }
+    expr.range()
+}
+
+/// An unsafe fix removing an expression statement (its whole line when it is alone on it),
+/// or replacing it with `pass` when it is the only statement of its block.
+pub(crate) fn delete_stmt_fix(ch: &Checker, stmt: &Stmt) -> Fix {
+    let r = stmt.range();
+    if block_len(ch, stmt) <= 1 {
+        return Fix::unsafe_("Replace with `pass`", vec![Edit::replace(r, "pass")]);
+    }
+    let text = &ch.source.text;
+    let start = usize::from(r.start());
+    let end = usize::from(r.end());
+    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[end..].find('\n').map_or(text.len(), |i| end + i + 1);
+    let before = &text[line_start..start];
+    let after = text[end..line_end].trim();
+    if before.trim().is_empty() && (after.is_empty() || after.starts_with('#')) {
+        Fix::unsafe_(
+            "Remove the statement",
+            vec![Edit::delete(TextRange::new(
+                TextSize::from(line_start as u32),
+                TextSize::from(line_end as u32),
+            ))],
+        )
+    } else {
+        Fix::unsafe_("Replace with `pass`", vec![Edit::replace(r, "pass")])
+    }
 }

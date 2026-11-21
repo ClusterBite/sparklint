@@ -50,7 +50,9 @@ pub fn build_model<'a>(
     prior.pandas_used = pandas_used;
     drop(pass1);
     // Pass 2: the final model.
-    Walker::run(module, source_len, opts, external, prior)
+    let mut m = Walker::run(module, source_len, opts, external, prior);
+    m.registered_udfs = crate::udf_refs::registered_names(&m, module);
+    m
 }
 
 struct Walker<'a> {
@@ -312,11 +314,14 @@ impl<'a> Walker<'a> {
         kind: LoopKind,
         range: TextRange,
         body: TextRange,
-        iter: Option<&Expr>,
+        iter: Option<&'a Expr>,
+        stmts: &'a [Stmt],
+        node: crate::loop_character::LoopNode<'a>,
     ) {
         if !self.loop_by_range.insert(range) {
             return;
         }
+        self.m.loop_nodes.insert(range, node);
         let func_scope = self.func_scope_of(self.scope);
         let literal_len = iter.and_then(|i| match i {
             Expr::List(l) => Some(l.elts.len()),
@@ -331,6 +336,7 @@ impl<'a> Walker<'a> {
             iter: iter.map(Ranged::range),
             func_scope,
             literal_len,
+            once: crate::loop_exit::once_regions(stmts),
         });
     }
 
@@ -447,6 +453,7 @@ impl<'a> Walker<'a> {
                                 let mut t = TypeInfo::certain(Ty::from_elem(e))
                                     .with_confidence(ti.confidence);
                                 t.facts.bounded = ti.facts.bounded;
+                                t.facts.row_limited = ti.facts.row_limited;
                                 (None, t)
                             }
                             _ => (None, TypeInfo::UNKNOWN),
@@ -475,6 +482,9 @@ impl<'a> Walker<'a> {
                 }
             }
             Expr::Subscript(s) => {
+                if let Expr::Name(n) = &*s.value {
+                    self.m.item_stores.insert(n.range.start());
+                }
                 self.visit_expr(&s.value);
                 self.visit_expr(&s.slice);
             }
@@ -955,8 +965,10 @@ impl<'a> Walker<'a> {
                 for alias in &i.names {
                     let name = alias.name.as_str();
                     if name == "*" {
-                        if canonical_qualified(&module) == "pyspark.sql.functions" {
-                            self.m.star_functions = true;
+                        match canonical_qualified(&module).as_str() {
+                            "pyspark.sql.functions" => self.m.star_functions = true,
+                            "delta" | "delta.tables" => self.m.star_delta = true,
+                            _ => {}
                         }
                         continue;
                     }
@@ -1087,6 +1099,11 @@ impl<'a> Walker<'a> {
                         None,
                     );
                 } else {
+                    if let Expr::Subscript(s) = &*a.target
+                        && let Expr::Name(n) = &*s.value
+                    {
+                        self.m.item_stores.insert(n.range.start());
+                    }
                     self.visit_expr(&a.target);
                 }
             }
@@ -1123,7 +1140,19 @@ impl<'a> Walker<'a> {
                     (Some(a), Some(b)) => TextRange::new(f.target.start(), b.end().max(a.end())),
                     _ => f.range,
                 };
-                self.push_loop(LoopKind::For, f.range, body_range, Some(&f.iter));
+                self.push_loop(
+                    LoopKind::For,
+                    f.range,
+                    body_range,
+                    Some(&f.iter),
+                    &f.body,
+                    crate::loop_character::LoopNode {
+                        iter: Some(&f.iter),
+                        targets: vec![&f.target],
+                        test: None,
+                        body: &f.body,
+                    },
+                );
                 let target: &'a Expr = &f.target;
                 let iter: &'a Expr = &f.iter;
                 let srange = stmt.range();
@@ -1139,6 +1168,13 @@ impl<'a> Walker<'a> {
                     wh.range,
                     TextRange::new(wh.test.start(), body_end),
                     None,
+                    &wh.body,
+                    crate::loop_character::LoopNode {
+                        iter: None,
+                        targets: Vec::new(),
+                        test: Some(&wh.test),
+                        body: &wh.body,
+                    },
                 );
                 self.visit_loop_body(Some(&wh.test), &wh.body, |_| {});
                 self.visit_body(&wh.orelse);
@@ -1297,6 +1333,13 @@ impl<'a> Walker<'a> {
             expr.range(),
             expr.range(),
             Some(&first.iter),
+            &[],
+            crate::loop_character::LoopNode {
+                iter: Some(&first.iter),
+                targets: generators.iter().map(|g| &g.target).collect(),
+                test: None,
+                body: &[],
+            },
         );
         let saved = self.scope;
         self.scope = cscope;

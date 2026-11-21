@@ -2,15 +2,26 @@
 
 use ruff_python_ast::{self as ast, CmpOp, Expr, Operator, Stmt};
 use ruff_text_size::{Ranged, TextRange};
-use sparklint_semantic::Ty;
 
 use super::Rule;
 use super::helpers::*;
+use super::msg::Msg;
+use super::udf_target::{Factory, UdfFn, decorated_udf, udf_target};
 use crate::checker::Checker;
-use crate::diagnostic::Diagnostic;
+use crate::msg;
 
 /// UDF001 (see [`super::Rule`]).
-pub const RULES: &[Rule] = &[Rule::new("UDF001").stmt(udf001_stmt).call(udf_call)];
+pub const RULES: &[Rule] = &[Rule::new("UDF001")
+    .stmt(udf001_stmt)
+    .call(udf_call)
+    .msgs(&[UDF001])];
+
+const UDF001: Msg = Msg::new(
+    "UDF001",
+    "builtin-equivalent",
+    "UDF body is equivalent to built-in {builtin} — drop the UDF.",
+)
+.help("Python UDFs serialise every row JVM→Python→JVM and block Catalyst/Photon; the built-in runs natively (note: built-ins return NULL for NULL input).");
 
 fn udf001_stmt(ch: &mut Checker, stmt: &Stmt) {
     if let Stmt::FunctionDef(f) = stmt {
@@ -18,79 +29,52 @@ fn udf001_stmt(ch: &mut Checker, stmt: &Stmt) {
     }
 }
 
-pub(crate) fn is_udf_factory(ch: &Checker, func: &Expr) -> bool {
-    if matches!(
-        ch.model.qualified_name(func).as_deref(),
-        Some("pyspark.sql.functions.udf")
-    ) {
-        return true;
-    }
-    // An unbound `udf` name (snippets/notebooks that rely on star imports).
-    ch.settings.heuristics
-        && matches!(func, Expr::Name(n) if n.id.as_str() == "udf"
-            && ch.model.use_site(n).is_some_and(|u| u.reaching.is_empty()))
-}
-
-/// `F.udf(fn_or_lambda, ...)`, `udf(lambda ...)`, `spark.udf.register("n", fn, ...)`.
-pub fn udf_call(ch: &mut Checker, c: &ast::ExprCall, expr: &Expr) {
-    let target = if is_udf_factory(ch, &c.func) {
-        c.arguments.args.first().or_else(|| {
-            c.arguments
-                .keywords
-                .iter()
-                .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "f"))
-                .map(|k| &k.value)
-        })
-    } else if let Some(sc) = ch.model.spark_call_named(expr, &["register"])
-        && sc.class() == Ty::UdfRegistration
-    {
-        c.arguments.args.get(1)
-    } else {
-        None
+/// `F.udf(fn_or_lambda, ...)`, `udf(lambda ...)`, `spark.udf.register("n", fn, ...)` (also
+/// `f=`), with the function inline or as a name bound to a lambda or def on every path.
+pub fn udf_call(ch: &mut Checker, _c: &ast::ExprCall, expr: &Expr) {
+    let Some(t) = udf_target(ch, expr) else {
+        return;
     };
-    let Some(target) = target else { return };
-    let (params, body): (Vec<String>, &Expr) = match target {
-        Expr::Lambda(l) => {
-            let params = l
-                .parameters
-                .as_ref()
-                .map(|p| {
-                    p.iter_non_variadic_params()
-                        .map(|p| p.parameter.name.as_str().to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-            (params, &l.body)
-        }
-        Expr::Name(n) => {
-            let Some(b) = ch.model.single_binding(n) else {
-                return;
-            };
-            let b = ch.model.binding(b);
-            let Some(def) = ch.fn_defs.get(&b.range.start()).copied() else {
-                return;
-            };
-            match single_return(def) {
+    // Every binding of a name argument must be a function with the same built-in.
+    if t.factory != Factory::Udf || !t.resolved.complete() {
+        return;
+    }
+    let mut found = None;
+    for w in &t.resolved.fns {
+        let (params, body): (Vec<String>, &Expr) = match w.func {
+            UdfFn::Lambda(l) => {
+                let params = l
+                    .parameters
+                    .as_ref()
+                    .map(|p| {
+                        p.iter_non_variadic_params()
+                            .map(|p| p.parameter.name.as_str().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (params, &l.body)
+            }
+            UdfFn::Def(def) => match single_return(def) {
                 Some((p, e)) => (p, e),
                 None => return,
-            }
+            },
+        };
+        let Some(builtin) = builtin_equivalent(ch, body, &params) else {
+            return;
+        };
+        if found.is_some_and(|f| f != builtin) {
+            return;
         }
-        _ => return,
-    };
-    if let Some(builtin) = builtin_equivalent(ch, body, &params) {
+        found = Some(builtin);
+    }
+    if let Some(builtin) = found {
         report(ch, builtin, expr.range());
     }
 }
 
 /// `@udf`, `@udf("string")`, `@F.udf(returnType=...)` on a def.
 pub fn udf_decorator(ch: &mut Checker, f: &ast::StmtFunctionDef) {
-    let Some(dec) = f.decorator_list.iter().find(|d| {
-        let callee = match &d.expression {
-            Expr::Call(c) => &*c.func,
-            other => other,
-        };
-        is_udf_factory(ch, callee)
-    }) else {
+    let Some(dec) = decorated_udf(ch, f, Factory::Udf).and_then(|t| t.decorator) else {
         return;
     };
     let Some((params, body)) = single_return(f) else {
@@ -106,14 +90,7 @@ pub fn udf_decorator(ch: &mut Checker, f: &ast::StmtFunctionDef) {
 }
 
 fn report(ch: &mut Checker, builtin: &str, range: TextRange) {
-    ch.report(
-        Diagnostic::new(
-            "UDF001",
-            format!("UDF body is equivalent to built-in {builtin} — drop the UDF."),
-            range,
-        )
-        .with_help("Python UDFs serialise every row JVM→Python→JVM and block Catalyst/Photon; the built-in runs natively (note: built-ins return NULL for NULL input)."),
-    );
+    ch.report(msg!(UDF001, range, builtin));
 }
 
 /// Parameters and the single returned expression of a def (docstring allowed).
@@ -252,7 +229,15 @@ fn equivalent(cx: &Ctx, e: &Expr) -> Option<&'static str> {
             let q = cx.qualified(&c.func)?;
             let args_ok = cx.simple_args(c) && c.arguments.args.iter().any(|a| cx.is_param(a));
             match q.as_str() {
-                "builtins.len" if args_ok => Some("F.length()"),
+                "builtins.len" if args_ok => Some("F.length() / F.size()"),
+                // `bool(re.match(p, x))`: a match test
+                "builtins.bool"
+                    if c.arguments.args.len() == 1
+                        && c.arguments.keywords.is_empty()
+                        && is_re_test(cx, &c.arguments.args[0]) =>
+                {
+                    Some("Column.rlike()")
+                }
                 "builtins.abs" if args_ok => Some("F.abs()"),
                 "builtins.round" if args_ok => Some("F.round()"),
                 "builtins.str" if args_ok => Some("Column.cast(\"string\")"),
@@ -276,8 +261,23 @@ fn equivalent(cx: &Ctx, e: &Expr) -> Option<&'static str> {
             }
         }
         Expr::Subscript(s) => {
-            if cx.is_param(&s.value) && s.slice.is_slice_expr() {
-                return Some("F.substring()");
+            if cx.is_param(&s.value)
+                && let Expr::Slice(sl) = &*s.slice
+            {
+                return match sl.step.as_deref() {
+                    None => Some("F.substring()"),
+                    // `x[::-1]`
+                    Some(Expr::UnaryOp(u))
+                        if sl.lower.is_none()
+                            && sl.upper.is_none()
+                            && u.op == ast::UnaryOp::USub
+                            && matches!(&*u.operand, Expr::NumberLiteral(n)
+                                if matches!(&n.value, ast::Number::Int(i) if i.as_u8() == Some(1))) =>
+                    {
+                        Some("F.reverse()")
+                    }
+                    Some(_) => None,
+                };
             }
             if let Expr::Call(c) = &*s.value
                 && cx.qualified(&c.func).as_deref() == Some("json.loads")
@@ -291,6 +291,10 @@ fn equivalent(cx: &Ctx, e: &Expr) -> Option<&'static str> {
         Expr::Compare(c) if c.ops.len() == 1 => {
             let (l, r) = (&c.operands[0], &c.operands[1]);
             match c.ops[0] {
+                // `re.search(p, x) is not None`
+                CmpOp::Is | CmpOp::IsNot if is_re_test(cx, l) && r.is_none_literal_expr() => {
+                    Some("Column.rlike()")
+                }
                 CmpOp::Is | CmpOp::IsNot if cx.is_param(l) && r.is_none_literal_expr() => {
                     Some(if c.ops[0] == CmpOp::Is {
                         "Column.isNull()"
@@ -368,4 +372,14 @@ fn equivalent(cx: &Ctx, e: &Expr) -> Option<&'static str> {
         }
         _ => None,
     }
+}
+
+/// `re.match|search|fullmatch(<simple args>)` with a parameter among the arguments.
+fn is_re_test(cx: &Ctx, e: &Expr) -> bool {
+    let Expr::Call(c) = e else { return false };
+    matches!(
+        cx.qualified(&c.func).as_deref(),
+        Some("re.match" | "re.search" | "re.fullmatch")
+    ) && cx.simple_args(c)
+        && c.arguments.args.iter().any(|a| cx.is_param(a))
 }
