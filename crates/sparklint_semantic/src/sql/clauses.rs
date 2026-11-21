@@ -590,8 +590,8 @@ impl Clauses {
         }
         // Which groups hold a query: children open after their parents, so walk back.
         let mut own_select = vec![false; c.groups.len()];
-        for i in 0..n {
-            if let Some(g) = c.level[i]
+        for (i, level) in c.level.iter().enumerate().take(n) {
+            if let Some(g) = *level
                 && v.is_word(i, "SELECT")
             {
                 own_select[g] = true;
