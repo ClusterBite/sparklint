@@ -7,6 +7,8 @@ output).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+
 - IOD001 / IOD002: a reader argument passed as `None` (`jdbc(url, t, column=None)`, `csv(p, inferSchema=None)`) now counts as not given, as in pyspark: the one-connection JDBC read is reported and the CSV read gets the all-strings note.
 - IOD003 now reports a write whose frame ends in one partition on every `if`/`else` path, also when the branches use different steps (`coalesce(1)` / `repartition(1)`, or a `select` after the step on one branch).
 - RDDs now carry the same origin facts as DataFrames in the type checker: `sc.parallelize([...])` over a literal list (also `c=`, or a name holding a literal list on every path) is driver-built data with a row bound, kept through RDD steps, by `collect()` rows and by `toDF()`; `df.rdd` keeps the frame's facts. Visible changes: IOD001 / IOD016 no longer report reads over the `.rdd` of a frame that fits the driver (`spark.createDataFrame([..]).rdd.map(..)`, `df.limit(100).rdd`) or over a literal `parallelize` followed by RDD steps, and now report `sc.parallelize(rows)` when `rows` is a literal filled later (`rows = []` + `rows.append(..)`); IOD016 gives the read-the-files help for file text kept through rows-only steps (`sc.textFile(p).filter(..)`, a union of two `textFile`s) and for `wholeTextFiles(..).map(..)` picking the contents in other spellings (`lambda p: p[-1]`, `operator.itemgetter(1)`, a name bound to the lambda); ACT004 / ACT010 no longer report iterating the `collect()` of, or `show()` on, a literal `parallelize` (as for `createDataFrame([..])`).
